@@ -1,0 +1,79 @@
+# ============================================================
+# fintracker — Sample Configuration
+# ============================================================
+# Copy this file to config/personal.yaml and fill in your
+# real numbers. personal.yaml is gitignored and will never
+# be committed to the repository.
+# ============================================================
+
+projection_years: 30
+
+income:
+  gross_annual_income: 120000
+  # Options: single | married_filing_jointly | head_of_household
+  filing_status: single
+  # Options: GA | CA | NY | TX | FL | WA | IL | NC | VA | CO | OTHER
+  state: GA
+  # Used only when state is OTHER
+  other_state_flat_rate: 0.05
+  # Set to 0 if single-income household
+  spouse_gross_annual_income: 0
+
+housing:
+  home_price: 400000
+  down_payment: 80000       # 20% = no PMI
+  interest_rate: 0.065      # 6.5%
+  loan_term_years: 30
+  annual_property_tax_rate: 0.012   # 1.2%
+  annual_insurance: 2000
+  annual_maintenance_rate: 0.01     # 1% of home value
+  pmi_annual_rate: 0.005
+  is_renting: false
+  monthly_rent: 0
+  annual_rent_increase_rate: 0.03
+
+lifestyle:
+  monthly_childcare: 0
+  num_children: 0
+  num_pets: 1
+  annual_pet_cost: 1800
+  annual_medical_oop: 3000
+  annual_vacation: 5000
+  monthly_other_recurring: 500
+
+investments:
+  current_liquid_cash: 100000
+  current_retirement_balance: 50000
+  current_brokerage_balance: 0
+  one_time_upcoming_expenses: 0     # Wedding, car, etc.
+  annual_401k_contribution: 23000   # 2024 IRS limit
+  annual_roth_ira_contribution: 0
+  annual_hsa_contribution: 4150     # 2024 single limit
+  annual_529_contribution: 0        # Per child
+  annual_brokerage_contribution: 0  # Additional after-tax investing
+  # Economic assumptions
+  annual_market_return: 0.08        # 8% nominal
+  annual_inflation_rate: 0.03       # 3%
+  annual_salary_growth_rate: 0.04   # 4%
+  annual_home_appreciation_rate: 0.035  # 3.5%
+
+strategies:
+  maximize_hsa: true
+  use_529_state_deduction: false
+  maximize_401k: true
+  use_roth_ladder: false
+  roth_conversion_annual_amount: 0
+
+# Timeline events: discrete life changes that alter the projection.
+# Each event fires at the START of the specified year.
+timeline_events:
+  - year: 3
+    description: "Get married"
+    marriage: true
+    extra_one_time_expense: 30000   # Wedding costs
+  - year: 4
+    description: "First child arrives"
+    new_child: true
+  - year: 5
+    description: "Promotion / raise"
+    income_change: 160000

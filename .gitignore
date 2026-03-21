@@ -1,0 +1,7 @@
+config/personal.yaml
+config/personal_*.yaml
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+fintracker.egg-info/

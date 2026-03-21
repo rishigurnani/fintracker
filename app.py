@@ -1,0 +1,1073 @@
+"""
+fintracker — Personal Long-Term Financial Planning Engine
+=========================================================
+Run with:  streamlit run app.py
+"""
+from __future__ import annotations
+
+import pathlib
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+from fintracker.models import (
+    FilingStatus, State,
+    IncomeProfile, HousingProfile, LifestyleProfile,
+    InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
+)
+from fintracker.tax_engine import TaxEngine
+from fintracker.mortgage import MortgageCalculator
+from fintracker.strategies import StrategyEngine
+from fintracker.projections import ProjectionEngine
+from fintracker.config import load_plan_or_sample, save_plan
+
+# ─────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="fintracker",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────────────────────
+# Minimal CSS — refined dark-accented palette
+# ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+h1, h2, h3 { font-family: 'DM Serif Display', serif; }
+
+.metric-card {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid #0f3460;
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    color: #e0e0e0;
+}
+.metric-card .label { font-size: 0.75rem; color: #8892a4; text-transform: uppercase; letter-spacing: 0.08em; }
+.metric-card .value { font-family: 'DM Mono', monospace; font-size: 1.75rem; font-weight: 500; color: #e8f4f8; margin-top: 0.25rem; }
+.metric-card .delta-pos { font-size: 0.8rem; color: #4ade80; margin-top: 0.15rem; }
+.metric-card .delta-neg { font-size: 0.8rem; color: #f87171; margin-top: 0.15rem; }
+
+.strategy-card {
+    background: #0d1117;
+    border-left: 3px solid #3b82f6;
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    margin: 0.4rem 0;
+    font-size: 0.875rem;
+    color: #c9d1d9;
+}
+.tip-card {
+    background: #0d1117;
+    border-left: 3px solid #f59e0b;
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    margin: 0.4rem 0;
+    font-size: 0.875rem;
+    color: #c9d1d9;
+}
+.section-header {
+    font-family: 'DM Serif Display', serif;
+    font-size: 1.4rem;
+    color: #e8f4f8;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 0.5rem;
+    margin: 1.5rem 0 1rem 0;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+PLOTLY_DARK = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(13,17,23,0.8)",
+    font=dict(family="Inter", color="#c9d1d9"),
+    xaxis=dict(gridcolor="#21262d", zerolinecolor="#21262d"),
+    yaxis=dict(gridcolor="#21262d", zerolinecolor="#21262d"),
+    margin=dict(l=0, r=0, t=30, b=0),
+)
+
+COLORS = {
+    "retirement": "#3b82f6",
+    "brokerage": "#8b5cf6",
+    "home_equity": "#10b981",
+    "hsa": "#f59e0b",
+    "taxes": "#ef4444",
+    "housing": "#f97316",
+    "lifestyle": "#06b6d4",
+    "breathing": "#4ade80",
+    "p10": "#374151",
+    "p25": "#4b5563",
+    "p50": "#3b82f6",
+    "p75": "#4b5563",
+    "p90": "#374151",
+}
+
+
+def fmt_dollar(v: float) -> str:
+    if abs(v) >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if abs(v) >= 1_000:
+        return f"${v:,.0f}"
+    return f"${v:.0f}"
+
+
+def hex_to_rgba(hex_color: str, alpha: float = 0.7) -> str:
+    """Convert a #rrggbb hex string to a valid rgba(...) string for Plotly."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def metric_card(label: str, value: str, delta: str = "", positive: bool = True) -> str:
+    delta_cls = "delta-pos" if positive else "delta-neg"
+    delta_html = f'<div class="{delta_cls}">{delta}</div>' if delta else ""
+    return f"""
+<div class="metric-card">
+  <div class="label">{label}</div>
+  <div class="value">{value}</div>
+  {delta_html}
+</div>"""
+
+
+# ─────────────────────────────────────────────────────────────
+# Sidebar — build the FinancialPlan
+# ─────────────────────────────────────────────────────────────
+
+def build_sidebar() -> FinancialPlan:
+    st.sidebar.title("⚙️ Configure Your Plan")
+
+    # --- Load from file ---
+    with st.sidebar.expander("📂 Load / Save Config", expanded=False):
+        uploaded = st.file_uploader("Load YAML config", type=["yaml", "yml"], label_visibility="collapsed")
+        if uploaded:
+            import yaml, tempfile, os
+            with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+                f.write(uploaded.read())
+                tmp_path = f.name
+            from fintracker.config import load_plan
+            try:
+                st.session_state["loaded_plan"] = load_plan(tmp_path)
+                st.success("Config loaded!")
+            except Exception as e:
+                st.error(f"Error loading config: {e}")
+            finally:
+                os.unlink(tmp_path)
+
+    # Default starting values (from loaded plan or defaults)
+    defaults = st.session_state.get("loaded_plan", None)
+    d_inc = defaults.income if defaults else None
+    d_hou = defaults.housing if defaults else None
+    d_lif = defaults.lifestyle if defaults else None
+    d_inv = defaults.investments if defaults else None
+    d_str = defaults.strategies if defaults else None
+
+    # ── Income ───────────────────────────────────────────────
+    st.sidebar.header("💵 Income")
+    gross = st.sidebar.number_input(
+        "Gross Annual Income ($)",
+        min_value=0, max_value=5_000_000,
+        value=int(d_inc.gross_annual_income) if d_inc else 120_000, step=5_000,
+    )
+    spouse = st.sidebar.number_input(
+        "Spouse Gross Income ($)",
+        min_value=0, max_value=5_000_000,
+        value=int(d_inc.spouse_gross_annual_income) if d_inc else 0, step=5_000,
+    )
+    filing = st.sidebar.selectbox(
+        "Filing Status",
+        options=[f.value for f in FilingStatus],
+        index=[f.value for f in FilingStatus].index(d_inc.filing_status.value) if d_inc else 0,
+        format_func=lambda x: x.replace("_", " ").title(),
+    )
+    state_options = [s.value for s in State]
+    state_val = st.sidebar.selectbox(
+        "State",
+        options=state_options,
+        index=state_options.index(d_inc.state.value) if d_inc else state_options.index("GA"),
+    )
+    other_rate = 0.05
+    if state_val == "OTHER":
+        other_rate = st.sidebar.slider("State Flat Tax Rate (%)", 0.0, 15.0, 5.0, 0.1) / 100
+
+    income = IncomeProfile(
+        gross_annual_income=float(gross),
+        spouse_gross_annual_income=float(spouse),
+        filing_status=FilingStatus(filing),
+        state=State(state_val),
+        other_state_flat_rate=other_rate,
+    )
+
+    # ── Housing ──────────────────────────────────────────────
+    st.sidebar.header("🏠 Housing")
+    is_renting = st.sidebar.toggle("I'm Renting", value=d_hou.is_renting if d_hou else False)
+
+    if is_renting:
+        monthly_rent = st.sidebar.number_input(
+            "Monthly Rent ($)", min_value=0, max_value=20_000,
+            value=int(d_hou.monthly_rent) if d_hou else 2_000, step=100,
+        )
+        housing = HousingProfile(
+            home_price=0, down_payment=0, interest_rate=0.0,
+            is_renting=True, monthly_rent=float(monthly_rent),
+        )
+    else:
+        home_price = st.sidebar.number_input(
+            "Home Price ($)", min_value=0, max_value=10_000_000,
+            value=int(d_hou.home_price) if d_hou else 400_000, step=10_000,
+        )
+        down_pmt = st.sidebar.number_input(
+            "Down Payment ($)", min_value=0, max_value=home_price,
+            value=min(int(d_hou.down_payment) if d_hou else 80_000, home_price), step=5_000,
+        )
+        rate = st.sidebar.slider(
+            "Mortgage Rate (%)", 2.0, 12.0,
+            float(d_hou.interest_rate * 100) if d_hou else 6.5, 0.125,
+        )
+        housing = HousingProfile(
+            home_price=float(home_price),
+            down_payment=float(down_pmt),
+            interest_rate=rate / 100,
+            annual_property_tax_rate=float(d_hou.annual_property_tax_rate) if d_hou else 0.012,
+            annual_insurance=float(d_hou.annual_insurance) if d_hou else 2_000,
+        )
+
+    # ── Lifestyle ────────────────────────────────────────────
+    st.sidebar.header("🌿 Lifestyle")
+    num_children = st.sidebar.number_input(
+        "Current Children", min_value=0, max_value=10,
+        value=int(d_lif.num_children) if d_lif else 0,
+    )
+    # Always show childcare cost — even with 0 current kids the user may be planning
+    # for future children via timeline events. The projection engine multiplies this
+    # by num_children at each year, so it correctly shows $0 until a child arrives.
+    monthly_childcare = st.sidebar.number_input(
+        "Monthly Childcare per Child ($)",
+        min_value=0, max_value=10_000,
+        value=int(d_lif.monthly_childcare) if d_lif else 0,
+        step=100,
+        help="Cost per child per month. Applied automatically when children are added via Timeline Events.",
+    )
+    num_pets = st.sidebar.number_input(
+        "Pets", min_value=0, max_value=10,
+        value=int(d_lif.num_pets) if d_lif else 0,
+    )
+    annual_pet = 0.0
+    if num_pets > 0:
+        annual_pet = st.sidebar.number_input(
+            "Annual Pet Cost ($)", min_value=0, max_value=20_000,
+            value=int(d_lif.annual_pet_cost) if d_lif else 1_800, step=100,
+        )
+    medical = st.sidebar.number_input(
+        "Annual Medical OOP ($)", min_value=0, max_value=50_000,
+        value=int(d_lif.annual_medical_oop) if d_lif else 3_000, step=500,
+    )
+    vacation = st.sidebar.number_input(
+        "Annual Vacation ($)", min_value=0, max_value=100_000,
+        value=int(d_lif.annual_vacation) if d_lif else 5_000, step=500,
+    )
+    other_monthly = st.sidebar.number_input(
+        "Other Monthly ($)", min_value=0, max_value=10_000,
+        value=int(d_lif.monthly_other_recurring) if d_lif else 500, step=100,
+    )
+    lifestyle = LifestyleProfile(
+        num_children=int(num_children),
+        monthly_childcare=float(monthly_childcare),
+        num_pets=int(num_pets),
+        annual_pet_cost=float(annual_pet),
+        annual_medical_oop=float(medical),
+        annual_vacation=float(vacation),
+        monthly_other_recurring=float(other_monthly),
+    )
+
+    # ── Investments ──────────────────────────────────────────
+    st.sidebar.header("📊 Investments & Savings")
+    liquid_cash = st.sidebar.number_input(
+        "Current Liquid Cash ($)", min_value=0, max_value=10_000_000,
+        value=int(d_inv.current_liquid_cash) if d_inv else 100_000, step=5_000,
+    )
+    retirement_bal = st.sidebar.number_input(
+        "Current Retirement Balance ($)", min_value=0, max_value=10_000_000,
+        value=int(d_inv.current_retirement_balance) if d_inv else 0, step=5_000,
+    )
+    brokerage_bal = st.sidebar.number_input(
+        "Current Brokerage / Taxable Balance ($)", min_value=0, max_value=10_000_000,
+        value=int(d_inv.current_brokerage_balance) if d_inv else 0, step=5_000,
+        help="Existing taxable investment accounts (separate from 401k/IRA/HSA).",
+    )
+    one_time = st.sidebar.number_input(
+        "Upcoming One-Time Expenses ($)", min_value=0, max_value=1_000_000,
+        value=int(d_inv.one_time_upcoming_expenses) if d_inv else 0, step=1_000,
+        help="Wedding, car purchase, etc. Subtracted from investable cash.",
+    )
+    k401 = st.sidebar.number_input(
+        "Annual 401k Contribution ($)", min_value=0, max_value=30_500,
+        value=int(d_inv.annual_401k_contribution) if d_inv else 23_000, step=500,
+    )
+    hsa = st.sidebar.number_input(
+        "Annual HSA Contribution ($)", min_value=0, max_value=8_300,
+        value=int(d_inv.annual_hsa_contribution) if d_inv else 4_150, step=100,
+    )
+    c529 = st.sidebar.number_input(
+        "Annual 529 Contribution per Child ($)", min_value=0, max_value=50_000,
+        value=int(d_inv.annual_529_contribution) if d_inv else 0, step=500,
+    )
+
+    investments = InvestmentProfile(
+        current_liquid_cash=float(liquid_cash),
+        current_retirement_balance=float(retirement_bal),
+        current_brokerage_balance=float(brokerage_bal),
+        one_time_upcoming_expenses=float(one_time),
+        annual_401k_contribution=float(k401),
+        annual_hsa_contribution=float(hsa),
+        annual_529_contribution=float(c529),
+        annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
+        annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
+        annual_salary_growth_rate=float(st.sidebar.slider("Salary Growth (%)", 0.0, 15.0, 4.0, 0.5)) / 100,
+        annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
+    )
+
+    # ── Strategies ───────────────────────────────────────────
+    st.sidebar.header("🎯 Tax Strategies")
+    strategies = StrategyToggles(
+        maximize_hsa=st.sidebar.toggle("Maximize HSA", value=d_str.maximize_hsa if d_str else True),
+        maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
+        use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
+        use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
+    )
+
+    # ── Timeline Events ──────────────────────────────────────
+    st.sidebar.header("🗓️ Timeline Events")
+    st.sidebar.caption("Add life events that change your financial picture.")
+
+    # Seed defaults from loaded plan so YAML events appear in the UI
+    loaded_events = defaults.timeline_events if defaults else []
+    default_n_events = len(loaded_events)
+
+    n_events = st.sidebar.number_input(
+        "Number of events", min_value=0, max_value=15, value=default_n_events
+    )
+    events: list[TimelineEvent] = []
+    for i in range(int(n_events)):
+        # Pull defaults for this slot from the loaded plan (if available)
+        ev_def = loaded_events[i] if i < len(loaded_events) else None
+
+        with st.sidebar.expander(
+            f"Event {i+1}" + (f": {ev_def.description}" if ev_def and ev_def.description else ""),
+            expanded=(i == 0),
+        ):
+            yr = st.number_input(
+                "Year", min_value=1, max_value=50,
+                value=int(ev_def.year) if ev_def else 1,
+                key=f"ev_yr_{i}",
+            )
+            desc = st.text_input(
+                "Description",
+                value=ev_def.description if ev_def else "",
+                key=f"ev_desc_{i}",
+            )
+            ev_marriage = st.checkbox(
+                "Marriage (→ MFJ filing)",
+                value=ev_def.marriage if ev_def else False,
+                key=f"ev_marry_{i}",
+            )
+            ev_child = st.checkbox(
+                "New child",
+                value=ev_def.new_child if ev_def else False,
+                key=f"ev_child_{i}",
+            )
+            ev_pet = st.checkbox(
+                "New pet",
+                value=ev_def.new_pet if ev_def else False,
+                key=f"ev_pet_{i}",
+            )
+            ev_income = st.number_input(
+                "New gross income (0 = no change)",
+                min_value=0, max_value=5_000_000,
+                value=int(ev_def.income_change) if (ev_def and ev_def.income_change) else 0,
+                key=f"ev_inc_{i}",
+            )
+            ev_expense = st.number_input(
+                "One-time expense ($)",
+                min_value=0, max_value=1_000_000,
+                value=int(ev_def.extra_one_time_expense) if ev_def else 0,
+                key=f"ev_exp_{i}",
+            )
+            ev_bonus = st.number_input(
+                "One-time income ($)",
+                min_value=0, max_value=1_000_000,
+                value=int(ev_def.extra_one_time_income) if ev_def else 0,
+                key=f"ev_bonus_{i}",
+            )
+            # Home purchase fields — shown only when buy_home is set in YAML
+            # or if the user explicitly toggles it on
+            ev_buy_home = st.checkbox(
+                "Buy home",
+                value=ev_def.buy_home if ev_def else False,
+                key=f"ev_buyhome_{i}",
+            )
+            ev_new_home_price = None
+            ev_new_home_down = None
+            ev_new_home_rate = None
+            ev_sell_current = True
+            if ev_buy_home:
+                ev_new_home_price = st.number_input(
+                    "New home price ($)",
+                    min_value=0, max_value=10_000_000,
+                    value=int(ev_def.new_home_price) if (ev_def and ev_def.new_home_price) else 500_000,
+                    key=f"ev_hp_{i}",
+                )
+                ev_new_home_down = st.number_input(
+                    "Down payment ($)",
+                    min_value=0, max_value=int(ev_new_home_price),
+                    value=int(ev_def.new_home_down_payment) if (ev_def and ev_def.new_home_down_payment) else int(ev_new_home_price * 0.20),
+                    key=f"ev_hd_{i}",
+                )
+                ev_new_home_rate = st.slider(
+                    "Mortgage rate (%)",
+                    2.0, 12.0,
+                    float(ev_def.new_home_interest_rate * 100) if (ev_def and ev_def.new_home_interest_rate) else 6.5,
+                    0.125,
+                    key=f"ev_hr_{i}",
+                )
+                ev_sell_current = st.checkbox(
+                    "Sell current home (add equity to cash)",
+                    value=ev_def.sell_current_home if ev_def else True,
+                    key=f"ev_sell_{i}",
+                )
+                ev_buyer_closing = st.slider(
+                    "Buyer closing costs (% of price)",
+                    0.0, 5.0,
+                    float(ev_def.buyer_closing_cost_rate * 100) if ev_def else 2.0,
+                    0.25,
+                    key=f"ev_bcc_{i}",
+                    help="Title, lender fees, escrow, transfer tax — typically 1.5–3%",
+                ) / 100
+                ev_seller_closing = 0.06
+                if ev_sell_current:
+                    ev_seller_closing = st.slider(
+                        "Seller closing costs (% of sale price)",
+                        0.0, 10.0,
+                        float(ev_def.seller_closing_cost_rate * 100) if ev_def else 6.0,
+                        0.25,
+                        key=f"ev_scc_{i}",
+                        help="Agent commissions, transfer tax — typically 5–7%",
+                    ) / 100
+
+            events.append(TimelineEvent(
+                year=int(yr),
+                description=desc,
+                marriage=ev_marriage,
+                new_child=ev_child,
+                new_pet=ev_pet,
+                income_change=float(ev_income) if ev_income > 0 else None,
+                extra_one_time_expense=float(ev_expense),
+                extra_one_time_income=float(ev_bonus),
+                buy_home=ev_buy_home,
+                new_home_price=float(ev_new_home_price) if ev_new_home_price else None,
+                new_home_down_payment=float(ev_new_home_down) if ev_new_home_down else None,
+                new_home_interest_rate=float(ev_new_home_rate) / 100 if ev_new_home_rate else None,
+                sell_current_home=ev_sell_current,
+                buyer_closing_cost_rate=ev_buyer_closing,
+                seller_closing_cost_rate=ev_seller_closing,
+            ))
+
+    projection_years = st.sidebar.slider(
+        "Projection Horizon (Years)", 5, 40,
+        defaults.projection_years if defaults else 30,
+    )
+
+    plan = FinancialPlan(
+        income=income, housing=housing, lifestyle=lifestyle,
+        investments=investments, strategies=strategies,
+        timeline_events=events, projection_years=int(projection_years),
+    )
+
+    # Save config button
+    with st.sidebar.expander("💾 Export Config", expanded=False):
+        if st.button("Download as YAML"):
+            import io, yaml
+            from fintracker.config import _plan_to_dict
+            buf = io.StringIO()
+            yaml.dump(_plan_to_dict(plan), buf, default_flow_style=False, sort_keys=False)
+            st.download_button(
+                "⬇️ Download personal.yaml",
+                data=buf.getvalue(),
+                file_name="personal.yaml",
+                mime="text/yaml",
+            )
+
+    return plan
+
+
+# ─────────────────────────────────────────────────────────────
+# Main dashboard
+# ─────────────────────────────────────────────────────────────
+
+def render_dashboard(plan: FinancialPlan) -> None:
+    tax_engine = TaxEngine()
+    strategy_engine = StrategyEngine()
+    projection_engine = ProjectionEngine(plan)
+
+    # Compute everything
+    tax_result = tax_engine.calculate(
+        plan.income, plan.investments, plan.strategies,
+        num_children=plan.lifestyle.num_children,
+    )
+    strategy_result = strategy_engine.analyze(
+        plan.income, plan.investments, plan.strategies,
+        num_children=plan.lifestyle.num_children,
+    )
+    snapshots = projection_engine.run_deterministic()
+
+    monthly_net = (plan.income.total_gross_income - tax_result.total_annual_tax
+                   - plan.investments.annual_hsa_contribution
+                   - plan.investments.annual_401k_contribution) / 12
+
+    mortgage_calc = (
+        MortgageCalculator(plan.housing, plan.investments.annual_home_appreciation_rate)
+        if not plan.housing.is_renting else None
+    )
+    monthly_housing = (
+        mortgage_calc.monthly_total_payment() if mortgage_calc
+        else plan.housing.monthly_rent
+    )
+    monthly_lifestyle = plan.lifestyle.annual_total / 12
+    monthly_breathing = monthly_net - monthly_housing - monthly_lifestyle
+
+    # ── Header ───────────────────────────────────────────────
+    st.markdown("# 📈 fintracker")
+    st.markdown("*Personal long-term financial planning — tax-aware, scenario-driven, Monte Carlo enabled.*")
+    st.divider()
+
+    # ── Top KPIs ─────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.markdown(metric_card("Monthly Take-Home", fmt_dollar(monthly_net)), unsafe_allow_html=True)
+    with c2:
+        st.markdown(metric_card("Monthly Housing", fmt_dollar(monthly_housing)), unsafe_allow_html=True)
+    with c3:
+        delta_sign = monthly_breathing >= 0
+        st.markdown(metric_card(
+            "Monthly Breathing Room", fmt_dollar(monthly_breathing),
+            delta=("▲ Positive cash flow" if delta_sign else "▼ Cash flow deficit"),
+            positive=delta_sign,
+        ), unsafe_allow_html=True)
+    with c4:
+        st.markdown(metric_card(
+            "Tax Strategy Savings", fmt_dollar(strategy_result.total_annual_savings) + "/yr",
+        ), unsafe_allow_html=True)
+    with c5:
+        final_nw = snapshots[-1].net_worth
+        st.markdown(metric_card(
+            f"Net Worth (Yr {plan.projection_years})", fmt_dollar(final_nw),
+        ), unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Tabs ─────────────────────────────────────────────────
+    tabs = st.tabs(["💰 Cash Flow", "🏠 Mortgage", "🎯 Tax Strategies", "📈 Projections", "🎲 Monte Carlo"])
+
+    # ── TAB 1: Cash Flow ─────────────────────────────────────
+    with tabs[0]:
+        st.markdown('<div class="section-header">Monthly Cash Flow Breakdown</div>', unsafe_allow_html=True)
+
+        col_chart, col_detail = st.columns([1, 1])
+
+        with col_chart:
+            monthly_k401 = plan.investments.annual_401k_contribution / 12
+            monthly_hsa = plan.investments.annual_hsa_contribution / 12
+
+            categories = ["Federal Tax", "FICA", "State Tax", "Housing", "Lifestyle",
+                          "401k", "HSA", "Breathing Room"]
+            values = [
+                tax_result.federal_income_tax / 12,
+                tax_result.total_fica / 12,
+                tax_result.state_income_tax / 12,
+                monthly_housing,
+                monthly_lifestyle,
+                monthly_k401,
+                monthly_hsa,
+                max(0, monthly_breathing),
+            ]
+            colors_list = ["#ef4444", "#f97316", "#fbbf24", "#f97316",
+                           "#06b6d4", "#3b82f6", "#f59e0b", "#4ade80"]
+
+            fig = go.Figure(go.Bar(
+                x=categories, y=values,
+                marker_color=colors_list,
+                text=[fmt_dollar(v) for v in values],
+                textposition="outside",
+                textfont=dict(size=11),
+            ))
+            fig.update_layout(
+                title="Monthly Dollar Allocation",
+                **PLOTLY_DARK,
+                yaxis_title="$ / month",
+                showlegend=False,
+                height=380,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col_detail:
+            st.markdown("#### Annual Tax Detail")
+            tax_rows = [
+                ("Federal Income Tax", tax_result.federal_income_tax),
+                ("Social Security (6.2%)", tax_result.social_security_tax),
+                ("Medicare (1.45%)", tax_result.medicare_tax),
+                ("Additional Medicare", tax_result.additional_medicare_tax),
+                ("State Income Tax", tax_result.state_income_tax),
+                ("**Total Tax**", tax_result.total_annual_tax),
+            ]
+            df_tax = pd.DataFrame(tax_rows, columns=["Item", "Annual"])
+            df_tax["Monthly"] = df_tax["Annual"] / 12
+            df_tax["Annual"] = df_tax["Annual"].apply(lambda x: f"${x:,.0f}")
+            df_tax["Monthly"] = df_tax["Monthly"].apply(lambda x: f"${x:,.0f}")
+            st.dataframe(df_tax, hide_index=True, use_container_width=True)
+
+            gross = plan.income.total_gross_income
+            eff_rate = tax_result.total_annual_tax / gross if gross else 0
+            st.markdown(f"**Effective Total Tax Rate:** `{eff_rate:.1%}`")
+
+            if plan.housing.is_renting:
+                st.info("🏠 Currently renting.")
+            elif mortgage_calc:
+                summary = mortgage_calc.summary()
+                st.markdown(f"""
+**Mortgage Summary**
+- Monthly P&I: `{fmt_dollar(summary.monthly_pi)}`
+- PMI: `{fmt_dollar(summary.monthly_pmi_initial)}/mo` {'(drops off month ' + str(summary.pmi_removal_month) + ')' if summary.pmi_removal_month else '(N/A — 20%+ down)'}
+- Total interest over life of loan: `{fmt_dollar(summary.total_interest_paid)}`
+""")
+
+    # ── TAB 2: Mortgage ──────────────────────────────────────
+    with tabs[1]:
+        if plan.housing.is_renting:
+            st.info("🏠 You're currently renting. Configure a home purchase to see amortization details.")
+        elif mortgage_calc:
+            st.markdown('<div class="section-header">Full Amortization Schedule</div>', unsafe_allow_html=True)
+            summary = mortgage_calc.summary()
+            schedule = mortgage_calc.full_schedule()
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Loan Amount", fmt_dollar(summary.loan_amount))
+            m2.metric("Monthly P&I", fmt_dollar(summary.monthly_pi))
+            m3.metric("Total Interest Paid", fmt_dollar(summary.total_interest_paid))
+            m4.metric("PMI Removal", f"Month {summary.pmi_removal_month}" if summary.pmi_removal_month else "N/A")
+
+            # Annual snapshots chart
+            annual_sched = [r for r in schedule if r.month % 12 == 0]
+            years_amort = [r.year for r in annual_sched]
+
+            fig_amort = go.Figure()
+            fig_amort.add_trace(go.Scatter(
+                x=years_amort, y=[r.home_value for r in annual_sched],
+                name="Home Value", fill="tozeroy",
+                line=dict(color=COLORS["home_equity"], width=2),
+                fillcolor="rgba(16,185,129,0.15)",
+            ))
+            fig_amort.add_trace(go.Scatter(
+                x=years_amort, y=[r.balance for r in annual_sched],
+                name="Loan Balance", fill="tozeroy",
+                line=dict(color=COLORS["taxes"], width=2),
+                fillcolor="rgba(239,68,68,0.2)",
+            ))
+            fig_amort.add_trace(go.Scatter(
+                x=years_amort, y=[r.equity for r in annual_sched],
+                name="Your Equity",
+                line=dict(color=COLORS["brokerage"], width=2, dash="dash"),
+            ))
+            fig_amort.update_layout(
+                title="Home Value vs Loan Balance vs Equity",
+                **PLOTLY_DARK, height=380, yaxis_title="$",
+            )
+            st.plotly_chart(fig_amort, use_container_width=True)
+
+            # P&I breakdown over time
+            fig_pi = go.Figure()
+            fig_pi.add_trace(go.Bar(
+                x=years_amort, y=[r.interest for r in annual_sched],
+                name="Interest", marker_color=COLORS["taxes"],
+            ))
+            fig_pi.add_trace(go.Bar(
+                x=years_amort, y=[r.principal for r in annual_sched],
+                name="Principal", marker_color=COLORS["home_equity"],
+            ))
+            fig_pi.update_layout(
+                barmode="stack", title="Annual Interest vs Principal Paid",
+                **PLOTLY_DARK, height=300, yaxis_title="$ / year",
+            )
+            st.plotly_chart(fig_pi, use_container_width=True)
+
+            # Full table (collapsed by default)
+            with st.expander("📋 Full Amortization Table (month-by-month)"):
+                df_sched = pd.DataFrame([{
+                    "Month": r.month,
+                    "Year": r.year,
+                    "Payment": f"${r.payment:,.0f}",
+                    "Principal": f"${r.principal:,.0f}",
+                    "Interest": f"${r.interest:,.0f}",
+                    "PMI": f"${r.pmi:,.2f}",
+                    "Balance": f"${r.balance:,.0f}",
+                    "Cumulative Interest": f"${r.cumulative_interest:,.0f}",
+                    "Home Value": f"${r.home_value:,.0f}",
+                    "Equity": f"${r.equity:,.0f}",
+                } for r in schedule])
+                st.dataframe(df_sched, hide_index=True, use_container_width=True, height=400)
+
+    # ── TAB 3: Tax Strategies ────────────────────────────────
+    with tabs[2]:
+        st.markdown('<div class="section-header">Tax Optimization Analysis</div>', unsafe_allow_html=True)
+
+        sa1, sa2, sa3, sa4 = st.columns(4)
+        sa1.metric("HSA Savings", fmt_dollar(strategy_result.hsa_annual_savings) + "/yr")
+        sa2.metric("401k Savings", fmt_dollar(strategy_result.k401_annual_savings) + "/yr")
+        sa3.metric("529 State Savings", fmt_dollar(strategy_result.state_529_annual_savings) + "/yr")
+        sa4.metric("Total Tax Alpha", fmt_dollar(strategy_result.total_annual_savings) + "/yr",
+                   delta=f"≈ {fmt_dollar(strategy_result.total_annual_savings * 10)} over 10 yrs (uninvested)")
+
+        st.markdown("#### Strategy Insights")
+        for note in strategy_result.notes:
+            is_tip = note.startswith("💡") or note.startswith("⚠️")
+            card_class = "tip-card" if is_tip else "strategy-card"
+            st.markdown(f'<div class="{card_class}">{note}</div>', unsafe_allow_html=True)
+
+        # Waterfall chart: income → take-home
+        st.markdown("#### Where Does Your Gross Income Go?")
+        gross = plan.income.total_gross_income
+        waterfall_cats = [
+            "Gross Income",
+            "Federal Tax",
+            "FICA",
+            "State Tax",
+            "401k",
+            "HSA",
+            "Take-Home",
+        ]
+        waterfall_vals = [
+            gross,
+            -tax_result.federal_income_tax,
+            -tax_result.total_fica,
+            -tax_result.state_income_tax,
+            -plan.investments.annual_401k_contribution if plan.strategies.maximize_401k else 0,
+            -plan.investments.annual_hsa_contribution if plan.strategies.maximize_hsa else 0,
+            0,  # calculated
+        ]
+        take_home = gross + sum(waterfall_vals[1:-1])
+        waterfall_vals[-1] = take_home
+
+        measures = ["absolute"] + ["relative"] * (len(waterfall_cats) - 2) + ["total"]
+        wf_colors = (
+            ["#4ade80"]
+            + ["#ef4444"] * 3
+            + ["#3b82f6", "#f59e0b"]
+            + ["#4ade80"]
+        )
+
+        fig_wf = go.Figure(go.Waterfall(
+            orientation="v",
+            measure=measures,
+            x=waterfall_cats,
+            y=waterfall_vals,
+            connector=dict(line=dict(color="#21262d", width=1)),
+            increasing=dict(marker_color="#4ade80"),
+            decreasing=dict(marker_color="#ef4444"),
+            totals=dict(marker_color="#4ade80"),
+            text=[fmt_dollar(abs(v)) for v in waterfall_vals],
+            textposition="outside",
+        ))
+        fig_wf.update_layout(
+            title="Annual Income Waterfall",
+            **PLOTLY_DARK, height=400, yaxis_title="$",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_wf, use_container_width=True)
+
+    # ── TAB 4: Projections ───────────────────────────────────
+    with tabs[3]:
+        st.markdown('<div class="section-header">Long-Term Wealth Projection</div>', unsafe_allow_html=True)
+
+        df = pd.DataFrame([{
+            "Year": s.year,
+            "Gross Income": s.gross_income,
+            "Net Income": s.net_income,
+            "Housing Cost": s.annual_housing_cost,
+            "Lifestyle Cost": s.annual_lifestyle_cost,
+            "Breathing Room": s.annual_breathing_room,
+            "Retirement": s.retirement_balance,
+            "Brokerage": s.brokerage_balance,
+            "Liquid Assets": s.brokerage_balance,  # cash + brokerage (HSA is illiquid)
+            "Home Equity": s.home_equity,
+            "HSA": s.hsa_balance,
+            "Net Worth": s.net_worth,
+            "Mortgage Balance": s.mortgage_balance,
+            "Taxes": s.annual_tax_total,
+        } for s in snapshots])
+
+        # Net worth composition stacked area
+        fig_nw = go.Figure()
+        for key, label, color in [
+            ("Retirement", "Retirement", COLORS["retirement"]),
+            ("Brokerage", "Brokerage", COLORS["brokerage"]),
+            ("Home Equity", "Home Equity", COLORS["home_equity"]),
+            ("HSA", "HSA", COLORS["hsa"]),
+        ]:
+            fig_nw.add_trace(go.Scatter(
+                x=df["Year"], y=df[key], name=label,
+                mode="lines", stackgroup="one",
+                line=dict(width=0.5, color=color),
+                fillcolor=hex_to_rgba(color, 0.7) if color.startswith("#") else color,
+            ))
+        fig_nw.update_layout(
+            title="Net Worth Composition Over Time",
+            **PLOTLY_DARK, height=420, yaxis_title="$",
+        )
+        st.plotly_chart(fig_nw, use_container_width=True)
+
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            # Income vs costs + liquid assets on secondary axis
+            fig_cf = go.Figure()
+            fig_cf.add_trace(go.Scatter(
+                x=df["Year"], y=df["Net Income"], name="Net Income",
+                line=dict(color="#4ade80", width=2),
+                yaxis="y1",
+            ))
+            fig_cf.add_trace(go.Scatter(
+                x=df["Year"],
+                y=df["Housing Cost"] + df["Lifestyle Cost"],
+                name="Total Expenses",
+                line=dict(color="#ef4444", width=2),
+                yaxis="y1",
+            ))
+            fig_cf.add_trace(go.Scatter(
+                x=df["Year"], y=df["Liquid Assets"], name="Liquid Assets (cash + brokerage)",
+                line=dict(color="#f59e0b", width=2, dash="dot"),
+                yaxis="y2",
+                fill="tozeroy",
+                fillcolor="rgba(245,158,11,0.08)",
+            ))
+            # Can't use **PLOTLY_DARK here because it already defines 'yaxis';
+            # passing yaxis= again would cause a duplicate keyword error.
+            fig_cf.update_layout(
+                title="Income vs Expenses + Liquid Assets",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(13,17,23,0.8)",
+                font=dict(family="Inter", color="#c9d1d9"),
+                margin=dict(l=0, r=0, t=30, b=0),
+                height=320,
+                xaxis=dict(gridcolor="#21262d", zerolinecolor="#21262d"),
+                yaxis=dict(title="$ / year", gridcolor="#21262d", zerolinecolor="#21262d"),
+                yaxis2=dict(
+                    title="Liquid Assets ($)",
+                    overlaying="y",
+                    side="right",
+                    gridcolor="rgba(0,0,0,0)",
+                    zerolinecolor="#374151",
+                    zerolinewidth=1,
+                    tickformat="$,.0f",
+                ),
+                legend=dict(orientation="h", y=-0.25, x=0),
+            )
+            st.plotly_chart(fig_cf, use_container_width=True)
+
+        with col_r:
+            # Breathing room bar
+            br_colors = ["#4ade80" if v >= 0 else "#ef4444" for v in df["Breathing Room"]]
+            fig_br = go.Figure(go.Bar(
+                x=df["Year"], y=df["Breathing Room"],
+                marker_color=br_colors,
+                text=[fmt_dollar(v) for v in df["Breathing Room"]],
+                textposition="outside",
+            ))
+            fig_br.update_layout(
+                title="Annual Breathing Room (Cash Surplus)", **PLOTLY_DARK, height=300, yaxis_title="$",
+            )
+            st.plotly_chart(fig_br, use_container_width=True)
+
+        # ── Liquidity warnings ───────────────────────────────────
+        negative_years = [s for s in snapshots if s.brokerage_balance < 0]
+        low_years = [s for s in snapshots if 0 <= s.brokerage_balance < 10_000]
+        if negative_years:
+            first = negative_years[0]
+            worst = min(negative_years, key=lambda s: s.brokerage_balance)
+            st.error(
+                f"⚠️ **Liquid assets go negative in Year {first.year}** — "
+                f"worst point is **{fmt_dollar(worst.brokerage_balance)}** in Year {worst.year}. "
+                f"You would need to sell investments, take on debt, or reduce expenses to cover the shortfall."
+            )
+        elif low_years:
+            first = low_years[0]
+            st.warning(
+                f"⚠️ **Liquid assets fall below $10,000 in Year {first.year}** "
+                f"(lowest: **{fmt_dollar(min(s.brokerage_balance for s in low_years))}**). "
+                f"Consider building a larger emergency buffer."
+            )
+
+        # Key milestones
+        st.markdown("#### Key Milestones")
+        milestones = []
+        for s in snapshots:
+            if s.net_worth >= 500_000 and not any(m[0] == "Net Worth $500k" for m in milestones):
+                milestones.append(("Net Worth $500k", f"Year {s.year}"))
+            if s.net_worth >= 1_000_000 and not any(m[0] == "Net Worth $1M" for m in milestones):
+                milestones.append(("Net Worth $1M 🎉", f"Year {s.year}"))
+            if s.net_worth >= 2_000_000 and not any(m[0] == "Net Worth $2M" for m in milestones):
+                milestones.append(("Net Worth $2M", f"Year {s.year}"))
+        if not milestones:
+            milestones.append(("Net Worth $1M", f"Not reached in {plan.projection_years} years"))
+
+        mc1, mc2, mc3 = st.columns(3)
+        for i, (label, year) in enumerate(milestones[:3]):
+            [mc1, mc2, mc3][i].metric(label, year)
+
+        # Data table
+        with st.expander("📋 Full Year-by-Year Projection Table"):
+            display_df = df.copy()
+            for col in ["Gross Income", "Net Income", "Housing Cost", "Lifestyle Cost",
+                        "Breathing Room", "Retirement", "Brokerage", "Home Equity",
+                        "HSA", "Net Worth", "Taxes"]:
+                display_df[col] = display_df[col].apply(lambda x: f"${x:,.0f}")
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    # ── TAB 5: Monte Carlo ───────────────────────────────────
+    with tabs[4]:
+        st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
+        st.markdown("Randomizes market returns (±15% std), inflation (±1.5%), and salary growth (±2%) across 1,000 simulations to show the range of possible outcomes.")
+
+        with st.spinner("Running 1,000 simulations…"):
+            mc = projection_engine.run_monte_carlo(n_simulations=1_000, seed=42)
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Median Net Worth (Final Year)", fmt_dollar(mc.p50_net_worth[-1]))
+        mc2.metric("Best 10% (90th pct)", fmt_dollar(mc.p90_net_worth[-1]))
+        mc3.metric("Worst 10% (10th pct)", fmt_dollar(mc.p10_net_worth[-1]))
+
+        fig_mc = go.Figure()
+
+        # Confidence bands
+        years_mc = mc.years
+        fig_mc.add_trace(go.Scatter(
+            x=years_mc + years_mc[::-1],
+            y=mc.p90_net_worth + mc.p10_net_worth[::-1],
+            fill="toself", fillcolor="rgba(59,130,246,0.1)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="10th–90th pct band",
+            hoverinfo="skip",
+        ))
+        fig_mc.add_trace(go.Scatter(
+            x=years_mc + years_mc[::-1],
+            y=mc.p75_net_worth + mc.p25_net_worth[::-1],
+            fill="toself", fillcolor="rgba(59,130,246,0.2)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="25th–75th pct band",
+            hoverinfo="skip",
+        ))
+        fig_mc.add_trace(go.Scatter(
+            x=years_mc, y=mc.p50_net_worth,
+            name="Median (p50)", line=dict(color="#3b82f6", width=2.5),
+        ))
+        fig_mc.add_trace(go.Scatter(
+            x=years_mc, y=mc.p90_net_worth,
+            name="Optimistic (p90)", line=dict(color="#4ade80", width=1.5, dash="dot"),
+        ))
+        fig_mc.add_trace(go.Scatter(
+            x=years_mc, y=mc.p10_net_worth,
+            name="Pessimistic (p10)", line=dict(color="#f87171", width=1.5, dash="dot"),
+        ))
+
+        # Deterministic overlay
+        fig_mc.add_trace(go.Scatter(
+            x=[s.year for s in snapshots], y=[s.net_worth for s in snapshots],
+            name="Deterministic", line=dict(color="#f59e0b", width=2, dash="dash"),
+        ))
+
+        fig_mc.update_layout(
+            title=f"Net Worth Distribution — 1,000 Simulations × {plan.projection_years} Years",
+            **PLOTLY_DARK, height=500, yaxis_title="Net Worth ($)",
+            xaxis_title="Year",
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
+
+        col_prob1, col_prob2 = st.columns(2)
+        with col_prob1:
+            st.metric(
+                "Probability of $1M+ (Year 10)",
+                f"{mc.prob_millionaire_10yr:.1%}",
+            )
+        with col_prob2:
+            st.metric(
+                "Simulations Run",
+                f"{mc.num_simulations:,}",
+            )
+
+        # Histogram of final year outcomes
+        st.markdown("#### Distribution of Final-Year Net Worth")
+        # We can't easily store all sim results from MonteCarloResult, so show percentile bar
+        pct_labels = ["p10", "p25", "p50", "p75", "p90"]
+        pct_values = [
+            mc.p10_net_worth[-1], mc.p25_net_worth[-1],
+            mc.p50_net_worth[-1], mc.p75_net_worth[-1],
+            mc.p90_net_worth[-1],
+        ]
+        fig_hist = go.Figure(go.Bar(
+            x=pct_labels, y=pct_values,
+            marker_color=["#f87171", "#fb923c", "#3b82f6", "#34d399", "#4ade80"],
+            text=[fmt_dollar(v) for v in pct_values],
+            textposition="outside",
+        ))
+        fig_hist.update_layout(
+            title=f"Net Worth Percentiles at Year {plan.projection_years}",
+            **PLOTLY_DARK, height=320, yaxis_title="$",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
+
+def _auto_load_personal_config() -> None:
+    """
+    On first page load, look for personal.yaml next to app.py and
+    pre-populate session_state so the sidebar reflects the user's real numbers.
+    Only runs once per session; manual uploads/changes override it.
+    """
+    if "loaded_plan" in st.session_state:
+        return  # already loaded (either auto or by user upload)
+
+    app_dir = pathlib.Path(__file__).parent
+    candidates = [
+        app_dir / "config" / "personal.yaml",
+        app_dir / "config" / "personal.yml",
+    ]
+    for path in candidates:
+        if path.exists():
+            from fintracker.config import load_plan
+            try:
+                st.session_state["loaded_plan"] = load_plan(path)
+            except Exception:
+                pass  # malformed YAML — fall through to defaults silently
+            return
+
+
+def main():
+    _auto_load_personal_config()
+    plan = build_sidebar()
+    render_dashboard(plan)
+
+
+if __name__ == "__main__":
+    main()
