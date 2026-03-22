@@ -915,22 +915,51 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 f"Consider building a larger emergency buffer."
             )
 
-        # Key milestones
+        # Key milestones — deduplicated, dynamically laid out
         st.markdown("#### Key Milestones")
-        milestones = []
-        for s in snapshots:
-            if s.net_worth >= 500_000 and not any(m[0] == "Net Worth $500k" for m in milestones):
-                milestones.append(("Net Worth $500k", f"Year {s.year}"))
-            if s.net_worth >= 1_000_000 and not any(m[0] == "Net Worth $1M" for m in milestones):
-                milestones.append(("Net Worth $1M 🎉", f"Year {s.year}"))
-            if s.net_worth >= 2_000_000 and not any(m[0] == "Net Worth $2M" for m in milestones):
-                milestones.append(("Net Worth $2M", f"Year {s.year}"))
-        if not milestones:
-            milestones.append(("Net Worth $1M", f"Not reached in {plan.projection_years} years"))
 
-        mc1, mc2, mc3 = st.columns(3)
-        for i, (label, year) in enumerate(milestones[:3]):
-            [mc1, mc2, mc3][i].metric(label, year)
+        # Each entry: (label, value, delta_note)
+        # We scan snapshots once and record the FIRST year each threshold is crossed.
+        # Thresholds are scaled to the projection horizon so they're always meaningful.
+        nw_thresholds = [
+            (250_000,  "Net Worth $250k"),
+            (500_000,  "Net Worth $500k"),
+            (1_000_000, "Net Worth $1M 🎉"),
+            (2_000_000, "Net Worth $2M"),
+            (5_000_000, "Net Worth $5M"),
+        ]
+        reached = {}  # label -> YearlySnapshot
+        for s in snapshots:
+            for threshold, label in nw_thresholds:
+                if label not in reached and s.net_worth >= threshold:
+                    reached[label] = s
+
+        milestones = []
+        for _, label in nw_thresholds:
+            if label in reached:
+                s = reached[label]
+                milestones.append((label, f"Year {s.year}", f"NW {fmt_dollar(s.net_worth)}"))
+
+        # Add mortgage payoff milestone
+        mortgage_paid = next((s for s in snapshots if s.mortgage_balance == 0 and not s.is_renting), None)
+        if mortgage_paid:
+            milestones.append(("🏠 Mortgage Paid Off", f"Year {mortgage_paid.year}", ""))
+
+        # Add "debt-free" note if brokerage ever goes deeply negative
+        worst_liquid = min(snapshots, key=lambda s: s.brokerage_balance)
+        if worst_liquid.brokerage_balance < -50_000:
+            milestones.append(("⚠️ Peak Cash Deficit", f"Year {worst_liquid.year}",
+                               fmt_dollar(worst_liquid.brokerage_balance)))
+
+        if not milestones:
+            milestones.append(("Net Worth $1M", f"Not reached in {plan.projection_years} years", ""))
+
+        # Render in rows of 3
+        for row_start in range(0, len(milestones), 3):
+            row = milestones[row_start:row_start + 3]
+            cols = st.columns(len(row))
+            for col, (label, value, delta) in zip(cols, row):
+                col.metric(label, value, delta if delta else None)
 
         # Data table
         with st.expander("📋 Full Year-by-Year Projection Table"):
