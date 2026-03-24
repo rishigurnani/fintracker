@@ -225,7 +225,9 @@ class ProjectionEngine:
             amort_lookup = self._build_amort_lookup(mortgage_calc)
 
         return {
-            "gross_income": p.income.total_gross_income,
+            "income_primary": p.income.gross_annual_income,
+            "income_partner": p.income.spouse_gross_annual_income,
+            "gross_income": p.income.total_gross_income,  # derived; keep for compatibility
             "filing_status": p.income.filing_status,
             "is_married": is_married,
             "num_children": p.lifestyle.num_children,
@@ -271,7 +273,11 @@ class ProjectionEngine:
 
             # --- Income change ---
             if event.income_change is not None:
-                state["gross_income"] = event.income_change
+                state["income_primary"] = event.income_change
+                state["gross_income"] = state["income_primary"] + state["income_partner"]
+            if event.partner_income_change is not None:
+                state["income_partner"] = event.partner_income_change
+                state["gross_income"] = state["income_primary"] + state["income_partner"]
 
             # --- One-time cash flows ---
             if event.extra_one_time_income:
@@ -298,12 +304,15 @@ class ProjectionEngine:
                 # Sell current home: equity goes into brokerage
                 if event.sell_current_home and not state["is_renting"]:
                     current_equity = max(0.0, state["home_value"] - state["mortgage_balance"])
-                    # Typical closing costs on sale ≈ 6% of sale price
-                    sale_proceeds = current_equity - (state["home_value"] * 0.06)
+                    # Seller closing costs: configurable per event (default 6%)
+                    seller_closing = state["home_value"] * event.seller_closing_cost_rate
+                    sale_proceeds = current_equity - seller_closing
                     state["brokerage_balance"] += max(0.0, sale_proceeds)
 
-                # Pay down payment from brokerage
+                # Pay down payment + buyer closing costs from brokerage
+                buyer_closing = new_price * event.buyer_closing_cost_rate
                 state["brokerage_balance"] -= new_down
+                state["brokerage_balance"] -= buyer_closing
 
                 # Build fresh mortgage calculator for the new home
                 new_housing_profile = HousingProfile(
@@ -359,17 +368,22 @@ class ProjectionEngine:
 
         # Inflate contributions, capped at IRS limits
         inf_factor = (1 + inflation) ** (year - 1)
-        # When maximize_hsa=True: contribute the full IRS limit (that's what 'maximize' means).
-        # When False: use the user's stated contribution, capped at IRS limit as a safety check.
-        if strat.maximize_hsa:
-            hsa_cont = hsa_irs_limit
-        else:
-            hsa_cont = min(inv.annual_hsa_contribution * inf_factor, hsa_irs_limit)
-        if strat.maximize_401k:
-            k401_cont = 30_500  # full IRS limit (23k employee + catch-up if 50+)
-        else:
-            k401_cont = min(inv.annual_401k_contribution * inf_factor, 30_500)
-        r529_cont = inv.annual_529_contribution * inf_factor
+        # Always use the user's stated HSA contribution, capped at IRS limit.
+        # maximize_hsa controls tax treatment and strategy analyzer recommendations,
+        # NOT the contribution amount. User sets their own target in annual_hsa_contribution.
+        hsa_cont = min(inv.annual_hsa_contribution, hsa_irs_limit) if strat.maximize_hsa else 0.0
+        # Always use the user's stated contribution — the projection should reflect
+        # what they actually plan to contribute, not the theoretical IRS maximum.
+        # maximize_401k only controls the pre-tax treatment in the tax calculation
+        # and the strategy analyzer's recommendations. It does NOT override the amount.
+        k401_cont = min(inv.annual_401k_contribution, 30_500)
+        # Partner 401k: same principle
+        partner_k401 = (
+            min(inv.partner_annual_401k_contribution, 30_500)
+            if state["income_partner"] > 0
+            else 0.0
+        )
+        r529_cont = inv.annual_529_contribution  # nominal; user controls this explicitly
 
         tmp_income = IncomeProfile(
             gross_annual_income=gross_income,
@@ -378,8 +392,8 @@ class ProjectionEngine:
             other_state_flat_rate=p.income.other_state_flat_rate,
         )
         tmp_inv = InvestmentProfile(
-            annual_hsa_contribution=hsa_cont if strat.maximize_hsa else 0.0,
-            annual_401k_contribution=k401_cont if strat.maximize_401k else 0.0,
+            annual_hsa_contribution=hsa_cont,   # always deducted if contributing
+            annual_401k_contribution=k401_cont,  # always deducted if contributing
             annual_529_contribution=r529_cont,
         )
 
@@ -387,7 +401,7 @@ class ProjectionEngine:
             tmp_income, tmp_inv, strat, num_children=num_children
         )
 
-        net_income = gross_income - tax_result.total_annual_tax - hsa_cont - k401_cont
+        net_income = gross_income - tax_result.total_annual_tax - hsa_cont - k401_cont - partner_k401
 
         # --- Housing ---
         mortgage_calc: Optional[MortgageCalculator] = state.get("mortgage_calc")
@@ -440,7 +454,7 @@ class ProjectionEngine:
         breathing_room = net_income - annual_housing - annual_lifestyle - annual_529
 
         # --- Asset growth ---
-        retirement_bal = state["retirement_balance"] * (1 + market_return) + k401_cont
+        retirement_bal = state["retirement_balance"] * (1 + market_return) + k401_cont + partner_k401
         hsa_bal = state["hsa_balance"] * (1 + market_return) + hsa_cont
         # Negative breathing_room correctly drains brokerage (deficit spending)
         brokerage_bal = state["brokerage_balance"] * (1 + market_return) + breathing_room
@@ -455,7 +469,7 @@ class ProjectionEngine:
             annual_housing_cost=annual_housing,
             annual_lifestyle_cost=annual_lifestyle,
             annual_medical_oop=medical_oop,
-            annual_retirement_contributions=k401_cont,
+            annual_retirement_contributions=k401_cont + partner_k401,
             annual_hsa_contributions=hsa_cont,
             annual_breathing_room=breathing_room,
             retirement_balance=retirement_bal,
@@ -486,7 +500,10 @@ class ProjectionEngine:
         p = self._plan
         sg = salary_growth if salary_growth is not None else p.investments.annual_salary_growth_rate
 
-        state["gross_income"] *= (1 + sg)
+        partner_sg = salary_growth if salary_growth is not None else p.investments.partner_salary_growth_rate
+        state["income_primary"] *= (1 + sg)
+        state["income_partner"] *= (1 + partner_sg)
+        state["gross_income"] = state["income_primary"] + state["income_partner"]
         state["retirement_balance"] = snap.retirement_balance
         state["brokerage_balance"] = snap.brokerage_balance
         state["hsa_balance"] = snap.hsa_balance

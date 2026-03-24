@@ -244,18 +244,30 @@ class TestChildcare:
         assert yr2_childcare == pytest.approx(60_000, abs=10)   # 2 children
 
     def test_childcare_inflates_each_year(self):
-        plan = self._childcare_plan(events=[
-            TimelineEvent(year=1, description="Child", new_child=True)
-        ], inflation=0.03)
+        # annual_lifestyle_cost does NOT include housing — rent is in annual_housing_cost.
+        # Use monthly_rent=0 so lifestyle == childcare with nothing to subtract.
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=2_500, num_children=0,
+                annual_vacation=0, monthly_other_recurring=0,
+                annual_medical_oop=0, medical_auto_scale=False,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=500_000, annual_market_return=0.0,
+                annual_inflation_rate=0.03, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(year=1, description="Child", new_child=True)],
+            projection_years=4,
+        )
         snaps = ProjectionEngine(plan).run_deterministic()
         for s in snaps:
             inf = (1.03) ** (s.year - 1)
             expected = s.num_children * 2_500 * 12 * inf
-            # Isolate childcare: lifestyle = childcare + rent*12*inf (no vacation/other/medical)
-            rent_cost = 1_500 * 12 * inf
-            implied_childcare = s.annual_lifestyle_cost - rent_cost
-            assert implied_childcare == pytest.approx(expected, abs=5), \
-                f"Year {s.year}: expected childcare {expected:.0f}, got {implied_childcare:.0f}"
+            assert s.annual_lifestyle_cost == pytest.approx(expected, abs=5), \
+                f"Year {s.year}: expected childcare {expected:.0f}, got {s.annual_lifestyle_cost:.0f}"
 
 
 # ── 4. Salary growth ──────────────────────────────────────────────────────────
@@ -522,11 +534,34 @@ class TestMarriageEvent:
         assert s[0].annual_medical_oop == pytest.approx(3_000, abs=1)
         assert s[1].annual_medical_oop == pytest.approx(6_000, abs=1)  # 3000 * 2.0
 
-    def test_hsa_upgrades_to_family_limit_on_marriage(self):
-        """maximize_hsa=True must contribute the full family limit after marriage."""
+    def test_hsa_stated_amount_honored_after_marriage(self):
+        """Stated annual_hsa_contribution=4150 is honored even after marriage.
+        Marriage upgrades the IRS cap from 4150 to 8300, but the engine
+        still contributes exactly what was stated. To receive 8300 the user
+        must set annual_hsa_contribution=8300 in their YAML."""
         s = ProjectionEngine(self._plan([TimelineEvent(year=2, description='Marry', marriage=True)])).run_deterministic()
-        assert s[0].annual_hsa_contributions == pytest.approx(4_150, abs=1)   # single
-        assert s[1].annual_hsa_contributions == pytest.approx(8_300, abs=1)   # family
+        assert s[0].annual_hsa_contributions == pytest.approx(4_150, abs=1)   # single, stated 4150
+        assert s[1].annual_hsa_contributions == pytest.approx(4_150, abs=1)   # married, stated 4150 still honored
+
+    def test_hsa_family_cap_allows_8300_when_stated(self):
+        """If user sets annual_hsa_contribution=8300, they get 4150 (single cap) before
+        marriage and 8300 (family cap) after marriage."""
+        plan = FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.GEORGIA),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_medical_oop=0, medical_auto_scale=False,
+                                       annual_vacation=0, monthly_other_recurring=0),
+            investments=InvestmentProfile(current_liquid_cash=200_000,
+                                          annual_hsa_contribution=8_300,
+                                          annual_market_return=0.0, annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=True, maximize_401k=False),
+            timeline_events=[TimelineEvent(year=2, description='Marry', marriage=True)],
+            projection_years=3,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        assert s[0].annual_hsa_contributions == pytest.approx(4_150, abs=1)   # capped at single limit
+        assert s[1].annual_hsa_contributions == pytest.approx(8_300, abs=1)   # family cap unlocked
 
     def test_mfj_tax_lower_than_single(self):
         """MFJ filing status must reduce tax relative to single at same income."""
@@ -540,31 +575,64 @@ class TestMarriageEvent:
 
 
 class TestMaximizeContributions:
+    """
+    REGRESSION CLASS — these tests document bugs that were introduced and fixed.
 
-    def test_maximize_hsa_hits_single_irs_limit(self):
-        """maximize_hsa=True should contribute exactly the IRS single limit."""
+    The core rule: annual_401k_contribution and annual_hsa_contribution in
+    InvestmentProfile are the user's stated nominal amounts. The projection
+    engine ALWAYS uses exactly what is stated, capped at IRS limits.
+    maximize_401k / maximize_hsa flags control tax treatment only,
+    NOT the contribution amount.
+
+    Bug history:
+      - "maximize means maximize" fix incorrectly overrode stated 23k to 30.5k,
+        silently diverting $7,500/yr from brokerage to retirement and causing
+        liquid assets to go negative years earlier than the user expected.
+    """
+
+    def test_stated_401k_is_honored_when_maximize_true(self):
+        """REGRESSION: maximize_401k=True must NOT override stated contribution.
+        User set 23k → engine must contribute exactly 23k, not 30.5k.
+        This was the bug that caused liquid assets to go negative unexpectedly."""
+        plan = FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=200_000,
+                                          annual_401k_contribution=23_000,
+                                          annual_market_return=0.0, annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=True),
+            projection_years=3,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        for snap in s:
+            assert snap.annual_retirement_contributions == pytest.approx(23_000, abs=1),                 f"Year {snap.year}: expected 23000, got {snap.annual_retirement_contributions:.0f}. "                 f"maximize_401k=True must not override the stated contribution amount."
+
+    def test_stated_hsa_is_honored_when_maximize_true(self):
+        """REGRESSION: maximize_hsa=True must NOT override stated contribution."""
         plan = FinancialPlan(
             income=IncomeProfile(120_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
             investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_hsa_contribution=1_000,  # user set low — should be overridden
+                                          annual_hsa_contribution=3_000,
                                           annual_market_return=0.0, annual_inflation_rate=0.0,
                                           annual_salary_growth_rate=0.0),
             strategies=StrategyToggles(maximize_hsa=True, maximize_401k=False),
             projection_years=2,
         )
         s = ProjectionEngine(plan).run_deterministic()
-        assert s[0].annual_hsa_contributions == pytest.approx(4_150, abs=1)
+        assert s[0].annual_hsa_contributions == pytest.approx(3_000, abs=1),             f"maximize_hsa=True overrode stated 3000 to {s[0].annual_hsa_contributions:.0f}"
 
-    def test_maximize_401k_hits_irs_limit(self):
-        """maximize_401k=True should contribute exactly the IRS limit regardless of user setting."""
+    def test_stated_401k_at_irs_limit_works(self):
+        """User who explicitly sets 30500 gets 30500 — IRS cap does not cut below stated."""
         plan = FinancialPlan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
             investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_401k_contribution=5_000,  # user set low
+                                          annual_401k_contribution=30_500,
                                           annual_market_return=0.0, annual_inflation_rate=0.0,
                                           annual_salary_growth_rate=0.0),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=True),
@@ -573,24 +641,65 @@ class TestMaximizeContributions:
         s = ProjectionEngine(plan).run_deterministic()
         assert s[0].annual_retirement_contributions == pytest.approx(30_500, abs=1)
 
-    def test_maximize_false_uses_user_amount(self):
-        """When maximize flags are off, use the user's stated contribution."""
+    def test_contribution_capped_at_irs_limit(self):
+        """Engine must not allow contributions above IRS limits even if user states more."""
+        plan = FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=200_000,
+                                          annual_401k_contribution=99_000,  # above IRS limit
+                                          annual_hsa_contribution=99_000,
+                                          annual_market_return=0.0, annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=True, maximize_401k=True),
+            projection_years=2,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        assert s[0].annual_retirement_contributions <= 30_500 + 1
+        assert s[0].annual_hsa_contributions <= 8_300 + 1
+
+    def test_maximize_false_means_zero_hsa_contribution(self):
+        """maximize_hsa=False means HSA not used at all, even if amount is set."""
         plan = FinancialPlan(
             income=IncomeProfile(120_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
             investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_hsa_contribution=2_000,
-                                          annual_401k_contribution=10_000,
+                                          annual_hsa_contribution=4_150,
                                           annual_market_return=0.0, annual_inflation_rate=0.0,
                                           annual_salary_growth_rate=0.0),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             projection_years=2,
         )
         s = ProjectionEngine(plan).run_deterministic()
-        assert s[0].annual_hsa_contributions == pytest.approx(2_000, abs=1)
-        assert s[0].annual_retirement_contributions == pytest.approx(10_000, abs=1)
+        assert s[0].annual_hsa_contributions == pytest.approx(0.0, abs=1)
 
+    def test_contribution_amount_unchanged_by_maximize_flag(self):
+        """REGRESSION: maximize_401k=True with stated 23k must contribute exactly 23k,
+        NOT 30.5k. The flag controls tax deduction treatment only — contribution amount
+        and retirement balance growth must be identical regardless of the flag."""
+        def make(maximize):
+            return FinancialPlan(
+                income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+                housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+                lifestyle=LifestyleProfile(),
+                investments=InvestmentProfile(current_liquid_cash=100_000,
+                                              annual_401k_contribution=23_000,
+                                              annual_market_return=0.0, annual_inflation_rate=0.0,
+                                              annual_salary_growth_rate=0.0),
+                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=maximize),
+                projection_years=3,
+            )
+        s_on  = ProjectionEngine(make(True)).run_deterministic()
+        s_off = ProjectionEngine(make(False)).run_deterministic()
+        for on, off in zip(s_on, s_off):
+            assert on.annual_retirement_contributions == pytest.approx(23_000, abs=1), \
+                f"Year {on.year}: maximize=True contributed {on.annual_retirement_contributions:.0f}, expected 23000"
+            assert off.annual_retirement_contributions == pytest.approx(23_000, abs=1), \
+                f"Year {on.year}: maximize=False contributed {off.annual_retirement_contributions:.0f}, expected 23000"
+            assert abs(on.retirement_balance - off.retirement_balance) < 1.0, \
+                f"Year {on.year}: retirement balance differs — contribution amount must not change"
 
 class TestIncomeChangeEvent:
 
@@ -678,7 +787,561 @@ class TestMultipleEventsSameYear:
         assert s[0].is_married
         assert not s[0].is_renting
         assert s[0].annual_medical_oop == pytest.approx(6_000, abs=50)
-        assert s[0].annual_hsa_contributions == pytest.approx(8_300, abs=1)
-        # Brokerage: started 200k, minus 130k down, minus 25k wedding, plus breathing room
-        expected_brok = (200_000 - 130_000 - 25_000) * 1.0 + s[0].annual_breathing_room
+        assert s[0].annual_hsa_contributions == pytest.approx(4_150, abs=1)  # stated 4150 honored, not overridden to family 8300
+        # Brokerage: started 200k, minus 130k down, minus 13k buyer closing (2% of 650k),
+        # minus 25k wedding, plus breathing room
+        buyer_closing = 650_000 * 0.02  # default buyer_closing_cost_rate=0.02
+        expected_brok = (200_000 - 130_000 - buyer_closing - 25_000) * 1.0 + s[0].annual_breathing_room
         assert abs(s[0].brokerage_balance - expected_brok) < 1
+
+
+# ============================================================
+# Closing cost tests
+# ============================================================
+
+class TestClosingCosts:
+
+    def _plan(self, events, liquid=200_000, brokerage=300_000):
+        return FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=liquid,
+                current_brokerage_balance=brokerage,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=events,
+            projection_years=3,
+        )
+
+    def test_buyer_closing_costs_deducted(self):
+        """Buyer closing costs reduce brokerage by exactly price * rate."""
+        rate = 0.02
+        price = 650_000
+        plan_with = self._plan([TimelineEvent(
+            year=1, description="Buy", buy_home=True,
+            new_home_price=price, new_home_down_payment=130_000,
+            new_home_interest_rate=0.065, sell_current_home=False,
+            buyer_closing_cost_rate=rate,
+        )])
+        plan_without = self._plan([TimelineEvent(
+            year=1, description="Buy", buy_home=True,
+            new_home_price=price, new_home_down_payment=130_000,
+            new_home_interest_rate=0.065, sell_current_home=False,
+            buyer_closing_cost_rate=0.0,
+        )])
+        s_with = ProjectionEngine(plan_with).run_deterministic()
+        s_without = ProjectionEngine(plan_without).run_deterministic()
+        diff = s_without[0].brokerage_balance - s_with[0].brokerage_balance
+        assert abs(diff - price * rate) < 1.0, f"Expected {price*rate:.0f}, got {diff:.0f}"
+
+    def test_buyer_closing_zero_no_extra_deduction(self):
+        """Setting buyer_closing_cost_rate=0 charges nothing beyond the down payment."""
+        plan_zero = self._plan([TimelineEvent(
+            year=1, description="Buy", buy_home=True,
+            new_home_price=500_000, new_home_down_payment=100_000,
+            new_home_interest_rate=0.065, sell_current_home=False,
+            buyer_closing_cost_rate=0.0,
+        )])
+        plan_two = self._plan([TimelineEvent(
+            year=1, description="Buy", buy_home=True,
+            new_home_price=500_000, new_home_down_payment=100_000,
+            new_home_interest_rate=0.065, sell_current_home=False,
+            buyer_closing_cost_rate=0.02,
+        )])
+        s0 = ProjectionEngine(plan_zero).run_deterministic()
+        s2 = ProjectionEngine(plan_two).run_deterministic()
+        assert s0[0].brokerage_balance > s2[0].brokerage_balance
+
+    def test_default_buyer_closing_rate_is_two_pct(self):
+        ev = TimelineEvent(year=1, description="Buy", buy_home=True,
+                           new_home_price=500_000, new_home_down_payment=100_000,
+                           new_home_interest_rate=0.065)
+        assert ev.buyer_closing_cost_rate == pytest.approx(0.02)
+
+    def test_seller_closing_rate_configurable(self):
+        """Lowering seller closing rate from 6% to 4% increases sale proceeds."""
+        def owned_plan(seller_rate):
+            return FinancialPlan(
+                income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+                housing=HousingProfile(400_000, 100_000, 0.065),
+                lifestyle=LifestyleProfile(),
+                investments=InvestmentProfile(
+                    current_liquid_cash=50_000,
+                    annual_market_return=0.0,
+                    annual_inflation_rate=0.0,
+                    annual_salary_growth_rate=0.0,
+                ),
+                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+                timeline_events=[TimelineEvent(
+                    year=2, description="Sell+Buy", buy_home=True,
+                    new_home_price=500_000, new_home_down_payment=100_000,
+                    new_home_interest_rate=0.065, sell_current_home=True,
+                    seller_closing_cost_rate=seller_rate,
+                    buyer_closing_cost_rate=0.0,
+                )],
+                projection_years=3,
+            )
+        s6 = ProjectionEngine(owned_plan(0.06)).run_deterministic()
+        s4 = ProjectionEngine(owned_plan(0.04)).run_deterministic()
+        # 4% seller closing leaves more money than 6%
+        assert s4[1].brokerage_balance > s6[1].brokerage_balance
+        # Difference ≈ 2% of home value at sale
+        diff = s4[1].brokerage_balance - s6[1].brokerage_balance
+        assert 5_000 < diff < 15_000, f"Expected ~8k diff, got {diff:.0f}"
+
+    def test_default_seller_closing_rate_is_six_pct(self):
+        ev = TimelineEvent(year=1, description="Sell", buy_home=True,
+                           new_home_price=500_000, new_home_down_payment=100_000,
+                           new_home_interest_rate=0.065, sell_current_home=True)
+        assert ev.seller_closing_cost_rate == pytest.approx(0.06)
+
+    def test_both_closing_costs_applied_on_upsize(self):
+        """Upsizing: buyer pays closing on new home AND seller pays closing on old home."""
+        plan_both = FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(400_000, 100_000, 0.065),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=50_000,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(
+                year=2, description="Upsize",
+                buy_home=True, sell_current_home=True,
+                new_home_price=600_000, new_home_down_payment=120_000,
+                new_home_interest_rate=0.065,
+                buyer_closing_cost_rate=0.02,
+                seller_closing_cost_rate=0.06,
+            )],
+            projection_years=3,
+        )
+        plan_no_costs = FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(400_000, 100_000, 0.065),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=50_000,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(
+                year=2, description="Upsize",
+                buy_home=True, sell_current_home=True,
+                new_home_price=600_000, new_home_down_payment=120_000,
+                new_home_interest_rate=0.065,
+                buyer_closing_cost_rate=0.0,
+                seller_closing_cost_rate=0.0,
+            )],
+            projection_years=3,
+        )
+        s_both = ProjectionEngine(plan_both).run_deterministic()
+        s_none = ProjectionEngine(plan_no_costs).run_deterministic()
+        # With costs: lower brokerage
+        assert s_both[1].brokerage_balance < s_none[1].brokerage_balance
+        # Total cost = buyer (600k*2%) + seller (~400k*6%) ≈ 12k + 24k = 36k
+        total_cost = s_none[1].brokerage_balance - s_both[1].brokerage_balance
+        assert 30_000 < total_cost < 45_000, f"Expected ~36k, got {total_cost:.0f}"
+
+
+# ============================================================
+# Closing cost tests
+# ============================================================
+
+class TestBuyerClosingCosts:
+
+    def _buy_plan(self, buyer_rate, liquid=300_000):
+        return FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=liquid, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(
+                year=1, description="Buy", buy_home=True,
+                new_home_price=650_000, new_home_down_payment=130_000,
+                new_home_interest_rate=0.068, sell_current_home=False,
+                buyer_closing_cost_rate=buyer_rate,
+            )],
+            projection_years=2,
+        )
+
+    def test_buyer_closing_deducted_from_brokerage(self):
+        s_2pct = ProjectionEngine(self._buy_plan(0.02)).run_deterministic()
+        s_zero = ProjectionEngine(self._buy_plan(0.00)).run_deterministic()
+        diff = s_zero[0].brokerage_balance - s_2pct[0].brokerage_balance
+        assert abs(diff - 650_000 * 0.02) < 1, f"Expected {650_000*0.02:.0f}, diff={diff:.0f}"
+
+    def test_buyer_closing_zero_means_no_extra_deduction(self):
+        s = ProjectionEngine(self._buy_plan(0.00)).run_deterministic()
+        expected = 300_000 - 130_000 + s[0].annual_breathing_room
+        assert abs(s[0].brokerage_balance - expected) < 1
+
+    def test_higher_buyer_rate_costs_more(self):
+        s_2 = ProjectionEngine(self._buy_plan(0.02)).run_deterministic()
+        s_3 = ProjectionEngine(self._buy_plan(0.03)).run_deterministic()
+        diff = s_2[0].brokerage_balance - s_3[0].brokerage_balance
+        assert abs(diff - 650_000 * 0.01) < 1, f"1% difference should be {650_000*0.01:.0f}, got {diff:.0f}"
+
+    def test_default_rate_is_2pct(self):
+        """TimelineEvent default buyer_closing_cost_rate must be 0.02."""
+        ev = TimelineEvent(year=1, description="Buy", buy_home=True,
+                           new_home_price=500_000, new_home_down_payment=100_000,
+                           new_home_interest_rate=0.065)
+        assert ev.buyer_closing_cost_rate == pytest.approx(0.02)
+
+
+class TestSellerClosingCosts:
+
+    def _sell_plan(self, seller_rate):
+        return FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(300_000, 100_000, 0.065),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=200_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(
+                year=2, description="Sell+Buy", buy_home=True,
+                new_home_price=500_000, new_home_down_payment=100_000,
+                new_home_interest_rate=0.065, sell_current_home=True,
+                seller_closing_cost_rate=seller_rate, buyer_closing_cost_rate=0.0,
+            )],
+            projection_years=3,
+        )
+
+    def test_higher_seller_rate_reduces_proceeds(self):
+        s_6 = ProjectionEngine(self._sell_plan(0.06)).run_deterministic()
+        s_8 = ProjectionEngine(self._sell_plan(0.08)).run_deterministic()
+        diff = s_6[1].brokerage_balance - s_8[1].brokerage_balance
+        # Seller closing is applied to the home value at START of yr2 (post-appreciation)
+        appreciated = 300_000 * 1.035
+        expected_diff = appreciated * (0.08 - 0.06)
+        assert abs(diff - expected_diff) < 2, f"Expected diff {expected_diff:.0f}, got {diff:.0f}"
+
+    def test_zero_seller_rate_returns_full_equity(self):
+        s = ProjectionEngine(self._sell_plan(0.00)).run_deterministic()
+        # With 0% seller rate, all equity should come back
+        appreciated = 300_000 * 1.035
+        calc = MortgageCalculator(HousingProfile(300_000, 100_000, 0.065))
+        exact = {r.year: r.balance for r in calc.full_schedule() if r.month % 12 == 0}
+        full_equity = appreciated - exact[1]
+        expected_yr2 = s[0].brokerage_balance + full_equity - 100_000 + s[1].annual_breathing_room
+        assert abs(s[1].brokerage_balance - expected_yr2) < 2
+
+    def test_default_seller_rate_is_6pct(self):
+        ev = TimelineEvent(year=1, description="Sell", buy_home=True,
+                           new_home_price=500_000, new_home_down_payment=100_000,
+                           new_home_interest_rate=0.065, sell_current_home=True)
+        assert ev.seller_closing_cost_rate == pytest.approx(0.06)
+
+
+# ============================================================
+# Regression: current_brokerage_balance included in initial pool
+# ============================================================
+
+class TestBrokerageBalance:
+    """
+    REGRESSION: current_brokerage_balance was missing from the sidebar
+    InvestmentProfile constructor, silently defaulting to 0.
+    A user with $232k brokerage + $20k liquid saw $0 brokerage in projections.
+    """
+
+    def test_brokerage_balance_included_in_initial_pool(self):
+        """current_brokerage_balance must be added to the starting brokerage pool."""
+        plan = FinancialPlan(
+            income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=20_000,
+                current_brokerage_balance=100_000,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=1,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        # Initial pool = 20k + 100k = 120k, then + breathing room
+        # With zero market return the brokerage starts at 120k + breathing
+        assert s[0].brokerage_balance > 100_000,             "current_brokerage_balance not reflected in starting pool"
+
+    def test_zero_brokerage_balance_gives_lower_liquid(self):
+        """Omitting current_brokerage_balance must produce lower liquid assets."""
+        def make(brokerage):
+            return FinancialPlan(
+                income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
+                housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+                lifestyle=LifestyleProfile(),
+                investments=InvestmentProfile(
+                    current_liquid_cash=20_000,
+                    current_brokerage_balance=brokerage,
+                    annual_market_return=0.0, annual_inflation_rate=0.0,
+                    annual_salary_growth_rate=0.0,
+                ),
+                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+                projection_years=3,
+            )
+        s_with    = ProjectionEngine(make(100_000)).run_deterministic()
+        s_without = ProjectionEngine(make(0)).run_deterministic()
+        for w, wo in zip(s_with, s_without):
+            assert w.brokerage_balance > wo.brokerage_balance,                 f"Year {w.year}: brokerage with 100k start ({w.brokerage_balance:.0f}) "                 f"should exceed zero-start ({wo.brokerage_balance:.0f})"
+
+
+# ============================================================
+# Regression: childcare hidden when num_children=0
+# ============================================================
+
+class TestChildcareWithFutureChildren:
+    """
+    REGRESSION: the sidebar only showed the monthly_childcare input when
+    num_children > 0. Users with 0 current children planning future children
+    via timeline events had childcare silently set to $0.
+    The engine itself is fine — this tests the data flow so it stays correct.
+    """
+
+    def test_childcare_applies_when_child_arrives_via_event(self):
+        """monthly_childcare must apply in the year a child arrives via timeline event,
+        even though num_children starts at 0."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=2_500,
+                num_children=0,          # no children today
+                annual_vacation=0,
+                monthly_other_recurring=0,
+                annual_medical_oop=0,
+                medical_auto_scale=False,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=200_000,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(year=2, description="Child", new_child=True)],
+            projection_years=4,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        # Year 1: no child → no childcare cost
+        assert s[0].annual_lifestyle_cost == pytest.approx(0.0, abs=1),             f"Year 1 has no child, childcare should be 0, got {s[0].annual_lifestyle_cost:.0f}"
+        # Year 2: child arrives → 2500*12 = 30000
+        assert s[1].annual_lifestyle_cost == pytest.approx(30_000, abs=1),             f"Year 2 child arrived, expected 30000 childcare, got {s[1].annual_lifestyle_cost:.0f}"
+
+    def test_childcare_zero_when_monthly_childcare_not_set(self):
+        """If monthly_childcare=0 (old default when field was hidden), children
+        cost $0 in childcare — this must be visible, not silently wrong."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=0,     # not set — the bug scenario
+                num_children=0,
+                annual_vacation=0, monthly_other_recurring=0,
+                annual_medical_oop=0, medical_auto_scale=False,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=200_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(year=1, description="Child", new_child=True)],
+            projection_years=2,
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        # Child arrives but childcare=0, so lifestyle cost = 0
+        assert s[0].annual_lifestyle_cost == pytest.approx(0.0, abs=1)
+        # This is "correct" but wrong for the user — the test documents the danger
+
+
+# ============================================================
+# Dual income: independent growth and partner events
+# ============================================================
+
+class TestDualIncome:
+    """
+    Tests for dual-income household support added in the partner salary session.
+    Each income must grow at its own rate independently.
+    """
+
+    def _dual_plan(self, primary, partner, primary_growth, partner_growth,
+                   events=None, years=5, k401_partner=0):
+        return FinancialPlan(
+            income=IncomeProfile(
+                gross_annual_income=primary,
+                spouse_gross_annual_income=partner,
+                filing_status=FilingStatus.MARRIED_FILING_JOINTLY,
+                state=State.TEXAS,
+            ),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=100_000,
+                annual_401k_contribution=0,
+                partner_annual_401k_contribution=k401_partner,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=primary_growth,
+                partner_salary_growth_rate=partner_growth,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=events or [],
+            projection_years=years,
+        )
+
+    def test_combined_income_is_sum(self):
+        s = ProjectionEngine(
+            self._dual_plan(180_000, 120_000, 0.0, 0.0)
+        ).run_deterministic()
+        assert s[0].gross_income == pytest.approx(300_000, abs=1)
+
+    def test_primary_grows_independently(self):
+        s = ProjectionEngine(
+            self._dual_plan(100_000, 100_000, primary_growth=0.10, partner_growth=0.0)
+        ).run_deterministic()
+        # Year 2: primary = 110k, partner = 100k, total = 210k
+        assert s[1].gross_income == pytest.approx(210_000, abs=1),             f"Expected 210000, got {s[1].gross_income:.0f}"
+
+    def test_partner_grows_independently(self):
+        s = ProjectionEngine(
+            self._dual_plan(100_000, 100_000, primary_growth=0.0, partner_growth=0.10)
+        ).run_deterministic()
+        # Year 2: primary = 100k, partner = 110k, total = 210k
+        assert s[1].gross_income == pytest.approx(210_000, abs=1)
+
+    def test_different_growth_rates_diverge_correctly(self):
+        s = ProjectionEngine(
+            self._dual_plan(180_000, 120_000, primary_growth=0.05, partner_growth=0.08)
+        ).run_deterministic()
+        for snap in s:
+            expected = 180_000 * (1.05)**(snap.year-1) + 120_000 * (1.08)**(snap.year-1)
+            assert abs(snap.gross_income - expected) < 1.0,                 f"Year {snap.year}: expected {expected:.0f}, got {snap.gross_income:.0f}"
+
+    def test_zero_partner_income_single_income_behavior(self):
+        """partner=0 must behave identically to a single-income household."""
+        dual = ProjectionEngine(
+            self._dual_plan(180_000, 0, 0.04, 0.0)
+        ).run_deterministic()
+        single = ProjectionEngine(FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.MARRIED_FILING_JOINTLY, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=100_000, annual_401k_contribution=0,
+                                          annual_market_return=0.0, annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.04),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=5,
+        )).run_deterministic()
+        for d, s in zip(dual, single):
+            assert abs(d.gross_income - s.gross_income) < 1.0, f"Year {d.year}"
+            assert abs(d.brokerage_balance - s.brokerage_balance) < 1.0, f"Year {d.year}"
+
+    def test_partner_401k_adds_to_retirement(self):
+        """Partner's 401k must be tracked separately and added to retirement balance."""
+        s = ProjectionEngine(
+            self._dual_plan(180_000, 120_000, 0.0, 0.0, k401_partner=20_000)
+        ).run_deterministic()
+        # With no primary 401k and partner 401k=20k
+        assert s[0].annual_retirement_contributions == pytest.approx(20_000, abs=1)
+
+    def test_partner_income_change_event(self):
+        """partner_income_change event must update partner salary independently."""
+        plan = self._dual_plan(
+            180_000, 120_000, 0.0, 0.0,
+            events=[TimelineEvent(year=2, description="Partner promotion",
+                                  partner_income_change=160_000)],
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        assert s[0].gross_income == pytest.approx(300_000, abs=1)   # yr1: 180k + 120k
+        assert s[1].gross_income == pytest.approx(340_000, abs=1)   # yr2: 180k + 160k
+
+    def test_primary_income_change_does_not_affect_partner(self):
+        """income_change event for primary must not clobber partner income."""
+        plan = self._dual_plan(
+            180_000, 120_000, 0.0, 0.0,
+            events=[TimelineEvent(year=2, description="Raise", income_change=220_000)],
+        )
+        s = ProjectionEngine(plan).run_deterministic()
+        assert s[1].gross_income == pytest.approx(340_000, abs=1)   # 220k + 120k
+
+
+# ============================================================
+# Regression: full realistic scenario must not go negative
+# ============================================================
+
+class TestRealisticScenario:
+    """
+    REGRESSION: The full user scenario (180k income, 600k home, adoption expense,
+    two children) must not produce negative liquid assets when using stated
+    contribution amounts of 23k 401k and 4150 HSA.
+
+    This test encodes the specific combination of bugs that caused the regression:
+      - maximize_401k overriding 23k to 30.5k silently
+      - Missing current_brokerage_balance in initial pool
+    Either bug alone could cause the liquid asset dip.
+    """
+
+    def test_600k_home_adoption_never_negative(self):
+        plan = FinancialPlan(
+            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.GEORGIA,
+                                 spouse_gross_annual_income=0),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_450),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=2_500, num_children=0, num_pets=1,
+                annual_pet_cost=2_500, annual_medical_oop=3_000,
+                medical_auto_scale=True, medical_spouse_multiplier=2.0,
+                medical_per_child_annual=1_500, annual_vacation=10_000,
+                monthly_other_recurring=500,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=20_000,
+                current_retirement_balance=80_000,
+                current_brokerage_balance=232_000,
+                annual_401k_contribution=23_000,
+                annual_hsa_contribution=4_150,
+                annual_market_return=0.08,
+                annual_inflation_rate=0.03,
+                annual_salary_growth_rate=0.04,
+                annual_home_appreciation_rate=0.035,
+            ),
+            strategies=StrategyToggles(maximize_hsa=True, maximize_401k=True),
+            timeline_events=[
+                TimelineEvent(year=1, description="Buy home", buy_home=True,
+                              new_home_price=600_000, new_home_down_payment=130_000,
+                              new_home_interest_rate=0.068, sell_current_home=False,
+                              buyer_closing_cost_rate=0.02),
+                TimelineEvent(year=1, description="Get married", marriage=True,
+                              extra_one_time_expense=13_000),
+                TimelineEvent(year=2, description="First child", new_child=True,
+                              extra_one_time_expense=50_000),
+                TimelineEvent(year=4, description="Second child", new_child=True),
+                TimelineEvent(year=6, description="Second dog", new_pet=True),
+            ],
+            projection_years=30,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        negative = [s for s in snaps if s.brokerage_balance < 0]
+        assert len(negative) == 0, (
+            f"Liquid assets went negative in years: {[s.year for s in negative]}. "
+            f"Worst: {min(s.brokerage_balance for s in negative):,.0f} in year "
+            f"{min(negative, key=lambda s: s.brokerage_balance).year}. "
+            f"Check maximize_401k semantics and current_brokerage_balance inclusion."
+        )

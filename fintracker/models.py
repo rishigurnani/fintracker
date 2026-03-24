@@ -127,7 +127,8 @@ class InvestmentProfile:
     current_brokerage_balance: float = 0.0
     one_time_upcoming_expenses: float = 0.0
 
-    annual_401k_contribution: float = 0.0
+    annual_401k_contribution: float = 0.0          # Primary person's 401k
+    partner_annual_401k_contribution: float = 0.0  # Partner's 401k (separate IRS limit)
     annual_roth_ira_contribution: float = 0.0
     annual_hsa_contribution: float = 0.0
     annual_529_contribution: float = 0.0
@@ -135,7 +136,8 @@ class InvestmentProfile:
 
     annual_market_return: float = 0.08
     annual_inflation_rate: float = 0.03
-    annual_salary_growth_rate: float = 0.04
+    annual_salary_growth_rate: float = 0.04         # Primary person's salary growth
+    partner_salary_growth_rate: float = 0.04        # Partner's salary growth (can differ)
     annual_home_appreciation_rate: float = 0.035
 
     @property
@@ -158,7 +160,8 @@ class TimelineEvent:
     """A discrete life event that changes financial inputs in a given year."""
     year: int
     description: str
-    income_change: Optional[float] = None
+    income_change: Optional[float] = None          # New gross income for primary person
+    partner_income_change: Optional[float] = None  # New gross income for partner
     new_child: bool = False
     new_pet: bool = False
     marriage: bool = False

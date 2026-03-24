@@ -311,9 +311,16 @@ def build_sidebar() -> FinancialPlan:
         help="Wedding, car purchase, etc. Subtracted from investable cash.",
     )
     k401 = st.sidebar.number_input(
-        "Annual 401k Contribution ($)", min_value=0, max_value=30_500,
+        "Your Annual 401k Contribution ($)", min_value=0, max_value=30_500,
         value=int(d_inv.annual_401k_contribution) if d_inv else 23_000, step=500,
     )
+    partner_k401 = 0
+    if spouse > 0:
+        partner_k401 = st.sidebar.number_input(
+            "Partner Annual 401k Contribution ($)", min_value=0, max_value=30_500,
+            value=int(d_inv.partner_annual_401k_contribution) if d_inv else 0, step=500,
+            help="Partner's independent 401k — each person has their own IRS limit.",
+        )
     hsa = st.sidebar.number_input(
         "Annual HSA Contribution ($)", min_value=0, max_value=8_300,
         value=int(d_inv.annual_hsa_contribution) if d_inv else 4_150, step=100,
@@ -329,11 +336,16 @@ def build_sidebar() -> FinancialPlan:
         current_brokerage_balance=float(brokerage_bal),
         one_time_upcoming_expenses=float(one_time),
         annual_401k_contribution=float(k401),
+        partner_annual_401k_contribution=float(partner_k401),
         annual_hsa_contribution=float(hsa),
         annual_529_contribution=float(c529),
         annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
         annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
-        annual_salary_growth_rate=float(st.sidebar.slider("Salary Growth (%)", 0.0, 15.0, 4.0, 0.5)) / 100,
+        annual_salary_growth_rate=float(st.sidebar.slider("Your Salary Growth (%)", 0.0, 15.0,
+            float(d_inv.annual_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100,
+        partner_salary_growth_rate=float(st.sidebar.slider("Partner Salary Growth (%)", 0.0, 15.0,
+            float(d_inv.partner_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100
+            if spouse > 0 else 0.04,
         annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
     )
 
@@ -392,10 +404,16 @@ def build_sidebar() -> FinancialPlan:
                 key=f"ev_pet_{i}",
             )
             ev_income = st.number_input(
-                "New gross income (0 = no change)",
+                "Your new gross income (0 = no change)",
                 min_value=0, max_value=5_000_000,
                 value=int(ev_def.income_change) if (ev_def and ev_def.income_change) else 0,
                 key=f"ev_inc_{i}",
+            )
+            ev_partner_income = st.number_input(
+                "Partner new gross income (0 = no change)",
+                min_value=0, max_value=5_000_000,
+                value=int(ev_def.partner_income_change) if (ev_def and ev_def.partner_income_change) else 0,
+                key=f"ev_pinc_{i}",
             )
             ev_expense = st.number_input(
                 "One-time expense ($)",
@@ -471,6 +489,7 @@ def build_sidebar() -> FinancialPlan:
                 new_child=ev_child,
                 new_pet=ev_pet,
                 income_change=float(ev_income) if ev_income > 0 else None,
+                partner_income_change=float(ev_partner_income) if ev_partner_income > 0 else None,
                 extra_one_time_expense=float(ev_expense),
                 extra_one_time_income=float(ev_bonus),
                 buy_home=ev_buy_home,
@@ -515,35 +534,61 @@ def build_sidebar() -> FinancialPlan:
 # ─────────────────────────────────────────────────────────────
 
 def render_dashboard(plan: FinancialPlan) -> None:
+    # ── Single source of truth ────────────────────────────────────────────────
+    # All financial figures flow from one place:
+    #   1. ProjectionEngine runs first — applies year-1 events (marriage, home
+    #      purchase, etc.) before computing taxes, so filing status, HSA tier,
+    #      and family size are all correct.
+    #   2. snapshots[0] is the authoritative year-1 result. Every tab reads
+    #      from it — no independent tax recalculation elsewhere.
+    #   3. tax_engine.calculate() is called exactly ONCE, using the year-1
+    #      state from snapshots[0], to get the detailed breakdown (fed/FICA/
+    #      state split) that the Cash Flow and Waterfall charts need.
+    #   4. mortgage_calc is constructed once, only for the Mortgage tab display.
+    # ─────────────────────────────────────────────────────────────────────────
+
     tax_engine = TaxEngine()
     strategy_engine = StrategyEngine()
     projection_engine = ProjectionEngine(plan)
 
-    # Compute everything
-    tax_result = tax_engine.calculate(
-        plan.income, plan.investments, plan.strategies,
-        num_children=plan.lifestyle.num_children,
-    )
-    strategy_result = strategy_engine.analyze(
-        plan.income, plan.investments, plan.strategies,
-        num_children=plan.lifestyle.num_children,
-    )
     snapshots = projection_engine.run_deterministic()
+    yr1 = snapshots[0]
 
-    monthly_net = (plan.income.total_gross_income - tax_result.total_annual_tax
-                   - plan.investments.annual_hsa_contribution
-                   - plan.investments.annual_401k_contribution) / 12
+    # Derive year-1 income profile from the snapshot (events already applied)
+    yr1_income_profile = IncomeProfile(
+        gross_annual_income=yr1.gross_income,
+        filing_status=yr1.filing_status,
+        state=plan.income.state,
+        other_state_flat_rate=plan.income.other_state_flat_rate,
+    )
+    yr1_inv_profile = InvestmentProfile(
+        annual_hsa_contribution=yr1.annual_hsa_contributions,
+        annual_401k_contribution=yr1.annual_retirement_contributions,
+    )
 
+    # ONE tax calculation — used by all tabs
+    tax_result = tax_engine.calculate(
+        yr1_income_profile, yr1_inv_profile, plan.strategies,
+        num_children=yr1.num_children,
+    )
+
+    # Strategy analysis uses the same year-1 state
+    strategy_result = strategy_engine.analyze(
+        yr1_income_profile, yr1_inv_profile, plan.strategies,
+        num_children=yr1.num_children,
+    )
+
+    # Monthly figures derived from year-1 snapshot — divide annual by 12
+    monthly_net       = yr1.net_income / 12
+    monthly_housing   = yr1.annual_housing_cost / 12
+    monthly_lifestyle = yr1.annual_lifestyle_cost / 12
+    monthly_breathing = yr1.annual_breathing_room / 12
+
+    # Mortgage calculator — constructed once, only used for Tab 2 detail display
     mortgage_calc = (
         MortgageCalculator(plan.housing, plan.investments.annual_home_appreciation_rate)
         if not plan.housing.is_renting else None
     )
-    monthly_housing = (
-        mortgage_calc.monthly_total_payment() if mortgage_calc
-        else plan.housing.monthly_rent
-    )
-    monthly_lifestyle = plan.lifestyle.annual_total / 12
-    monthly_breathing = monthly_net - monthly_housing - monthly_lifestyle
 
     # ── Header ───────────────────────────────────────────────
     st.markdown("# 📈 fintracker")
@@ -743,8 +788,11 @@ def render_dashboard(plan: FinancialPlan) -> None:
             st.markdown(f'<div class="{card_class}">{note}</div>', unsafe_allow_html=True)
 
         # Waterfall chart: income → take-home
+        # Use year-1 snapshot values so the filing status, HSA tier, and tax
+        # all match what the projection table shows for year 1.
+        # Waterfall uses tax_result (already computed from yr1 state above)
         st.markdown("#### Where Does Your Gross Income Go?")
-        gross = plan.income.total_gross_income
+        gross = yr1.gross_income
         waterfall_cats = [
             "Gross Income",
             "Federal Tax",
@@ -759,8 +807,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
             -tax_result.federal_income_tax,
             -tax_result.total_fica,
             -tax_result.state_income_tax,
-            -plan.investments.annual_401k_contribution if plan.strategies.maximize_401k else 0,
-            -plan.investments.annual_hsa_contribution if plan.strategies.maximize_hsa else 0,
+            -yr1.annual_retirement_contributions,
+            -yr1.annual_hsa_contributions,
             0,  # calculated
         ]
         take_home = gross + sum(waterfall_vals[1:-1])
@@ -806,7 +854,6 @@ def render_dashboard(plan: FinancialPlan) -> None:
             "Breathing Room": s.annual_breathing_room,
             "Retirement": s.retirement_balance,
             "Brokerage": s.brokerage_balance,
-            "Liquid Assets": s.brokerage_balance,  # cash + brokerage (HSA is illiquid)
             "Home Equity": s.home_equity,
             "HSA": s.hsa_balance,
             "Net Worth": s.net_worth,
@@ -852,7 +899,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 yaxis="y1",
             ))
             fig_cf.add_trace(go.Scatter(
-                x=df["Year"], y=df["Liquid Assets"], name="Liquid Assets (cash + brokerage)",
+                x=df["Year"], y=df["Brokerage"], name="Liquid Assets (cash + brokerage)",
                 line=dict(color="#f59e0b", width=2, dash="dot"),
                 yaxis="y2",
                 fill="tozeroy",
@@ -963,12 +1010,34 @@ def render_dashboard(plan: FinancialPlan) -> None:
 
         # Data table
         with st.expander("📋 Full Year-by-Year Projection Table"):
-            display_df = df.copy()
-            for col in ["Gross Income", "Net Income", "Housing Cost", "Lifestyle Cost",
-                        "Breathing Room", "Retirement", "Brokerage", "Home Equity",
-                        "HSA", "Net Worth", "Taxes"]:
-                display_df[col] = display_df[col].apply(lambda x: f"${x:,.0f}")
-            st.dataframe(display_df, hide_index=True, use_container_width=True)
+            import streamlit as _st
+
+            # ── Annual Cash Flows (what happened this year) ──────────
+            st.markdown("**Annual Cash Flows** — income, costs, and surplus for each year")
+            flow_cols = ["Year", "Gross Income", "Taxes", "Net Income",
+                         "Housing Cost", "Lifestyle Cost", "Breathing Room"]
+            flow_df = df[flow_cols].copy()
+            flow_df["Gross Income"]  = flow_df["Gross Income"].apply(fmt_dollar)
+            flow_df["Net Income"]    = flow_df["Net Income"].apply(fmt_dollar)
+            flow_df["Taxes"]         = flow_df["Taxes"].apply(fmt_dollar)
+            flow_df["Housing Cost"]  = flow_df["Housing Cost"].apply(fmt_dollar)
+            flow_df["Lifestyle Cost"]= flow_df["Lifestyle Cost"].apply(fmt_dollar)
+            flow_df["Breathing Room"]= flow_df["Breathing Room"].apply(
+                lambda x: f"{'▲ ' if x >= 0 else '▼ '}{fmt_dollar(x)}"
+            )
+            st.dataframe(flow_df, hide_index=True, use_container_width=True)
+
+            st.markdown("")
+
+            # ── End-of-Year Balances (where you stand) ───────────────
+            st.markdown("**End-of-Year Balances** — cumulative wealth position at end of each year")
+            bal_cols = ["Year", "Retirement", "Brokerage", "HSA",
+                        "Home Equity", "Mortgage Balance", "Net Worth"]
+            bal_df = df[bal_cols].copy()
+            for col in ["Retirement", "Brokerage", "HSA",
+                        "Home Equity", "Mortgage Balance", "Net Worth"]:
+                bal_df[col] = bal_df[col].apply(fmt_dollar)
+            st.dataframe(bal_df, hide_index=True, use_container_width=True)
 
     # ── TAB 5: Monte Carlo ───────────────────────────────────
     with tabs[4]:
