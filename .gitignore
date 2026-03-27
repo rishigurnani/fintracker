@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 venv/
 fintracker.egg-info/
+.DS_Store

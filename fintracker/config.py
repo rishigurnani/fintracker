@@ -19,7 +19,7 @@ from typing import Any
 import yaml
 
 from fintracker.models import (
-    FilingStatus, State,
+    CarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
@@ -104,6 +104,8 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         medical_per_child_annual=float(l_d.get("medical_per_child_annual", 1_500)),
         annual_vacation=float(l_d.get("annual_vacation", 5_000)),
         monthly_other_recurring=float(l_d.get("monthly_other_recurring", 500)),
+        annual_parent_care_cost=float(l_d.get("annual_parent_care_cost", 0)),
+        annual_wedding_fund_per_child=float(l_d.get("annual_wedding_fund_per_child", 0)),
     )
 
     inv_d = d.get("investments", {})
@@ -140,6 +142,13 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
             description=str(e.get("description", "")),
             income_change=e.get("income_change"),
             partner_income_change=e.get("partner_income_change"),
+            stop_working=bool(e.get("stop_working", False)),
+            resume_working=bool(e.get("resume_working", False)),
+            partner_stop_working=bool(e.get("partner_stop_working", False)),
+            partner_resume_working=bool(e.get("partner_resume_working", False)),
+            start_parent_care=bool(e.get("start_parent_care", False)),
+            stop_parent_care=bool(e.get("stop_parent_care", False)),
+            child_birth_year_override=e.get("child_birth_year_override"),
             new_child=bool(e.get("new_child", False)),
             new_pet=bool(e.get("new_pet", False)),
             marriage=bool(e.get("marriage", False)),
@@ -157,6 +166,44 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         for e in d.get("timeline_events", [])
     ]
 
+    # Retirement profile (optional)
+    ret_d = d.get("retirement", {})
+    retirement = RetirementProfile(
+        current_age=int(ret_d.get("current_age", 35)),
+        retirement_age=int(ret_d.get("retirement_age", 65)),
+        desired_annual_income=float(ret_d.get("desired_annual_income", 80_000)),
+        years_in_retirement=int(ret_d.get("years_in_retirement", 30)),
+        expected_post_retirement_return=float(ret_d.get("expected_post_retirement_return", 0.05)),
+        estimated_social_security_annual=float(ret_d.get("estimated_social_security_annual", 0)),
+    ) if "retirement" in d else None
+
+    # Car profile (optional)
+    car_d = d.get("car", {})
+    car = CarProfile(
+        car_price=float(car_d.get("car_price", 25_000)),
+        down_payment=float(car_d.get("down_payment", 5_000)),
+        loan_rate=float(car_d.get("loan_rate", 0.065)),
+        loan_term_years=int(car_d.get("loan_term_years", 5)),
+        replace_every_years=int(car_d.get("replace_every_years", 10)),
+        residual_value=float(car_d.get("residual_value", 5_000)),
+        hand_down_age=int(car_d.get("hand_down_age", 16)),
+        num_cars=int(car_d.get("num_cars", 1)),
+    ) if "car" in d else None
+
+    # College profile (optional)
+    col_d = d.get("college", {})
+    college = CollegeProfile(
+        annual_cost_per_child=float(col_d.get("annual_cost_per_child", 35_000)),
+        years_per_child=int(col_d.get("years_per_child", 4)),
+        start_age=int(col_d.get("start_age", 18)),
+        use_aotc_credit=bool(col_d.get("use_aotc_credit", True)),
+        # annual_wedding_fund_per_child moved to lifestyle — kept here for back-compat
+        # (old YAMLs with this under college: will just be silently ignored now)
+        early_529_return=float(col_d.get("early_529_return", 0.08)),
+        late_529_return=float(col_d.get("late_529_return", 0.04)),
+        glide_path_years=int(col_d.get("glide_path_years", 10)),
+    ) if "college" in d else None
+
     return FinancialPlan(
         income=income,
         housing=housing,
@@ -165,6 +212,9 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         strategies=strategies,
         timeline_events=events,
         projection_years=int(d.get("projection_years", 30)),
+        retirement=retirement,
+        college=college,
+        car=car,
     )
 
 
@@ -202,6 +252,8 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "medical_per_child_annual": plan.lifestyle.medical_per_child_annual,
             "annual_vacation": plan.lifestyle.annual_vacation,
             "monthly_other_recurring": plan.lifestyle.monthly_other_recurring,
+            "annual_parent_care_cost": plan.lifestyle.annual_parent_care_cost,
+            "annual_wedding_fund_per_child": plan.lifestyle.annual_wedding_fund_per_child,
         },
         "investments": {
             "current_liquid_cash": plan.investments.current_liquid_cash,
@@ -233,6 +285,13 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
                 "description": e.description,
                 "income_change": e.income_change,
                 "partner_income_change": e.partner_income_change,
+                "stop_working": e.stop_working,
+                "resume_working": e.resume_working,
+                "partner_stop_working": e.partner_stop_working,
+                "partner_resume_working": e.partner_resume_working,
+                "start_parent_care": e.start_parent_care,
+                "stop_parent_care": e.stop_parent_care,
+                "child_birth_year_override": e.child_birth_year_override,
                 "new_child": e.new_child,
                 "new_pet": e.new_pet,
                 "marriage": e.marriage,
@@ -249,6 +308,38 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             for e in plan.timeline_events
         ],
     }
+    if plan.car:
+        d["car"] = {
+            "car_price": plan.car.car_price,
+            "down_payment": plan.car.down_payment,
+            "loan_rate": plan.car.loan_rate,
+            "loan_term_years": plan.car.loan_term_years,
+            "replace_every_years": plan.car.replace_every_years,
+            "residual_value": plan.car.residual_value,
+            "hand_down_age": plan.car.hand_down_age,
+            "num_cars": plan.car.num_cars,
+        }
+    if plan.retirement:
+        d["retirement"] = {
+            "current_age": plan.retirement.current_age,
+            "retirement_age": plan.retirement.retirement_age,
+            "desired_annual_income": plan.retirement.desired_annual_income,
+            "years_in_retirement": plan.retirement.years_in_retirement,
+            "expected_post_retirement_return": plan.retirement.expected_post_retirement_return,
+            "estimated_social_security_annual": plan.retirement.estimated_social_security_annual,
+        }
+    if plan.college:
+        d["college"] = {
+            "annual_cost_per_child": plan.college.annual_cost_per_child,
+            "years_per_child": plan.college.years_per_child,
+            "start_age": plan.college.start_age,
+            "use_aotc_credit": plan.college.use_aotc_credit,
+            # annual_wedding_fund_per_child is now in lifestyle, not college
+            "early_529_return": plan.college.early_529_return,
+            "late_529_return": plan.college.late_529_return,
+            "glide_path_years": plan.college.glide_path_years,
+        }
+    return d
 
 
 def _default_plan() -> FinancialPlan:

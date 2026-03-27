@@ -10,26 +10,25 @@ projection_years: 30
 
 income:
   gross_annual_income: 120000
+  spouse_gross_annual_income: 0    # set to 0 for single-income household
   # Options: single | married_filing_jointly | head_of_household
   filing_status: single
   # Options: GA | CA | NY | TX | FL | WA | IL | NC | VA | CO | OTHER
   state: GA
-  # Used only when state is OTHER
+  # Only used when state is OTHER
   other_state_flat_rate: 0.05
-  # Set to 0 if single-income household
-  spouse_gross_annual_income: 0
 
 housing:
-  home_price: 400000
-  down_payment: 80000       # 20% = no PMI
-  interest_rate: 0.065      # 6.5%
-  loan_term_years: 30
-  annual_property_tax_rate: 0.012   # 1.2%
-  annual_insurance: 2000
-  annual_maintenance_rate: 0.01     # 1% of home value
-  pmi_annual_rate: 0.005
   is_renting: false
-  monthly_rent: 0
+  home_price: 400000
+  down_payment: 80000             # 20% = no PMI
+  interest_rate: 0.065            # 6.5%
+  loan_term_years: 30
+  annual_property_tax_rate: 0.012 # 1.2%
+  annual_insurance: 2000
+  annual_maintenance_rate: 0.01   # 1% of home value per year
+  pmi_annual_rate: 0.005          # only charged while LTV > 80%
+  monthly_rent: 0                 # only used when is_renting: true
   annual_rent_increase_rate: 0.03
 
 lifestyle:
@@ -37,43 +36,163 @@ lifestyle:
   num_children: 0
   num_pets: 1
   annual_pet_cost: 1800
-  annual_medical_oop: 3000
+  annual_medical_oop: 3000        # baseline for single adult, auto-scales for family
+  medical_auto_scale: true        # scales on marriage + per-child
+  medical_spouse_multiplier: 1.8  # family plan roughly 80% more than single
+  medical_per_child_annual: 1500
   annual_vacation: 5000
   monthly_other_recurring: 500
+  # Parent care: annual cost of supporting aging parents (in-home care,
+  # assisted living contribution, etc.). Inflates with inflation.
+  # Activate/deactivate via start_parent_care / stop_parent_care timeline events.
+  annual_parent_care_cost: 0
 
 investments:
   current_liquid_cash: 100000
   current_retirement_balance: 50000
   current_brokerage_balance: 0
-  one_time_upcoming_expenses: 0     # Wedding, car, etc.
-  annual_401k_contribution: 23000   # 2024 IRS limit
+  one_time_upcoming_expenses: 0       # deducted from liquid cash on day 1
+
+  # 401k: stated amount is used as-is. maximize_401k controls tax deduction
+  # treatment only — it does NOT override this amount to the IRS maximum.
+  annual_401k_contribution: 23000     # 2024 IRS employee limit
+  partner_annual_401k_contribution: 0 # partner has their own independent IRS limit
   annual_roth_ira_contribution: 0
-  annual_hsa_contribution: 4150     # 2024 single limit
-  annual_529_contribution: 0        # Per child
-  annual_brokerage_contribution: 0  # Additional after-tax investing
+  annual_hsa_contribution: 4150       # 2024 single limit; family limit = 8300
+  annual_529_contribution: 0          # per child; total = this x num_children
+  # Earmarked taxable brokerage investment. Deducted from breathing room and
+  # tracked separately in projections. Total invested in brokerage is unchanged.
+  annual_brokerage_contribution: 0
+
   # Economic assumptions
-  annual_market_return: 0.08        # 8% nominal
-  annual_inflation_rate: 0.03       # 3%
-  annual_salary_growth_rate: 0.04   # 4%
-  annual_home_appreciation_rate: 0.035  # 3.5%
+  annual_market_return: 0.08          # 8% nominal (applies to all investment accounts)
+  annual_inflation_rate: 0.03         # 3%
+  annual_salary_growth_rate: 0.04     # primary income growth
+  partner_salary_growth_rate: 0.04    # partner income growth (can differ)
+  annual_home_appreciation_rate: 0.035
 
 strategies:
-  maximize_hsa: true
+  maximize_hsa: true                  # applies HSA pre-tax treatment
   use_529_state_deduction: false
-  maximize_401k: true
+  maximize_401k: true                 # applies 401k pre-tax treatment
   use_roth_ladder: false
   roth_conversion_annual_amount: 0
 
-# Timeline events: discrete life changes that alter the projection.
-# Each event fires at the START of the specified year.
+# ── Retirement Readiness (optional) ───────────────────────────────────────────
+# If present, the Projections tab shows whether your savings are on track.
+# Remove or comment out this section to disable.
+#
+# How the calculation works:
+#   1. The engine sums retirement + brokerage + HSA at your retirement year
+#      (projection year = retirement_age - current_age).
+#   2. desired_annual_income is inflated from today's dollars to nominal
+#      retirement-year dollars at your annual_inflation_rate.
+#   3. estimated_social_security_annual offsets the income requirement.
+#   4. The engine computes the lump sum needed to fund the remaining income for
+#      years_in_retirement years at expected_post_retirement_return, using the
+#      present-value-of-annuity formula.
+#   5. Projected balance vs required balance yields funded_pct and
+#      annual_surplus_or_gap (positive = surplus, negative = shortfall).
+retirement:
+  current_age: 32
+  retirement_age: 65
+  # Desired annual spending in retirement, in TODAY'S dollars.
+  # Automatically inflated to nominal dollars at retirement.
+  desired_annual_income: 80000
+  years_in_retirement: 30
+  # Post-retirement portfolio return. Use a conservative number — portfolios
+  # typically shift toward bonds as you approach and enter retirement.
+  expected_post_retirement_return: 0.05
+  # Your estimated Social Security benefit in TODAY'S dollars.
+  # Use ssa.gov to get your personalised estimate. Set to 0 to be conservative.
+  estimated_social_security_annual: 0
+
+# ── College Costs (optional) ──────────────────────────────────────────────────
+# If present, the engine models college costs per child, draws down 529 balances
+# in college years, and applies the American Opportunity Tax Credit (AOTC).
+# Remove or comment out to disable.
+#
+# 529 drawdown: in each college year the engine draws from the 529 balance
+# (tax-free) first. Any remaining cost reduces brokerage via breathing room.
+# Same-year 529 contributions are available for same-year drawdown.
+#
+# AOTC: up to $2,500 credit per student per year for the first 4 years of
+# college. Phase-out: single $80k-$90k, MFJ $160k-$180k (2024 figures).
+# Applied as a direct reduction to your effective tax bill.
+#
+# Child birth year tracking: the engine records each child's birth year from
+# new_child timeline events. Use child_birth_year_override on the event if
+# a child was born before your projection starts (e.g. -3 for a child born
+# 3 years before projection year 1).
+college:
+  annual_cost_per_child: 35000    # tuition + room & board in TODAY'S dollars
+  years_per_child: 4
+  start_age: 18                   # age child starts college
+  use_aotc_credit: true
+  annual_wedding_fund_per_child: 0  # optional annual savings per child for wedding
+
+# ── Timeline Events ────────────────────────────────────────────────────────────
+# Each event fires at the START of the specified year. Multiple events can
+# fire in the same year and are applied in order.
 timeline_events:
   - year: 3
     description: "Get married"
     marriage: true
-    extra_one_time_expense: 30000   # Wedding costs
+    extra_one_time_expense: 30000   # wedding costs
+
   - year: 4
-    description: "First child arrives"
+    description: "First child"
     new_child: true
+
   - year: 5
-    description: "Promotion / raise"
+    description: "Promotion"
     income_change: 160000
+
+  # ── Additional event examples (uncomment to use) ──
+
+  # Add a second income (partner joins workforce):
+  # - year: 2
+  #   description: "Partner starts working"
+  #   partner_income_change: 85000
+
+  # Partner takes career break:
+  # - year: 6
+  #   description: "Partner on leave"
+  #   partner_stop_working: true
+  # - year: 8
+  #   description: "Partner returns"
+  #   partner_resume_working: true
+  #   partner_income_change: 95000
+
+  # Buy a home mid-projection (if currently renting):
+  # - year: 2
+  #   description: "Buy first home"
+  #   buy_home: true
+  #   new_home_price: 500000
+  #   new_home_down_payment: 100000
+  #   new_home_interest_rate: 0.068
+  #   sell_current_home: false        # true if selling existing home
+  #   buyer_closing_cost_rate: 0.02   # default; override if you know your actual costs
+  #   seller_closing_cost_rate: 0.06  # only matters when sell_current_home: true
+
+  # Parent care (pair start and stop):
+  # - year: 10
+  #   description: "Mom needs in-home care"
+  #   start_parent_care: true
+  # - year: 16
+  #   description: "Mom passes"
+  #   stop_parent_care: true
+
+  # Child already born before projection starts (for college cost timing):
+  # - year: 1
+  #   description: "Existing child (born 3 years ago)"
+  #   new_child: true
+  #   child_birth_year_override: -3   # negative = already born
+
+  # Windfall or one-time expense:
+  # - year: 7
+  #   description: "Inheritance"
+  #   extra_one_time_income: 50000
+  # - year: 3
+  #   description: "New car"
+  #   extra_one_time_expense: 35000

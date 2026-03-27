@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 from fintracker.models import (
     FilingStatus, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
-    InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
+    CarProfile, InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
 )
 from fintracker.tax_engine import TaxEngine
 from fintracker.mortgage import MortgageCalculator
@@ -356,7 +356,56 @@ def build_sidebar() -> FinancialPlan:
         maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
         use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
         use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
+        auto_invest_surplus=st.sidebar.toggle(
+            "Auto-Invest Surplus",
+            value=d_str.auto_invest_surplus if d_str else True,
+            help="ON: surplus breathing room is swept into brokerage each year (earns market return). "
+                 "OFF: surplus stays in cash (0% return). Toggle to see the cost of not investing.",
+        ),
     )
+
+    # ── Car ─────────────────────────────────────────────────
+    st.sidebar.header("🚗 Car")
+    d_car = defaults.car if defaults else None
+    has_car = st.sidebar.toggle("Model car purchases", value=d_car is not None)
+    car = None
+    if has_car:
+        car = CarProfile(
+            car_price=st.sidebar.number_input(
+                "Car price ($)", min_value=0, max_value=200_000,
+                value=int(d_car.car_price) if d_car else 25_000, step=1_000,
+            ),
+            down_payment=st.sidebar.number_input(
+                "Down payment ($)", min_value=0, max_value=100_000,
+                value=int(d_car.down_payment) if d_car else 5_000, step=500,
+            ),
+            loan_rate=st.sidebar.slider(
+                "Loan rate (%)", 0.0, 20.0,
+                float(d_car.loan_rate * 100) if d_car else 6.5, 0.25,
+            ) / 100,
+            loan_term_years=st.sidebar.selectbox(
+                "Loan term (years)", [3, 4, 5, 6, 7],
+                index=[3,4,5,6,7].index(d_car.loan_term_years) if d_car else 2,
+            ),
+            replace_every_years=st.sidebar.selectbox(
+                "Replace every (years)", [5, 7, 8, 10, 12, 15],
+                index=[5,7,8,10,12,15].index(d_car.replace_every_years) if d_car else 3,
+            ),
+            residual_value=st.sidebar.number_input(
+                "Sell old car for ($)", min_value=0, max_value=30_000,
+                value=int(d_car.residual_value) if d_car else 5_000, step=500,
+                help="Amount received when selling the old car if no child is old enough to receive it.",
+            ),
+            hand_down_age=st.sidebar.number_input(
+                "Hand-down age (child)", min_value=14, max_value=25,
+                value=int(d_car.hand_down_age) if d_car else 16, step=1,
+                help="Minimum child age to receive the handed-down car instead of selling it.",
+            ),
+            num_cars=st.sidebar.selectbox(
+                "Number of cars", [1, 2, 3],
+                index=(d_car.num_cars - 1) if d_car else 0,
+            ),
+        )
 
     # ── Timeline Events ──────────────────────────────────────
     st.sidebar.header("🗓️ Timeline Events")
@@ -403,6 +452,29 @@ def build_sidebar() -> FinancialPlan:
                 value=ev_def.new_pet if ev_def else False,
                 key=f"ev_pet_{i}",
             )
+
+            st.markdown("**Work changes**")
+            ev_stop = st.checkbox(
+                "You stop working",
+                value=ev_def.stop_working if ev_def else False,
+                key=f"ev_stop_{i}",
+            )
+            ev_resume = st.checkbox(
+                "You resume working",
+                value=ev_def.resume_working if ev_def else False,
+                key=f"ev_resume_{i}",
+            )
+            ev_partner_stop = st.checkbox(
+                "Partner stops working",
+                value=ev_def.partner_stop_working if ev_def else False,
+                key=f"ev_pstop_{i}",
+            )
+            ev_partner_resume = st.checkbox(
+                "Partner resumes working",
+                value=ev_def.partner_resume_working if ev_def else False,
+                key=f"ev_presume_{i}",
+            )
+
             ev_income = st.number_input(
                 "Your new gross income (0 = no change)",
                 min_value=0, max_value=5_000_000,
@@ -438,6 +510,8 @@ def build_sidebar() -> FinancialPlan:
             ev_new_home_down = None
             ev_new_home_rate = None
             ev_sell_current = True
+            ev_buyer_closing = 0.02   # default; only overridden when ev_buy_home=True
+            ev_seller_closing = 0.06  # default; only overridden when ev_buy_home=True
             if ev_buy_home:
                 ev_new_home_price = st.number_input(
                     "New home price ($)",
@@ -488,6 +562,10 @@ def build_sidebar() -> FinancialPlan:
                 marriage=ev_marriage,
                 new_child=ev_child,
                 new_pet=ev_pet,
+                stop_working=ev_stop,
+                resume_working=ev_resume,
+                partner_stop_working=ev_partner_stop,
+                partner_resume_working=ev_partner_resume,
                 income_change=float(ev_income) if ev_income > 0 else None,
                 partner_income_change=float(ev_partner_income) if ev_partner_income > 0 else None,
                 extra_one_time_expense=float(ev_expense),
@@ -510,6 +588,9 @@ def build_sidebar() -> FinancialPlan:
         income=income, housing=housing, lifestyle=lifestyle,
         investments=investments, strategies=strategies,
         timeline_events=events, projection_years=int(projection_years),
+        retirement=defaults.retirement if defaults else None,
+        college=defaults.college if defaults else None,
+        car=car,
     )
 
     # Save config button
@@ -905,6 +986,69 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 fill="tozeroy",
                 fillcolor="rgba(245,158,11,0.08)",
             ))
+
+            # ── Retirement balance line (always shown) ──────────────────
+            # Show retirement balance unconditionally — it is always meaningful
+            # regardless of whether a RetirementProfile is configured.
+            fig_cf.add_trace(go.Scatter(
+                x=df["Year"], y=df["Retirement"],
+                name="Retirement Balance",
+                line=dict(color="#818cf8", width=2, dash="dashdot"),
+                yaxis="y2",
+            ))
+            # Retirement target line — only when RetirementProfile is configured
+            if plan.retirement:
+                rr = projection_engine.compute_retirement_readiness(snapshots)
+                if rr:
+                    fig_cf.add_hline(
+                        y=rr.required_balance,
+                        line=dict(color="#818cf8", width=1, dash="dot"),
+                        annotation_text=f"Retirement target {fmt_dollar(rr.required_balance)}",
+                        annotation_position="top left",
+                        annotation_font=dict(color="#818cf8", size=10),
+                        yref="y2",
+                    )
+
+            # ── 529 college fund line + target ──────────────────────────
+            if plan.college and any(s.college_529_balance > 0 for s in snapshots):
+                col529_vals = [s.college_529_balance for s in snapshots]
+                fig_cf.add_trace(go.Scatter(
+                    x=df["Year"], y=col529_vals,
+                    name="529 Balance",
+                    line=dict(color="#34d399", width=2, dash="dash"),
+                    yaxis="y2",
+                ))
+
+                # College target: sum of all nominal college costs from first
+                # college year onward — this is what you need saved by then
+                college_costs = [(s.year, s.annual_college_cost)
+                                 for s in snapshots if s.annual_college_cost > 0]
+                if college_costs:
+                    first_college_yr = college_costs[0][0]
+                    last_college_yr  = college_costs[-1][0]
+                    total_college_cost = sum(c for _, c in college_costs)
+
+                    # Horizontal target: total nominal cost (a rough but intuitive benchmark)
+                    fig_cf.add_hline(
+                        y=total_college_cost,
+                        line=dict(color="#34d399", width=1, dash="dot"),
+                        annotation_text=f"College total {fmt_dollar(total_college_cost)}",
+                        annotation_position="bottom right",
+                        annotation_font=dict(color="#34d399", size=10),
+                        yref="y2",
+                    )
+
+                    # Vertical band marking active college years
+                    fig_cf.add_vrect(
+                        x0=first_college_yr - 0.5,
+                        x1=last_college_yr + 0.5,
+                        fillcolor="rgba(52,211,153,0.07)",
+                        line_width=0,
+                        annotation_text="College years",
+                        annotation_position="top left",
+                        annotation_font=dict(color="#34d399", size=9),
+                    )
+
             # Can't use **PLOTLY_DARK here because it already defines 'yaxis';
             # passing yaxis= again would cause a duplicate keyword error.
             fig_cf.update_layout(
@@ -913,11 +1057,11 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 plot_bgcolor="rgba(13,17,23,0.8)",
                 font=dict(family="Inter", color="#c9d1d9"),
                 margin=dict(l=0, r=0, t=30, b=0),
-                height=320,
+                height=360,
                 xaxis=dict(gridcolor="#21262d", zerolinecolor="#21262d"),
                 yaxis=dict(title="$ / year", gridcolor="#21262d", zerolinecolor="#21262d"),
                 yaxis2=dict(
-                    title="Liquid Assets ($)",
+                    title="Balances ($)",
                     overlaying="y",
                     side="right",
                     gridcolor="rgba(0,0,0,0)",
@@ -925,7 +1069,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
                     zerolinewidth=1,
                     tickformat="$,.0f",
                 ),
-                legend=dict(orientation="h", y=-0.25, x=0),
+                legend=dict(orientation="h", y=-0.22, x=0),
             )
             st.plotly_chart(fig_cf, use_container_width=True)
 
@@ -963,6 +1107,35 @@ def render_dashboard(plan: FinancialPlan) -> None:
             )
 
         # Key milestones — deduplicated, dynamically laid out
+        # ── Retirement Readiness Panel ────────────────────────────────
+        if plan.retirement:
+            rr_panel = projection_engine.compute_retirement_readiness(snapshots)
+            if rr_panel:
+                st.markdown("#### 🎯 Retirement Readiness")
+                color   = "#4ade80" if rr_panel.on_track else "#ef4444"
+                status  = "✅ On Track" if rr_panel.on_track else "⚠️ Off Track"
+                funded  = f"{rr_panel.funded_pct:.0%}"
+                gap_lbl = "Annual Surplus" if rr_panel.annual_surplus_or_gap >= 0 else "Annual Gap"
+                gap_val = fmt_dollar(abs(rr_panel.annual_surplus_or_gap))
+                gap_sign = "+" if rr_panel.annual_surplus_or_gap >= 0 else "-"
+
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("Status", status)
+                rc2.metric("Funded", funded,
+                           delta=f"target {fmt_dollar(rr_panel.required_balance)}",
+                           delta_color="normal" if rr_panel.on_track else "inverse")
+                rc3.metric("Projected at Retirement", fmt_dollar(rr_panel.projected_balance_at_retirement))
+                rc4.metric(gap_lbl, f"{gap_sign}{gap_val} /yr",
+                           delta=f"over {plan.retirement.years_in_retirement}yr @ {plan.retirement.expected_post_retirement_return:.0%}")
+
+                st.caption(
+                    f"Retire at age {plan.retirement.retirement_age} (year {rr_panel.years_to_retirement}) · "
+                    f"Desired income: {fmt_dollar(rr_panel.desired_income_nominal)}/yr (nominal) · "
+                    + (f"SS offset: {fmt_dollar(rr_panel.social_security_offset)}/yr · " if rr_panel.social_security_offset > 0 else "")
+                    + f"Post-retirement return: {plan.retirement.expected_post_retirement_return:.0%}"
+                )
+                st.divider()
+
         st.markdown("#### Key Milestones")
 
         # Each entry: (label, value, delta_note)
