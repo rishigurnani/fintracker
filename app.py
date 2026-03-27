@@ -347,6 +347,12 @@ def build_sidebar() -> FinancialPlan:
             float(d_inv.partner_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100
             if spouse > 0 else 0.04,
         annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
+        auto_invest_surplus=st.sidebar.toggle(
+            "Auto-Invest Surplus",
+            value=d_inv.auto_invest_surplus if d_inv else True,
+            help="ON: surplus swept into brokerage each year (earns market return). "
+                 "OFF: surplus stays in cash (0% return).",
+        ),
     )
 
     # ── Strategies ───────────────────────────────────────────
@@ -356,12 +362,6 @@ def build_sidebar() -> FinancialPlan:
         maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
         use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
         use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
-        auto_invest_surplus=st.sidebar.toggle(
-            "Auto-Invest Surplus",
-            value=d_str.auto_invest_surplus if d_str else True,
-            help="ON: surplus breathing room is swept into brokerage each year (earns market return). "
-                 "OFF: surplus stays in cash (0% return). Toggle to see the cost of not investing.",
-        ),
     )
 
     # ── Car ─────────────────────────────────────────────────
@@ -987,16 +987,23 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 fillcolor="rgba(245,158,11,0.08)",
             ))
 
-            # ── Retirement balance line (always shown) ──────────────────
-            # Show retirement balance unconditionally — it is always meaningful
-            # regardless of whether a RetirementProfile is configured.
+            # ── Total investable assets + retirement target ─────────────
+            # "Total investable assets" = retirement + brokerage + HSA.
+            # This is the SAME pool compute_retirement_readiness() projects
+            # against, so the line and the target are always comparable.
+            # Showing just retirement_balance here would conflict with the
+            # Retirement Readiness panel (single source of truth rule).
+            total_investable = [
+                s.retirement_balance + s.hsa_balance + s.brokerage_balance
+                for s in snapshots
+            ]
             fig_cf.add_trace(go.Scatter(
-                x=df["Year"], y=df["Retirement"],
-                name="Retirement Balance",
+                x=df["Year"], y=total_investable,
+                name="Total Investable Assets",
                 line=dict(color="#818cf8", width=2, dash="dashdot"),
                 yaxis="y2",
             ))
-            # Retirement target line — only when RetirementProfile is configured
+            # Retirement target — only when RetirementProfile is configured
             if plan.retirement:
                 rr = projection_engine.compute_retirement_readiness(snapshots)
                 if rr:

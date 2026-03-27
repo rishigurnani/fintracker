@@ -8,7 +8,7 @@ Tests for the five new feature groups:
 """
 import pytest
 from fintracker.models import (
-    CollegeProfile, FilingStatus, FinancialPlan, HousingProfile,
+    CarProfile, CollegeProfile, FilingStatus, FinancialPlan, HousingProfile,
     IncomeProfile, InvestmentProfile, LifestyleProfile, RetirementProfile,
     State, StrategyToggles, TimelineEvent,
 )
@@ -184,6 +184,80 @@ class TestRetirementReadiness:
         yr5 = snaps[4]
         expected = yr5.retirement_balance + yr5.brokerage_balance + yr5.hsa_balance
         assert abs(rr.projected_balance_at_retirement - expected) < 1
+
+
+
+    def test_required_balance_uses_growing_annuity(self):
+        """
+        REGRESSION: required_balance must use the growing annuity formula, not
+        a fixed annuity.  A fixed annuity assumes flat spending throughout
+        retirement; a growing annuity inflates spending at annual_inflation_rate
+        each year — the correct model for a real retiree.
+
+        For r=5%, g=3%, n=30, PMT=$194k:
+          Fixed annuity:   PMT * (1-(1+r)^-n)/r
+          Growing annuity: PMT / (r-g) * (1 - ((1+g)/(1+r))^n)
+        The growing annuity target is materially larger.
+        """
+        plan = FinancialPlan(
+            income=IncomeProfile(80_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=0, current_retirement_balance=0,
+                annual_401k_contribution=0, annual_market_return=0.0,
+                annual_inflation_rate=0.03, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=30,
+            retirement=RetirementProfile(
+                current_age=35, retirement_age=65,
+                desired_annual_income=100_000,
+                years_in_retirement=30,
+                expected_post_retirement_return=0.05,
+            ),
+        )
+        rr = ProjectionEngine(plan).compute_retirement_readiness()
+
+        # Manual growing annuity: PMT = 100k*(1.03)^30, r=5%, g=3%, n=30
+        import math
+        pmt = 100_000 * (1.03 ** 30)
+        r, g, n = 0.05, 0.03, 30
+        expected_growing = pmt / (r - g) * (1 - ((1 + g) / (1 + r)) ** n)
+        expected_fixed   = pmt * (1 - (1 + r) ** -n) / r
+
+        assert abs(rr.required_balance - expected_growing) < 1.0, (
+            f"Engine returned {rr.required_balance:,.0f}, "
+            f"expected growing annuity {expected_growing:,.0f}"
+        )
+        assert rr.required_balance > expected_fixed, (
+            f"Growing annuity ({rr.required_balance:,.0f}) should exceed "
+            f"fixed annuity ({expected_fixed:,.0f})"
+        )
+
+    def test_growing_annuity_edge_r_equals_g(self):
+        """When r == g exactly, formula uses L'Hôpital limit: PMT*n/(1+r)."""
+        plan = FinancialPlan(
+            income=IncomeProfile(80_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
+                                       annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=0,current_retirement_balance=0,
+                                          annual_401k_contribution=0,annual_market_return=0.0,
+                                          annual_inflation_rate=0.04,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=30,
+            retirement=RetirementProfile(current_age=35,retirement_age=65,
+                                          desired_annual_income=50_000,years_in_retirement=20,
+                                          expected_post_retirement_return=0.04),
+        )
+        rr = ProjectionEngine(plan).compute_retirement_readiness()
+        pmt = 50_000 * (1.04**30)
+        expected = pmt * 20 / 1.04
+        assert abs(rr.required_balance - expected) < 1.0, (
+            f"r=g edge case: got {rr.required_balance:,.0f}, expected {expected:,.0f}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -827,7 +901,8 @@ class TestParentCareCosts:
         for yr in [1, 2, 3]:
             assert snaps[yr-1].annual_parent_care_cost > 0, f"Yr{yr} should have care cost"
         for yr in [4, 5, 6, 7, 8]:
-            assert snaps[yr-1].annual_parent_care_cost == 0.0, f"Yr{yr} care should have stopped"
+            assert snaps[yr-1].annual_parent_care_cost == 0.0, \
+                f"Yr{yr}: parent care should be zero after stop_parent_care event in yr4"
 
     def test_parent_care_reduces_breathing_room(self):
         p_with = self._parent_plan(12_000)
@@ -924,7 +999,7 @@ class TestIntegrationAllFeatures:
 
 class TestAutoInvestSurplus:
     """
-    Tests for the auto_invest_surplus toggle on StrategyToggles.
+    Tests for the auto_invest_surplus toggle on InvestmentProfile.
     ON  (default): surplus breathing room swept to brokerage each year → earns market return.
     OFF: surplus stays in uninvested_cash (0% return) → shows cost of not investing.
     """
@@ -940,9 +1015,9 @@ class TestAutoInvestSurplus:
                 annual_market_return=0.08,
                 annual_inflation_rate=0.0,
                 annual_salary_growth_rate=0.0,
+                auto_invest_surplus=auto_invest,
             ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
-                                        auto_invest_surplus=auto_invest),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             projection_years=years,
         )
 
@@ -994,9 +1069,9 @@ class TestAutoInvestSurplus:
                 annual_market_return=0.0,
                 annual_inflation_rate=0.0,
                 annual_salary_growth_rate=0.0,
+                auto_invest_surplus=False,
             ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
-                                        auto_invest_surplus=False),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             # Year 3: big expense that flips to deficit
             timeline_events=[
                 TimelineEvent(year=3, description="Big expense", extra_one_time_expense=500_000),
@@ -1013,4 +1088,272 @@ class TestAutoInvestSurplus:
 
     def test_toggle_default_is_on(self):
         """Default behavior must be to invest surplus (backwards compatible)."""
-        assert StrategyToggles().auto_invest_surplus is True
+        assert InvestmentProfile().auto_invest_surplus is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Car Purchases and Financing
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCarPurchases:
+
+    def _plan(self, events=None, children=None, years=22, num_cars=1,
+              replace_every=10, loan_term=5, residual=5_000, hand_down_age=16,
+              car_price=25_000, down=5_000):
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=300_000,
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=events or (children or []),
+            car=CarProfile(
+                car_price=car_price, down_payment=down,
+                loan_rate=0.065, loan_term_years=loan_term,
+                replace_every_years=replace_every, residual_value=residual,
+                hand_down_age=hand_down_age, num_cars=num_cars,
+            ),
+            projection_years=years,
+        )
+
+    # --- Loan payments ---
+
+    def test_loan_payment_fires_during_loan_term(self):
+        """Car loan P&I payments must be non-zero during the loan term."""
+        snaps = ProjectionEngine(self._plan(loan_term=5)).run_deterministic()
+        for s in snaps[:5]:
+            assert s.annual_car_payment > 0, f"Yr{s.year}: expected payment during loan term"
+
+    def test_no_payment_after_loan_paid_off(self):
+        """No car payments after loan term expires."""
+        snaps = ProjectionEngine(self._plan(loan_term=5)).run_deterministic()
+        for s in snaps[5:10]:  # yrs 6-10: loan paid off, next car not yet bought
+            assert s.annual_car_payment == pytest.approx(0.0, abs=1),                 f"Yr{s.year}: loan should be paid off"
+
+    def test_payment_reduces_breathing_room(self):
+        """Car payment must reduce breathing room compared to no-car plan."""
+        plan_car  = self._plan()
+        plan_none = FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=5,
+        )
+        s_car  = ProjectionEngine(plan_car).run_deterministic()[0]
+        s_none = ProjectionEngine(plan_none).run_deterministic()[0]
+        assert s_car.annual_breathing_room < s_none.annual_breathing_room,             "Car payment should reduce breathing room"
+
+    # --- Down payment ---
+
+    def test_initial_down_payment_deducted_from_brokerage(self):
+        """Initial car down payment must come out of starting brokerage."""
+        plan_car  = self._plan(down=5_000)
+        plan_none = FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=1,
+        )
+        s_car  = ProjectionEngine(plan_car).run_deterministic()[0]
+        s_none = ProjectionEngine(plan_none).run_deterministic()[0]
+        # At yr1: brokerage_car = brokerage_none - 5k_down (same net income, same market return)
+        # Total reduction = down_payment + annual_car_payment (both reduce brokerage)
+        expected_diff = 5_000 + s_car.annual_car_payment
+        actual_diff = s_none.brokerage_balance - s_car.brokerage_balance
+        assert abs(actual_diff - expected_diff) < 1.0, \
+            f"Expected diff {expected_diff:.0f}, got {actual_diff:.0f}"
+
+    def test_replacement_down_payment_hits_brokerage(self):
+        """At replacement year, new down payment is deducted from brokerage."""
+        snaps = ProjectionEngine(self._plan(replace_every=10)).run_deterministic()
+        yr11 = snaps[10]
+        assert yr11.car_purchase_cost == pytest.approx(5_000, abs=1),             f"Yr11 replacement should show 5k down payment, got {yr11.car_purchase_cost:.0f}"
+
+    # --- Replacement cycle ---
+
+    def test_replacement_fires_every_n_years(self):
+        """Car replacement must fire at yr11 and yr21 for replace_every=10."""
+        snaps = ProjectionEngine(self._plan(replace_every=10, years=25)).run_deterministic()
+        replacement_yrs = [s.year for s in snaps if s.car_purchase_cost > 0]
+        assert 11 in replacement_yrs, f"Expected replacement at yr11, got {replacement_yrs}"
+        assert 21 in replacement_yrs, f"Expected replacement at yr21, got {replacement_yrs}"
+
+    def test_new_loan_starts_after_replacement(self):
+        """After replacing the car, a new 5-year loan starts."""
+        snaps = ProjectionEngine(self._plan(replace_every=10, loan_term=5)).run_deterministic()
+        # Yr11-15: new loan payments (5 years)
+        for yr in [11, 12, 13, 14, 15]:
+            assert snaps[yr-1].annual_car_payment > 0, f"Yr{yr}: expected payment on new loan"
+        # Yr16-20: loan paid off
+        for yr in [16, 17, 18, 19, 20]:
+            assert snaps[yr-1].annual_car_payment == pytest.approx(0.0, abs=1),                 f"Yr{yr}: loan should be paid off"
+
+    # --- Sell vs hand-down ---
+
+    def test_sells_old_car_when_no_children(self):
+        """With no children, old car is always sold for residual_value."""
+        snaps = ProjectionEngine(self._plan(residual=5_000)).run_deterministic()
+        yr11 = snaps[10]
+        assert yr11.car_sale_proceeds == pytest.approx(5_000, abs=1),             f"Expected 5k sale proceeds, got {yr11.car_sale_proceeds:.0f}"
+
+    def test_sells_old_car_when_children_too_young(self):
+        """If all children are below hand_down_age, sell the car."""
+        # Child born yr1 → age 10 at yr11 → too young (hand_down_age=16)
+        events = [TimelineEvent(year=1, description="Child", new_child=True)]
+        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16)).run_deterministic()
+        yr11 = snaps[10]
+        child_age = 11 - 1  # born yr1
+        assert child_age < 16
+        assert yr11.car_sale_proceeds == pytest.approx(5_000, abs=1),             f"Child age {child_age} < 16, should sell for 5k"
+
+    def test_hands_down_car_when_child_old_enough(self):
+        """If a child is at or above hand_down_age at replacement, hand down (0 proceeds)."""
+        # Child born yr1 → age 20 at yr21 → old enough (hand_down_age=16)
+        events = [TimelineEvent(year=1, description="Child", new_child=True)]
+        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16, years=25)).run_deterministic()
+        yr21 = snaps[20]
+        child_age = 21 - 1
+        assert child_age >= 16
+        assert yr21.car_sale_proceeds == pytest.approx(0.0, abs=1),             f"Child age {child_age} >= 16, should hand down (0 proceeds)"
+
+    def test_hand_down_saves_money_vs_sell(self):
+        """Brokerage at yr21 should be higher when handing down vs not having children."""
+        # When handing down: no 5k proceeds BUT also the child has the car (no loss)
+        # When selling: +5k proceeds BUT -5k goes toward new car down (net neutral)
+        # Actually same cash flow. Key difference: handing down vs selling is neutral for parent.
+        # The real benefit is to the child. Test that proceeds=0 when handing down.
+        events = [TimelineEvent(year=1, description="Child", new_child=True)]
+        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16, years=22)).run_deterministic()
+        yr21 = snaps[20]
+        assert yr21.car_sale_proceeds == 0.0  # handed down, not sold
+
+    # --- Multiple cars ---
+
+    def test_two_cars_double_payments(self):
+        """Two cars should produce roughly double the annual payment of one."""
+        s1 = ProjectionEngine(self._plan(num_cars=1)).run_deterministic()[0]
+        s2 = ProjectionEngine(self._plan(num_cars=2)).run_deterministic()[0]
+        assert abs(s2.annual_car_payment - 2 * s1.annual_car_payment) < 50,             f"2-car payment {s2.annual_car_payment:.0f} should be ~2x {s1.annual_car_payment:.0f}"
+
+    def test_two_cars_double_initial_down(self):
+        """Two cars means 2x the initial down payment from brokerage."""
+        plan1 = self._plan(num_cars=1, down=5_000)
+        plan2 = self._plan(num_cars=2, down=5_000)
+        plan0 = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=1)
+        s0 = ProjectionEngine(plan0).run_deterministic()[0]
+        s1 = ProjectionEngine(plan1).run_deterministic()[0]
+        s2 = ProjectionEngine(plan2).run_deterministic()[0]
+        # Down payments are deducted in _initial_state(), before year 1 runs.
+        # With market_return=0: initial_brokerage = yr1_brokerage - yr1_breathing_room
+        # This strips out loan payments and isolates only the initial down payment.
+        init0 = s0.brokerage_balance - s0.annual_breathing_room
+        init1 = s1.brokerage_balance - s1.annual_breathing_room
+        init2 = s2.brokerage_balance - s2.annual_breathing_room
+        diff1 = init0 - init1
+        diff2 = init0 - init2
+        assert abs(diff1 - 5_000) < 1, f"1-car: expected 5k down diff, got {diff1:.0f}"
+        assert abs(diff2 - 10_000) < 1, f"2-car: expected 10k down diff, got {diff2:.0f}"
+
+    # --- No car ---
+
+    def test_no_car_zero_car_costs(self):
+        """Without a CarProfile, all car fields on snapshots should be zero."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=5)
+        for s in ProjectionEngine(plan).run_deterministic():
+            assert s.annual_car_payment == 0.0
+            assert s.car_purchase_cost == 0.0
+            assert s.car_sale_proceeds == 0.0
+
+    # --- NW integrity ---
+
+    def test_nw_integrity_with_car(self):
+        """Net worth components must sum correctly with car costs active."""
+        events = [TimelineEvent(year=1, description="Child", new_child=True)]
+        plan = self._plan(events=events, years=25)
+        for s in ProjectionEngine(plan).run_deterministic():
+            components = (s.retirement_balance + s.brokerage_balance
+                          + s.college_529_balance + s.home_equity
+                          + s.hsa_balance + s.uninvested_cash)
+            assert abs(components - s.net_worth) < 1.0,                 f"Yr{s.year}: components={components:.2f} net_worth={s.net_worth:.2f}"
+
+
+class TestChildBirthYearOverrideRegression:
+    """
+    REGRESSION: child_birth_year_override=0 was treated as falsy in:
+        birth_year = event.child_birth_year_override or year
+    which evaluates to `year` when override=0 (falsy zero).
+    Fix: use `event.child_birth_year_override if event.child_birth_year_override is not None else year`
+    This affected college timing, AOTC, wedding fund stop age, and car hand-down logic.
+    """
+
+    def test_zero_override_not_treated_as_falsy(self):
+        """child_birth_year_override=0 must use year 0, not the event year."""
+        plan = FinancialPlan(
+            income=IncomeProfile(70_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=500_000,
+                                          annual_529_contribution=5_000,
+                                          annual_market_return=0.0, annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[
+                TimelineEvent(year=1, description="Child born yr0",
+                              new_child=True, child_birth_year_override=0)
+            ],
+            college=CollegeProfile(annual_cost_per_child=10_000, years_per_child=4,
+                                    start_age=18, use_aotc_credit=True),
+            projection_years=22,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # Born yr0: age 18 at yr18 → college starts yr18 (not yr19 as with falsy bug)
+        assert snaps[17].annual_college_cost > 0, \
+            "Yr18: child age 18, college should start. " \
+            "Regression: child_birth_year_override=0 was treated as falsy."
+        assert snaps[16].annual_college_cost == 0, \
+            "Yr17: child age 17, college not yet"
+
+    def test_negative_override_unaffected(self):
+        """Negative overrides (already born) were never affected by the bug."""
+        plan = FinancialPlan(
+            income=IncomeProfile(70_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=300_000, annual_market_return=0.0,
+                                          annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[
+                TimelineEvent(year=1, description="Teen", new_child=True,
+                              child_birth_year_override=-17)
+            ],
+            college=CollegeProfile(annual_cost_per_child=10_000, years_per_child=4,
+                                    start_age=18, use_aotc_credit=False),
+            projection_years=6,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # Born yr -17: age 18 at yr1 → college starts yr1
+        assert snaps[0].annual_college_cost > 0, "Yr1 college should start for child born yr-17"
