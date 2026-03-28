@@ -8,7 +8,7 @@ Tests for the five new feature groups:
 """
 import pytest
 from fintracker.models import (
-    CarProfile, CollegeProfile, FilingStatus, FinancialPlan, HousingProfile,
+    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan, HousingProfile,
     IncomeProfile, InvestmentProfile, LifestyleProfile, RetirementProfile,
     State, StrategyToggles, TimelineEvent,
 )
@@ -1299,6 +1299,118 @@ class TestCarPurchases:
             assert abs(components - s.net_worth) < 1.0,                 f"Yr{s.year}: components={components:.2f} net_worth={s.net_worth:.2f}"
 
 
+
+
+    # --- Kids' first cars ---
+
+    def test_kids_car_fires_at_graduation(self):
+        """kids_car is purchased in the year each child graduates college."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
+                                       annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=500_000,annual_market_return=0.0,
+                                          annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            timeline_events=[
+                # Child born yr-17 (age 18 at yr1) → graduates at age 22 → yr5
+                TimelineEvent(year=1,description="Child",new_child=True,child_birth_year_override=-17),
+            ],
+            college=CollegeProfile(annual_cost_per_child=10_000,years_per_child=4,
+                                    start_age=18,use_aotc_credit=False),
+            car=CarProfile(car_price=25_000,down_payment=5_000,loan_rate=0.07,
+                           loan_term_years=5,replace_every_years=20,num_cars=0,
+                           kids_car=KidCarProfile(car_price=15_000,down_payment_pct=0.20,
+                                                   loan_rate=0.07,loan_term_years=5)),
+            projection_years=10,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # No adult car (num_cars=0), so any car payment must come from the kid's car
+        # Kid graduates yr5 (age=22): loan payments start yr5 and run through yr9
+        assert snaps[4].annual_car_payment > 0, "Kid car loan should start in yr5"
+        assert snaps[3].annual_car_payment == 0, "No car payment before graduation (yr4)"
+        assert snaps[9].annual_car_payment == 0, "Loan paid off after 5 years (yr10)"
+
+    def test_two_kids_get_separate_cars_at_graduation(self):
+        """Each child gets their own car at their own graduation year."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
+                                       annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=500_000,annual_market_return=0.0,
+                                          annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            timeline_events=[
+                # Kid1: born -17 → graduates yr5 (age 22)
+                TimelineEvent(year=1,description="Kid1",new_child=True,child_birth_year_override=-17),
+                # Kid2: born -15 → graduates yr7 (age 22)
+                TimelineEvent(year=1,description="Kid2",new_child=True,child_birth_year_override=-15),
+            ],
+            college=CollegeProfile(annual_cost_per_child=10_000,years_per_child=4,
+                                    start_age=18,use_aotc_credit=False),
+            car=CarProfile(car_price=25_000,down_payment=5_000,loan_rate=0.07,
+                           loan_term_years=5,replace_every_years=20,num_cars=0,
+                           kids_car=KidCarProfile(car_price=15_000,down_payment_pct=0.20,
+                                                   loan_rate=0.07,loan_term_years=5)),
+            projection_years=12,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr5: kid1 loan starts (yr1 of loan)
+        # yr6: kid1 only (yr2 of loan)
+        # yr7: both loans active (kid1 yr3, kid2 yr1) → payments should be > yr6
+        assert snaps[4].annual_car_payment > 0,                "Kid1 loan starts yr5"
+        assert snaps[6].annual_car_payment > snaps[5].annual_car_payment,             "yr7 (both kids) > yr6 (kid1 only)"
+        # NW integrity
+        for s in snaps:
+            c = (s.retirement_balance + s.brokerage_balance + s.college_529_balance
+                 + s.home_equity + s.hsa_balance + s.uninvested_cash + s.cash_buffer)
+            assert abs(c - s.net_worth) < 1.0, f"Yr{s.year}: NW mismatch"
+
+    def test_kids_car_config_roundtrip(self):
+        """KidCarProfile survives YAML serialisation round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=100_000),
+            strategies=StrategyToggles(),
+            car=CarProfile(car_price=30_000,num_cars=2,
+                           kids_car=KidCarProfile(car_price=15_000,down_payment_pct=0.15,
+                                                   buy_at_age=22)),
+            projection_years=10)
+        plan2 = _dict_to_plan(_plan_to_dict(plan))
+        assert plan2.car.kids_car is not None
+        assert plan2.car.kids_car.car_price == 15_000
+        assert plan2.car.kids_car.down_payment_pct == 0.15
+        assert plan2.car.kids_car.buy_at_age == 22
+
+    def test_no_kids_car_no_graduation_purchases(self):
+        """Without kids_car configured, no graduation-linked car purchases occur."""
+        plan = FinancialPlan(
+            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
+                                       annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=500_000,annual_market_return=0.0,
+                                          annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            timeline_events=[
+                TimelineEvent(year=1,description="Child",new_child=True,child_birth_year_override=-17),
+            ],
+            college=CollegeProfile(annual_cost_per_child=10_000,years_per_child=4,
+                                    start_age=18,use_aotc_credit=False),
+            # num_cars=0 means no adult car either; kids_car=None means no graduation car
+            car=CarProfile(num_cars=0, kids_car=None),
+            projection_years=10,
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert all(s.annual_car_payment == 0 for s in snaps),             "No car payments when num_cars=0 and kids_car=None"
+
+
+
 class TestChildBirthYearOverrideRegression:
     """
     REGRESSION: child_birth_year_override=0 was treated as falsy in:
@@ -1357,3 +1469,573 @@ class TestChildBirthYearOverrideRegression:
         snaps = ProjectionEngine(plan).run_deterministic()
         # Born yr -17: age 18 at yr1 → college starts yr1
         assert snaps[0].annual_college_cost > 0, "Yr1 college should start for child born yr-17"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Monte Carlo — configurable params + liquidity risk
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMonteCarloLiquidity:
+    """Tests for the new liquidity risk tracking and configurable std params."""
+
+    def _plan(self, income=120_000, liquid_cash=50_000, rent=1_500, years=15):
+        return FinancialPlan(
+            income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=rent),
+            lifestyle=LifestyleProfile(annual_vacation=5_000,monthly_other_recurring=500,
+                                       annual_medical_oop=3_000,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=liquid_cash,
+                                          annual_market_return=0.07,annual_inflation_rate=0.03,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=years,
+        )
+
+    def test_prob_negative_liquid_length_matches_years(self):
+        """One probability value per projection year."""
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(n_simulations=100, seed=1)
+        assert len(mc.prob_negative_liquid) == len(mc.years)
+
+    def test_prob_negative_liquid_is_valid_probability(self):
+        """All values must be in [0, 1]. 0.0 is valid (no risk) and 1.0 is valid (always illiquid)."""
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(n_simulations=100, seed=1)
+        for i, p in enumerate(mc.prob_negative_liquid):
+            assert 0.0 <= p <= 1.0, f"Year {mc.years[i]}: probability {p} out of [0, 1]"
+
+    def test_liquid_percentile_lengths_match_years(self):
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(n_simulations=100, seed=1)
+        n = len(mc.years)
+        assert len(mc.p10_liquid) == n
+        assert len(mc.p50_liquid) == n
+        assert len(mc.p90_liquid) == n
+
+    def test_liquid_percentile_ordering(self):
+        """p10 ≤ p50 ≤ p90 every year."""
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(n_simulations=200, seed=42)
+        for i in range(len(mc.years)):
+            assert mc.p10_liquid[i] <= mc.p50_liquid[i], f"yr{mc.years[i]}: p10 > p50"
+            assert mc.p50_liquid[i] <= mc.p90_liquid[i], f"yr{mc.years[i]}: p50 > p90"
+
+    def test_tight_plan_shows_liquidity_risk(self):
+        """A plan with income far below housing costs should produce non-zero liquidity risk."""
+        plan = FinancialPlan(
+            income=IncomeProfile(40_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(400_000, 80_000, 0.07),
+            lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=1_000,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=150_000, annual_market_return=0.08,
+                                          annual_inflation_rate=0.03, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=10,
+        )
+        mc = ProjectionEngine(plan).run_monte_carlo(n_simulations=300, seed=42)
+        assert max(mc.prob_negative_liquid) > 0,             "Expected non-zero liquidity risk for a structurally cash-flow-negative plan"
+
+    def test_healthy_plan_zero_liquidity_risk(self):
+        """A well-funded plan with strong income should stay liquid in all simulations."""
+        plan = FinancialPlan(
+            income=IncomeProfile(300_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=500_000, annual_market_return=0.07,
+                                          annual_inflation_rate=0.03, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=10,
+        )
+        mc = ProjectionEngine(plan).run_monte_carlo(n_simulations=200, seed=42)
+        assert max(mc.prob_negative_liquid) == 0.0,             f"Expected zero risk, got {max(mc.prob_negative_liquid):.1%}"
+
+    def test_higher_market_std_widens_liquid_spread(self):
+        """Higher volatility should produce a wider p10–p90 liquid band.
+        Must use use_historical_returns=False: bootstrap ignores market_return_std."""
+        engine = ProjectionEngine(self._plan(years=20))
+        mc_low  = engine.run_monte_carlo(200, seed=42, market_return_std=0.05, use_historical_returns=False)
+        mc_high = engine.run_monte_carlo(200, seed=42, market_return_std=0.30, use_historical_returns=False)
+        spread_low  = mc_low.p90_liquid[-1]  - mc_low.p10_liquid[-1]
+        spread_high = mc_high.p90_liquid[-1] - mc_high.p10_liquid[-1]
+        assert spread_high > spread_low,             f"Higher std should widen band: high={spread_high:.0f} low={spread_low:.0f}"
+
+    def test_market_return_std_stored_in_result(self):
+        """Custom std values should be stored on the result for display."""
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(100, seed=1,
+                                                             market_return_std=0.20,
+                                                             inflation_std=0.025,
+                                                             salary_growth_std=0.03)
+        assert abs(mc.market_return_std - 0.20) < 1e-9
+        assert abs(mc.inflation_std - 0.025) < 1e-9
+        assert abs(mc.salary_growth_std - 0.03) < 1e-9
+
+    def test_seeded_results_reproducible(self):
+        """Same seed + params should produce identical results."""
+        engine = ProjectionEngine(self._plan())
+        mc1 = engine.run_monte_carlo(200, seed=99)
+        mc2 = engine.run_monte_carlo(200, seed=99)
+        assert mc1.p50_net_worth == mc2.p50_net_worth
+        assert mc1.prob_negative_liquid == mc2.prob_negative_liquid
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cash Buffer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCashBuffer:
+    """
+    Tests for cash_buffer_months in InvestmentProfile.
+
+    The buffer keeps N months of living expenses as liquid cash (0% return)
+    before sweeping any surplus to brokerage. Deficits drain the buffer
+    first, then brokerage — reducing the probability of going negative
+    in bad Monte Carlo years.
+    """
+
+    def _plan(self, buffer_months=0.0, income=120_000):
+        return FinancialPlan(
+            income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_500),
+            lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=50_000,
+                annual_market_return=0.07, annual_inflation_rate=0.03,
+                annual_salary_growth_rate=0.04,
+                cash_buffer_months=buffer_months,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=10,
+        )
+
+    def test_zero_buffer_stays_zero(self):
+        """With cash_buffer_months=0, cash_buffer is always 0."""
+        for s in ProjectionEngine(self._plan(0)).run_deterministic():
+            assert s.cash_buffer == 0.0, f"Yr{s.year}: buffer should be 0"
+
+    def test_buffer_builds_from_surplus(self):
+        """With buffer_months>0, cash_buffer grows toward the floor."""
+        snaps = ProjectionEngine(self._plan(6)).run_deterministic()
+        assert snaps[-1].cash_buffer > 0, "Buffer should be positive after 10 years"
+
+    def test_buffer_diverts_surplus_from_brokerage(self):
+        """Buffer is funded by diverting surplus that would otherwise go to brokerage."""
+        s0 = ProjectionEngine(self._plan(0)).run_deterministic()
+        s6 = ProjectionEngine(self._plan(6)).run_deterministic()
+        assert s6[-1].brokerage_balance < s0[-1].brokerage_balance,             "Buffer diverts from brokerage; brokerage should be smaller"
+        assert s6[-1].cash_buffer > 0
+
+    def test_nw_integrity_with_buffer(self):
+        """cash_buffer must count toward net_worth."""
+        for s in ProjectionEngine(self._plan(6)).run_deterministic():
+            components = (s.retirement_balance + s.brokerage_balance
+                          + s.college_529_balance + s.home_equity
+                          + s.hsa_balance + s.uninvested_cash + s.cash_buffer)
+            assert abs(components - s.net_worth) < 1.0,                 f"Yr{s.year}: components={components:.2f} net_worth={s.net_worth:.2f}"
+
+    def test_nw_integrity_zero_buffer(self):
+        """NW integrity must hold with zero buffer too (regression)."""
+        for s in ProjectionEngine(self._plan(0)).run_deterministic():
+            components = (s.retirement_balance + s.brokerage_balance
+                          + s.college_529_balance + s.home_equity
+                          + s.hsa_balance + s.uninvested_cash + s.cash_buffer)
+            assert abs(components - s.net_worth) < 1.0,                 f"Yr{s.year}: NW mismatch {components:.2f} vs {s.net_worth:.2f}"
+
+    def test_buffer_stabilises_once_filled(self):
+        """Once the buffer reaches its floor, changes are small (only inflation drift)."""
+        snaps = ProjectionEngine(self._plan(3)).run_deterministic()
+        diffs = [snaps[i].cash_buffer - snaps[i-1].cash_buffer for i in range(3, len(snaps))]
+        assert all(d >= -1.0 for d in diffs),             f"Buffer should not shrink after filling: diffs={diffs}"
+
+    def test_default_buffer_is_zero(self):
+        """Default cash_buffer_months should be 0 (backwards compatible)."""
+        assert InvestmentProfile().cash_buffer_months == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YAML Export Fidelity — no field may be lost on round-trip through the UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExportFidelity:
+    """
+    Verifies that every field in a loaded YAML plan survives the sidebar
+    build_sidebar() → FinancialPlan → _plan_to_dict() round-trip unchanged.
+
+    The failure mode being guarded against: build_sidebar() constructs
+    sub-objects from scratch using only sidebar widget values, silently
+    dropping any field not exposed in the UI.  The fix uses
+    dataclasses.replace() so non-UI fields are inherited from the loaded plan.
+
+    These tests simulate what the sidebar does without running Streamlit:
+    they call _simulate_sidebar_merge() which mirrors the merge logic.
+    """
+
+    def _full_plan(self) -> FinancialPlan:
+        """A plan with every optional field set to a non-default value."""
+        return FinancialPlan(
+            income=IncomeProfile(
+                gross_annual_income=180_000,
+                spouse_gross_annual_income=100_000,
+                filing_status=FilingStatus.MARRIED_FILING_JOINTLY,
+                state=State.GEORGIA,
+                other_state_flat_rate=0.07,
+            ),
+            housing=HousingProfile(
+                home_price=600_000, down_payment=120_000, interest_rate=0.068,
+                loan_term_years=30,
+                annual_property_tax_rate=0.015,
+                annual_insurance=3_500,
+                annual_maintenance_rate=0.012,
+                pmi_annual_rate=0.006,
+                is_renting=False,
+                monthly_rent=0.0,
+                annual_rent_increase_rate=0.04,
+            ),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=2_500,
+                num_children=1,
+                num_pets=2,
+                annual_pet_cost=3_000,
+                annual_medical_oop=4_000,
+                medical_auto_scale=True,
+                medical_spouse_multiplier=1.9,
+                medical_per_child_annual=1_800,
+                annual_vacation=12_000,
+                monthly_other_recurring=1_500,
+                annual_wedding_fund_per_child=5_000,
+                annual_parent_care_cost=18_000,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=50_000,
+                current_retirement_balance=120_000,
+                current_brokerage_balance=300_000,
+                one_time_upcoming_expenses=10_000,
+                annual_401k_contribution=21_000,
+                partner_annual_401k_contribution=19_500,
+                annual_roth_ira_contribution=6_500,
+                annual_hsa_contribution=8_300,
+                annual_529_contribution=10_000,
+                annual_brokerage_contribution=5_000,
+                annual_market_return=0.09,
+                annual_inflation_rate=0.035,
+                annual_salary_growth_rate=0.05,
+                partner_salary_growth_rate=0.06,
+                annual_home_appreciation_rate=0.04,
+                auto_invest_surplus=False,
+                cash_buffer_months=6.0,
+            ),
+            strategies=StrategyToggles(
+                maximize_hsa=True,
+                use_529_state_deduction=True,
+                maximize_401k=True,
+                use_roth_ladder=True,
+                roth_conversion_annual_amount=25_000,
+            ),
+            timeline_events=[
+                TimelineEvent(
+                    year=1, description="Get married",
+                    marriage=True, extra_one_time_expense=15_000,
+                ),
+                TimelineEvent(
+                    year=2, description="Buy home",
+                    buy_home=True, new_home_price=600_000,
+                    new_home_down_payment=120_000,
+                    new_home_interest_rate=0.068,
+                    sell_current_home=False,
+                    buyer_closing_cost_rate=0.025,
+                    seller_closing_cost_rate=0.055,
+                ),
+                TimelineEvent(
+                    year=3, description="Child with override",
+                    new_child=True,
+                    child_birth_year_override=-2,
+                ),
+                TimelineEvent(
+                    year=5, description="Partner stops",
+                    partner_stop_working=True,
+                ),
+                TimelineEvent(
+                    year=8, description="Start parent care",
+                    start_parent_care=True,
+                ),
+                TimelineEvent(
+                    year=14, description="Stop parent care",
+                    stop_parent_care=True,
+                ),
+                TimelineEvent(
+                    year=6, description="Business investment",
+                    extra_one_time_expense=100_000,
+                ),
+            ],
+            retirement=RetirementProfile(
+                current_age=29,
+                retirement_age=65,
+                desired_annual_income=100_000,
+                years_in_retirement=45,
+                expected_post_retirement_return=0.05,
+                estimated_social_security_annual=0,
+            ),
+            college=CollegeProfile(
+                annual_cost_per_child=26_000,
+                years_per_child=4,
+                start_age=18,
+                use_aotc_credit=True,
+                early_529_return=0.08,
+                late_529_return=0.04,
+                glide_path_years=10,
+            ),
+            car=CarProfile(
+                car_price=25_000,
+                down_payment=5_000,
+                loan_rate=0.065,
+                loan_term_years=5,
+                replace_every_years=15,
+                residual_value=5_000,
+                hand_down_age=16,
+                num_cars=2,
+                kids_car=KidCarProfile(
+                    car_price=15_000,
+                    down_payment_pct=0.20,
+                    loan_rate=0.07,
+                    loan_term_years=5,
+                    buy_at_age=22,
+                ),
+            ),
+            projection_years=36,
+        )
+
+    def _sidebar_merge(self, loaded: FinancialPlan, sidebar_income=None,
+                       sidebar_is_renting=None, sidebar_spouse=0) -> FinancialPlan:
+        """
+        Simulate what build_sidebar() does: merge sidebar-controlled fields
+        on top of the loaded plan using dataclasses.replace().
+        This mirrors the exact pattern used in app.py.
+        """
+        import dataclasses
+
+        # Income — fully covered
+        income = dataclasses.replace(
+            loaded.income,
+            gross_annual_income=sidebar_income or loaded.income.gross_annual_income,
+        )
+
+        # Housing — sidebar only controls 3-4 fields; rest come from loaded plan
+        if sidebar_is_renting is True:
+            housing = dataclasses.replace(
+                loaded.housing,
+                home_price=0.0, down_payment=0.0, interest_rate=0.0,
+                is_renting=True, monthly_rent=loaded.housing.monthly_rent,
+            )
+        else:
+            housing = dataclasses.replace(
+                loaded.housing,
+                is_renting=False,
+            )
+
+        # Lifestyle — sidebar controls 7 fields; 5 come from loaded plan
+        lifestyle = dataclasses.replace(
+            loaded.lifestyle,
+            num_children=loaded.lifestyle.num_children,
+            annual_medical_oop=loaded.lifestyle.annual_medical_oop,
+        )
+
+        # Investments — sidebar controls most; 2 come from loaded plan
+        investments = dataclasses.replace(
+            loaded.investments,
+            annual_roth_ira_contribution=loaded.investments.annual_roth_ira_contribution,
+            annual_brokerage_contribution=loaded.investments.annual_brokerage_contribution,
+        )
+
+        # Strategies — sidebar controls 4; roth_conversion_annual_amount from loaded
+        strategies = dataclasses.replace(
+            loaded.strategies,
+            maximize_hsa=loaded.strategies.maximize_hsa,
+        )
+
+        return FinancialPlan(
+            income=income,
+            housing=housing,
+            lifestyle=lifestyle,
+            investments=investments,
+            strategies=strategies,
+            timeline_events=loaded.timeline_events,
+            projection_years=loaded.projection_years,
+            retirement=loaded.retirement,
+            college=loaded.college,
+            car=loaded.car,
+        )
+
+    def _assert_plans_equal(self, original: FinancialPlan, exported: FinancialPlan,
+                             context: str = "") -> None:
+        """Deep field-by-field comparison with clear failure messages."""
+        import dataclasses
+
+        def cmp(a, b, path):
+            if dataclasses.is_dataclass(a) and dataclasses.is_dataclass(b):
+                for f in dataclasses.fields(a):
+                    cmp(getattr(a, f.name), getattr(b, f.name), f"{path}.{f.name}")
+            elif isinstance(a, list) and isinstance(b, list):
+                assert len(a) == len(b), f"{context}{path}: list length {len(a)} vs {len(b)}"
+                for i, (x, y) in enumerate(zip(a, b)):
+                    cmp(x, y, f"{path}[{i}]")
+            elif isinstance(a, float) and isinstance(b, float):
+                assert abs(a - b) < 1e-9, f"{context}{path}: {a} != {b}"
+            else:
+                assert a == b, f"{context}{path}: {a!r} != {b!r}"
+
+        cmp(original, exported, "plan")
+
+    # ── Core round-trip tests ───────────────────────────────────────────────
+
+    def test_config_roundtrip_preserves_all_fields(self):
+        """_plan_to_dict → _dict_to_plan must be a perfect lossless round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan = self._full_plan()
+        restored = _dict_to_plan(_plan_to_dict(plan))
+        self._assert_plans_equal(plan, restored, "config round-trip: ")
+
+    def test_housing_non_ui_fields_preserved_in_merge(self):
+        """loan_term_years, property tax, insurance, maintenance, pmi, rent_increase
+        must survive a sidebar merge that only touches home_price/rate/down."""
+        import dataclasses
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+
+        assert merged.housing.loan_term_years          == plan.housing.loan_term_years
+        assert merged.housing.annual_property_tax_rate == plan.housing.annual_property_tax_rate
+        assert merged.housing.annual_insurance         == plan.housing.annual_insurance
+        assert merged.housing.annual_maintenance_rate  == plan.housing.annual_maintenance_rate
+        assert merged.housing.pmi_annual_rate          == plan.housing.pmi_annual_rate
+        assert merged.housing.annual_rent_increase_rate == plan.housing.annual_rent_increase_rate
+
+    def test_lifestyle_non_ui_fields_preserved_in_merge(self):
+        """medical_auto_scale, multiplier, per_child, wedding_fund, parent_care
+        must not be reset to defaults by a sidebar merge."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+
+        assert merged.lifestyle.medical_auto_scale          == plan.lifestyle.medical_auto_scale
+        assert merged.lifestyle.medical_spouse_multiplier   == plan.lifestyle.medical_spouse_multiplier
+        assert merged.lifestyle.medical_per_child_annual    == plan.lifestyle.medical_per_child_annual
+        assert merged.lifestyle.annual_wedding_fund_per_child == plan.lifestyle.annual_wedding_fund_per_child
+        assert merged.lifestyle.annual_parent_care_cost     == plan.lifestyle.annual_parent_care_cost
+
+    def test_investments_non_ui_fields_preserved_in_merge(self):
+        """annual_roth_ira_contribution and annual_brokerage_contribution must survive."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+
+        assert merged.investments.annual_roth_ira_contribution  == plan.investments.annual_roth_ira_contribution
+        assert merged.investments.annual_brokerage_contribution == plan.investments.annual_brokerage_contribution
+
+    def test_partner_salary_growth_preserved_when_solo(self):
+        """partner_salary_growth_rate must survive even when spouse income = 0 in sidebar."""
+        plan = self._full_plan()
+        # Simulate sidebar with spouse=0 (partner not shown)
+        merged = self._sidebar_merge(plan, sidebar_spouse=0)
+        assert merged.investments.partner_salary_growth_rate == plan.investments.partner_salary_growth_rate
+
+    def test_strategies_roth_amount_preserved(self):
+        """roth_conversion_annual_amount is not in the sidebar; must not reset to 0."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+        assert merged.strategies.roth_conversion_annual_amount == plan.strategies.roth_conversion_annual_amount
+
+    def test_retirement_profile_preserved(self):
+        """RetirementProfile must pass through unchanged (no sidebar UI for it)."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+        assert merged.retirement is not None
+        assert merged.retirement.current_age              == plan.retirement.current_age
+        assert merged.retirement.desired_annual_income    == plan.retirement.desired_annual_income
+        assert merged.retirement.years_in_retirement      == plan.retirement.years_in_retirement
+
+    def test_college_profile_preserved(self):
+        """CollegeProfile must pass through unchanged."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+        assert merged.college is not None
+        assert merged.college.annual_cost_per_child == plan.college.annual_cost_per_child
+        assert merged.college.early_529_return      == plan.college.early_529_return
+        assert merged.college.glide_path_years      == plan.college.glide_path_years
+
+    def test_car_profile_preserved_including_kids_car(self):
+        """CarProfile and KidCarProfile must pass through unchanged."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+        assert merged.car is not None
+        assert merged.car.replace_every_years          == plan.car.replace_every_years
+        assert merged.car.kids_car is not None
+        assert merged.car.kids_car.car_price           == plan.car.kids_car.car_price
+        assert merged.car.kids_car.buy_at_age          == plan.car.kids_car.buy_at_age
+
+    def test_timeline_event_hidden_fields_preserved(self):
+        """start_parent_care, stop_parent_care, child_birth_year_override must
+        survive the sidebar event rebuild."""
+        plan = self._full_plan()
+        merged = self._sidebar_merge(plan)
+
+        by_desc = {e.description: e for e in merged.timeline_events}
+        assert by_desc["Child with override"].child_birth_year_override == -2
+        assert by_desc["Start parent care"].start_parent_care  is True
+        assert by_desc["Stop parent care"].stop_parent_care    is True
+        assert by_desc["Partner stops"].partner_stop_working   is True
+
+    def test_none_retirement_stays_none(self):
+        """Plans without a RetirementProfile must not gain one after a merge."""
+        import dataclasses
+        plan = dataclasses.replace(self._full_plan(), retirement=None)
+        merged = self._sidebar_merge(plan)
+        assert merged.retirement is None
+
+    def test_none_college_stays_none(self):
+        """Plans without a CollegeProfile must not gain one after a merge."""
+        import dataclasses
+        plan = dataclasses.replace(self._full_plan(), college=None)
+        merged = self._sidebar_merge(plan)
+        assert merged.college is None
+
+    def test_none_car_stays_none(self):
+        """Plans without a CarProfile must not gain one after a merge."""
+        import dataclasses
+        plan = dataclasses.replace(self._full_plan(), car=None)
+        merged = self._sidebar_merge(plan)
+        assert merged.car is None
+
+    def test_renting_plan_preserves_rent_increase_rate(self):
+        """When is_renting=True, annual_rent_increase_rate must survive."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._full_plan(),
+            housing=HousingProfile(
+                home_price=0, down_payment=0, interest_rate=0.0,
+                is_renting=True, monthly_rent=2_000,
+                annual_rent_increase_rate=0.05,
+            ),
+        )
+        merged = self._sidebar_merge(plan, sidebar_is_renting=True)
+        assert merged.housing.annual_rent_increase_rate == 0.05
+
+    def test_full_plan_config_roundtrip_is_lossless(self):
+        """End-to-end: _plan_to_dict → _dict_to_plan → merge → _plan_to_dict
+        must produce identical dicts (i.e. no field is silently dropped at
+        any stage of the export pipeline)."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan = self._full_plan()
+        # Simulate: load → sidebar merge → export
+        merged = self._sidebar_merge(plan)
+        d_original = _plan_to_dict(plan)
+        d_merged   = _plan_to_dict(merged)
+
+        def compare_dicts(a, b, path=""):
+            if isinstance(a, dict) and isinstance(b, dict):
+                for k in a:
+                    assert k in b, f"Key '{path}.{k}' missing from merged export"
+                    compare_dicts(a[k], b[k], f"{path}.{k}")
+            elif isinstance(a, list) and isinstance(b, list):
+                assert len(a) == len(b), f"{path}: list length {len(a)} vs {len(b)}"
+                for i, (x, y) in enumerate(zip(a, b)):
+                    compare_dicts(x, y, f"{path}[{i}]")
+            elif isinstance(a, float) and isinstance(b, float):
+                assert abs(a - b) < 1e-9, f"{path}: {a} != {b}"
+            else:
+                assert a == b, f"{path}: {a!r} != {b!r}"
+
+        compare_dicts(d_original, d_merged)

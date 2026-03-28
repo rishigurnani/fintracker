@@ -5,6 +5,7 @@ Run with:  streamlit run app.py
 """
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import streamlit as st
 import pandas as pd
@@ -217,8 +218,10 @@ def build_sidebar() -> FinancialPlan:
             "Monthly Rent ($)", min_value=0, max_value=20_000,
             value=int(d_hou.monthly_rent) if d_hou else 2_000, step=100,
         )
-        housing = HousingProfile(
-            home_price=0, down_payment=0, interest_rate=0.0,
+        _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
+        housing = dataclasses.replace(
+            _hou_base,
+            home_price=0.0, down_payment=0.0, interest_rate=0.0,
             is_renting=True, monthly_rent=float(monthly_rent),
         )
     else:
@@ -234,10 +237,13 @@ def build_sidebar() -> FinancialPlan:
             "Mortgage Rate (%)", 2.0, 12.0,
             float(d_hou.interest_rate * 100) if d_hou else 6.5, 0.125,
         )
-        housing = HousingProfile(
+        _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
+        housing = dataclasses.replace(
+            _hou_base,
             home_price=float(home_price),
             down_payment=float(down_pmt),
             interest_rate=rate / 100,
+            is_renting=False,
             annual_property_tax_rate=float(d_hou.annual_property_tax_rate) if d_hou else 0.012,
             annual_insurance=float(d_hou.annual_insurance) if d_hou else 2_000,
         )
@@ -280,7 +286,9 @@ def build_sidebar() -> FinancialPlan:
         "Other Monthly ($)", min_value=0, max_value=10_000,
         value=int(d_lif.monthly_other_recurring) if d_lif else 500, step=100,
     )
-    lifestyle = LifestyleProfile(
+    _lif_base = d_lif if d_lif else LifestyleProfile()
+    lifestyle = dataclasses.replace(
+        _lif_base,
         num_children=int(num_children),
         monthly_childcare=float(monthly_childcare),
         num_pets=int(num_pets),
@@ -353,11 +361,36 @@ def build_sidebar() -> FinancialPlan:
             help="ON: surplus swept into brokerage each year (earns market return). "
                  "OFF: surplus stays in cash (0% return).",
         ),
+        cash_buffer_months=st.sidebar.slider(
+            "Cash Buffer (months of expenses)",
+            min_value=0.0, max_value=24.0,
+            value=float(d_inv.cash_buffer_months) if d_inv else 0.0,
+            step=1.0,
+            help="Keep this many months of living expenses as liquid cash (0% return) "
+                 "before sweeping surplus to brokerage. Reduces liquidity risk in bad years. "
+                 "Set to 0 to invest all surplus (default).",
+        ),
+    )
+    # Preserve fields not exposed in sidebar (partner_salary_growth_rate when solo,
+    # annual_roth_ira_contribution, annual_brokerage_contribution)
+    _inv_base = d_inv if d_inv else InvestmentProfile()
+    investments = dataclasses.replace(
+        investments,
+        annual_roth_ira_contribution=_inv_base.annual_roth_ira_contribution,
+        annual_brokerage_contribution=_inv_base.annual_brokerage_contribution,
+        # partner_salary_growth_rate: sidebar only shows it when spouse > 0;
+        # preserve the loaded value when spouse income is 0 at sidebar time
+        partner_salary_growth_rate=(
+            investments.partner_salary_growth_rate
+            if spouse > 0 else _inv_base.partner_salary_growth_rate
+        ),
     )
 
     # ── Strategies ───────────────────────────────────────────
     st.sidebar.header("🎯 Tax Strategies")
-    strategies = StrategyToggles(
+    _str_base = d_str if d_str else StrategyToggles()
+    strategies = dataclasses.replace(
+        _str_base,
         maximize_hsa=st.sidebar.toggle("Maximize HSA", value=d_str.maximize_hsa if d_str else True),
         maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
         use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
@@ -475,6 +508,26 @@ def build_sidebar() -> FinancialPlan:
                 key=f"ev_presume_{i}",
             )
 
+            ev_start_care = st.checkbox(
+                "Start parent care",
+                value=ev_def.start_parent_care if ev_def else False,
+                key=f"ev_startcare_{i}",
+                help="Activates annual_parent_care_cost from Lifestyle settings.",
+            )
+            ev_stop_care = st.checkbox(
+                "Stop parent care",
+                value=ev_def.stop_parent_care if ev_def else False,
+                key=f"ev_stopcare_{i}",
+            )
+            ev_birth_yr_override = st.number_input(
+                "Child birth year override (0 = this year)",
+                min_value=-30, max_value=0,
+                value=int(ev_def.child_birth_year_override) if (ev_def and ev_def.child_birth_year_override is not None) else 0,
+                key=f"ev_birthyr_{i}",
+                help="Set negative to indicate a child already born before the projection. "
+                     "0 means born in this event's year (default).",
+            )
+
             ev_income = st.number_input(
                 "Your new gross income (0 = no change)",
                 min_value=0, max_value=5_000_000,
@@ -556,7 +609,9 @@ def build_sidebar() -> FinancialPlan:
                         help="Agent commissions, transfer tax — typically 5–7%",
                     ) / 100
 
-            events.append(TimelineEvent(
+            _ev_base = ev_def if ev_def else TimelineEvent(year=int(yr), description=desc)
+            events.append(dataclasses.replace(
+                _ev_base,
                 year=int(yr),
                 description=desc,
                 marriage=ev_marriage,
@@ -566,6 +621,9 @@ def build_sidebar() -> FinancialPlan:
                 resume_working=ev_resume,
                 partner_stop_working=ev_partner_stop,
                 partner_resume_working=ev_partner_resume,
+                start_parent_care=ev_start_care,
+                stop_parent_care=ev_stop_care,
+                child_birth_year_override=int(ev_birth_yr_override) if ev_birth_yr_override != 0 else None,
                 income_change=float(ev_income) if ev_income > 0 else None,
                 partner_income_change=float(ev_partner_income) if ev_partner_income > 0 else None,
                 extra_one_time_expense=float(ev_expense),
@@ -702,10 +760,10 @@ def render_dashboard(plan: FinancialPlan) -> None:
     st.markdown("")
 
     # ── Tabs ─────────────────────────────────────────────────
-    tabs = st.tabs(["💰 Cash Flow", "🏠 Mortgage", "🎯 Tax Strategies", "📈 Projections", "🎲 Monte Carlo"])
+    tabs = st.tabs(["📈 Projections", "🎲 Monte Carlo", "💰 Cash Flow", "🏠 Mortgage", "🎯 Tax Strategies"])
 
-    # ── TAB 1: Cash Flow ─────────────────────────────────────
-    with tabs[0]:
+    # ── TAB 3: Cash Flow ─────────────────────────────────────
+    with tabs[2]:
         st.markdown('<div class="section-header">Monthly Cash Flow Breakdown</div>', unsafe_allow_html=True)
 
         col_chart, col_detail = st.columns([1, 1])
@@ -776,8 +834,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
 - Total interest over life of loan: `{fmt_dollar(summary.total_interest_paid)}`
 """)
 
-    # ── TAB 2: Mortgage ──────────────────────────────────────
-    with tabs[1]:
+    # ── TAB 4: Mortgage ──────────────────────────────────────
+    with tabs[3]:
         if plan.housing.is_renting:
             st.info("🏠 You're currently renting. Configure a home purchase to see amortization details.")
         elif mortgage_calc:
@@ -851,8 +909,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 } for r in schedule])
                 st.dataframe(df_sched, hide_index=True, use_container_width=True, height=400)
 
-    # ── TAB 3: Tax Strategies ────────────────────────────────
-    with tabs[2]:
+    # ── TAB 5: Tax Strategies ────────────────────────────────
+    with tabs[4]:
         st.markdown('<div class="section-header">Tax Optimization Analysis</div>', unsafe_allow_html=True)
 
         sa1, sa2, sa3, sa4 = st.columns(4)
@@ -922,8 +980,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
         )
         st.plotly_chart(fig_wf, use_container_width=True)
 
-    # ── TAB 4: Projections ───────────────────────────────────
-    with tabs[3]:
+    # ── TAB 1: Projections ───────────────────────────────────
+    with tabs[0]:
         st.markdown('<div class="section-header">Long-Term Wealth Projection</div>', unsafe_allow_html=True)
 
         df = pd.DataFrame([{
@@ -1219,38 +1277,90 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 bal_df[col] = bal_df[col].apply(fmt_dollar)
             st.dataframe(bal_df, hide_index=True, use_container_width=True)
 
-    # ── TAB 5: Monte Carlo ───────────────────────────────────
-    with tabs[4]:
+    # ── TAB 2: Monte Carlo ───────────────────────────────────
+    with tabs[1]:
         st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
-        st.markdown("Randomizes market returns (±15% std), inflation (±1.5%), and salary growth (±2%) across 1,000 simulations to show the range of possible outcomes.")
+        st.markdown(
+            "Runs N simulations with randomized annual shocks. "
+            "**Historical mode** (recommended): market returns sampled from 100 years of S&P 500 "
+            "actuals (1926–2025) — preserving fat tails, crash years, and boom years as they "
+            "really happened. "
+            "Inflation and salary growth are always drawn from normal distributions. "
+            "Shows the full range of outcomes including liquidity risk."
+        )
 
-        with st.spinner("Running 1,000 simulations…"):
-            mc = projection_engine.run_monte_carlo(n_simulations=1_000, seed=42)
+        # ── Simulation parameters ────────────────────────────────
+        with st.expander("⚙️ Simulation Parameters", expanded=False):
+            use_hist = st.toggle(
+                "Use Historical S&P 500 Returns (1926–2025)",
+                value=True,
+                help="ON (recommended): each simulation year draws a return sampled at random "
+                     "from 100 years of actual S&P 500 history — capturing fat tails, -43% crashes, "
+                     "and +54% booms as they really occurred. "
+                     "OFF: draws from a normal distribution with the std dev below.",
+            )
+            mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
+            n_sims = mc_col1.number_input(
+                "Simulations", min_value=100, max_value=10_000,
+                value=1_000, step=100,
+                help="More simulations = smoother percentile bands but slower.",
+            )
+            mkt_std = mc_col2.slider(
+                "Market Return Std Dev (%)", 1.0, 30.0, 15.0, 1.0,
+                disabled=use_hist,
+                help="Only used when historical returns are OFF. "
+                     "Historical S&P 500 std dev is ~19.6%.",
+            ) / 100
+            inf_std = mc_col3.slider(
+                "Inflation Std Dev (%)", 0.0, 5.0, 1.5, 0.25,
+                help="Year-to-year variation in inflation rate.",
+            ) / 100
+            sg_std = mc_col4.slider(
+                "Salary Growth Std Dev (%)", 0.0, 10.0, 2.0, 0.5,
+                help="Year-to-year variation in salary growth.",
+            ) / 100
+            mc_seed = st.checkbox("Fix random seed (reproducible)", value=True)
 
-        mc1, mc2, mc3 = st.columns(3)
+        with st.spinner(f"Running {n_sims:,} simulations…"):
+            mc = projection_engine.run_monte_carlo(
+                n_simulations=int(n_sims),
+                seed=42 if mc_seed else None,
+                use_historical_returns=use_hist,
+                market_return_std=mkt_std,
+                inflation_std=inf_std,
+                salary_growth_std=sg_std,
+            )
+
+        # ── Summary KPIs ─────────────────────────────────────────
+        mc1, mc2, mc3, mc4 = st.columns(4)
         mc1.metric("Median Net Worth (Final Year)", fmt_dollar(mc.p50_net_worth[-1]))
-        mc2.metric("Best 10% (90th pct)", fmt_dollar(mc.p90_net_worth[-1]))
-        mc3.metric("Worst 10% (10th pct)", fmt_dollar(mc.p10_net_worth[-1]))
+        mc2.metric("Best 10% (p90)", fmt_dollar(mc.p90_net_worth[-1]))
+        mc3.metric("Worst 10% (p10)", fmt_dollar(mc.p10_net_worth[-1]))
+        worst_liq_prob = max(mc.prob_negative_liquid)
+        worst_liq_yr   = mc.years[mc.prob_negative_liquid.index(worst_liq_prob)]
+        mc4.metric(
+            "Peak Liquidity Risk",
+            f"{worst_liq_prob:.1%}",
+            delta=f"worst in year {worst_liq_yr}",
+            delta_color="inverse",
+        )
 
-        fig_mc = go.Figure()
-
-        # Confidence bands
+        # ── Net worth fan chart ───────────────────────────────────
         years_mc = mc.years
+        fig_mc = go.Figure()
         fig_mc.add_trace(go.Scatter(
             x=years_mc + years_mc[::-1],
             y=mc.p90_net_worth + mc.p10_net_worth[::-1],
             fill="toself", fillcolor="rgba(59,130,246,0.1)",
             line=dict(color="rgba(0,0,0,0)"),
-            name="10th–90th pct band",
-            hoverinfo="skip",
+            name="p10–p90 band", hoverinfo="skip",
         ))
         fig_mc.add_trace(go.Scatter(
             x=years_mc + years_mc[::-1],
             y=mc.p75_net_worth + mc.p25_net_worth[::-1],
             fill="toself", fillcolor="rgba(59,130,246,0.2)",
             line=dict(color="rgba(0,0,0,0)"),
-            name="25th–75th pct band",
-            hoverinfo="skip",
+            name="p25–p75 band", hoverinfo="skip",
         ))
         fig_mc.add_trace(go.Scatter(
             x=years_mc, y=mc.p50_net_worth,
@@ -1264,35 +1374,104 @@ def render_dashboard(plan: FinancialPlan) -> None:
             x=years_mc, y=mc.p10_net_worth,
             name="Pessimistic (p10)", line=dict(color="#f87171", width=1.5, dash="dot"),
         ))
-
-        # Deterministic overlay
         fig_mc.add_trace(go.Scatter(
             x=[s.year for s in snapshots], y=[s.net_worth for s in snapshots],
             name="Deterministic", line=dict(color="#f59e0b", width=2, dash="dash"),
         ))
-
+        mode_label = "Historical Returns" if use_hist else "Normal Distribution"
         fig_mc.update_layout(
-            title=f"Net Worth Distribution — 1,000 Simulations × {plan.projection_years} Years",
-            **PLOTLY_DARK, height=500, yaxis_title="Net Worth ($)",
-            xaxis_title="Year",
+            title=f"Net Worth Distribution — {n_sims:,} Simulations ({mode_label})",
+            **PLOTLY_DARK, height=460, yaxis_title="Net Worth ($)", xaxis_title="Year",
         )
         st.plotly_chart(fig_mc, use_container_width=True)
 
-        col_prob1, col_prob2 = st.columns(2)
-        with col_prob1:
-            st.metric(
-                "Probability of $1M+ (Year 10)",
-                f"{mc.prob_millionaire_10yr:.1%}",
-            )
-        with col_prob2:
-            st.metric(
-                "Simulations Run",
-                f"{mc.num_simulations:,}",
-            )
+        # ── Liquidity risk ────────────────────────────────────────
+        st.markdown("#### Liquidity Risk — Probability of Negative Liquid Assets by Year")
+        st.caption(
+            "Each bar shows the fraction of simulations where your brokerage balance "
+            "went negative in that year — meaning you ran out of accessible cash "
+            "and would need to liquidate retirement accounts or take on debt."
+        )
 
-        # Histogram of final year outcomes
-        st.markdown("#### Distribution of Final-Year Net Worth")
-        # We can't easily store all sim results from MonteCarloResult, so show percentile bar
+        # Colour bars by severity
+        liq_colors = [
+            "#ef4444" if p > 0.20
+            else "#f97316" if p > 0.10
+            else "#fbbf24" if p > 0.05
+            else "#4ade80"
+            for p in mc.prob_negative_liquid
+        ]
+        fig_liq = go.Figure(go.Bar(
+            x=years_mc,
+            y=[p * 100 for p in mc.prob_negative_liquid],
+            marker_color=liq_colors,
+            hovertemplate="Year %{x}: %{y:.1f}% of simulations went negative<extra></extra>",
+        ))
+        # Zero-risk reference line
+        fig_liq.add_hline(y=0, line=dict(color="#374151", width=1))
+        fig_liq.update_layout(
+            **PLOTLY_DARK, height=280,
+            yaxis_title="% of simulations",
+            xaxis_title="Year",
+            yaxis_ticksuffix="%",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_liq, use_container_width=True)
+
+        # Warn if any year has >10% liquidity risk
+        high_risk_years = [(yr, p) for yr, p in zip(mc.years, mc.prob_negative_liquid) if p > 0.10]
+        if high_risk_years:
+            yr_list = ", ".join(f"Year {yr} ({p:.0%})" for yr, p in high_risk_years[:5])
+            st.error(
+                f"⚠️ **Significant liquidity risk detected.** In more than 10% of simulations, "
+                f"liquid assets go negative in: {yr_list}. "
+                f"Consider building a larger cash buffer or reducing fixed expenses."
+            )
+        elif any(p > 0 for p in mc.prob_negative_liquid):
+            st.warning(
+                "⚠️ **Low but non-zero liquidity risk.** Some simulations produce negative "
+                "liquid assets in at least one year. Your plan is resilient but not bulletproof."
+            )
+        else:
+            st.success("✅ **No liquidity risk.** Liquid assets stayed positive in all simulations.")
+
+        # ── Liquid assets fan chart ───────────────────────────────
+        st.markdown("#### Liquid Assets (Brokerage) Distribution")
+        fig_liq_fan = go.Figure()
+        fig_liq_fan.add_trace(go.Scatter(
+            x=years_mc + years_mc[::-1],
+            y=mc.p90_liquid + mc.p10_liquid[::-1],
+            fill="toself", fillcolor="rgba(245,158,11,0.12)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="p10–p90 band", hoverinfo="skip",
+        ))
+        fig_liq_fan.add_trace(go.Scatter(
+            x=years_mc, y=mc.p50_liquid,
+            name="Median liquid", line=dict(color="#f59e0b", width=2),
+        ))
+        fig_liq_fan.add_trace(go.Scatter(
+            x=years_mc, y=mc.p10_liquid,
+            name="Pessimistic (p10)", line=dict(color="#f87171", width=1.5, dash="dot"),
+        ))
+        fig_liq_fan.add_trace(go.Scatter(
+            x=years_mc, y=[s.brokerage_balance for s in snapshots],
+            name="Deterministic", line=dict(color="#4ade80", width=1.5, dash="dash"),
+        ))
+        # Zero line — going below this means illiquid
+        fig_liq_fan.add_hline(
+            y=0, line=dict(color="#ef4444", width=1.5, dash="dot"),
+            annotation_text="Illiquid threshold", annotation_position="right",
+            annotation_font=dict(color="#ef4444", size=9),
+        )
+        fig_liq_fan.update_layout(
+            **PLOTLY_DARK, height=320,
+            yaxis_title="Brokerage Balance ($)", xaxis_title="Year",
+            yaxis_tickformat="$,.0f",
+        )
+        st.plotly_chart(fig_liq_fan, use_container_width=True)
+
+        # ── Final-year percentile bar ─────────────────────────────
+        st.markdown("#### Net Worth Percentiles at Final Year")
         pct_labels = ["p10", "p25", "p50", "p75", "p90"]
         pct_values = [
             mc.p10_net_worth[-1], mc.p25_net_worth[-1],
@@ -1307,10 +1486,13 @@ def render_dashboard(plan: FinancialPlan) -> None:
         ))
         fig_hist.update_layout(
             title=f"Net Worth Percentiles at Year {plan.projection_years}",
-            **PLOTLY_DARK, height=320, yaxis_title="$",
-            showlegend=False,
+            **PLOTLY_DARK, height=300, yaxis_title="$", showlegend=False,
         )
         st.plotly_chart(fig_hist, use_container_width=True)
+
+        col_prob1, col_prob2 = st.columns(2)
+        col_prob1.metric("Probability of $1M+ (Year 10)", f"{mc.prob_millionaire_10yr:.1%}")
+        col_prob2.metric("Simulations Run", f"{mc.num_simulations:,}")
 
 
 # ─────────────────────────────────────────────────────────────

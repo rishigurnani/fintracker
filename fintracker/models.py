@@ -170,6 +170,13 @@ class InvestmentProfile:
     # decision, not a tax-optimisation strategy.
     auto_invest_surplus: bool = True
 
+    # Cash buffer: target number of months of total expenses to keep as
+    # liquid cash (0% return) before sweeping surplus to brokerage.
+    # e.g. cash_buffer_months=3 → always keep 3 months of expenses accessible.
+    # This is separate from uninvested_cash (the auto_invest_surplus toggle):
+    # the buffer is intentional and maintained even when auto_invest_surplus=True.
+    cash_buffer_months: float = 0.0
+
     @property
     def investable_cash(self) -> float:
         return max(0.0, self.current_liquid_cash - self.one_time_upcoming_expenses)
@@ -240,17 +247,46 @@ class CollegeProfile:
 
 
 @dataclass
+@dataclass
+class KidCarProfile:
+    """
+    Configuration for a first car given to each child.
+
+    buy_at_age controls when each child receives a car:
+      - 16  → at driving age (handed down from household or bought new)
+      - 22  → at college graduation (start_age + years_per_child)
+      - None → defaults to college graduation age if a CollegeProfile is
+                configured, otherwise age 16
+
+    All dollar amounts are today's dollars; the engine inflates them.
+    Financed with a down payment from brokerage and an amortising loan.
+    """
+    car_price: float = 15_000
+    down_payment_pct: float = 0.20
+    loan_rate: float = 0.07
+    loan_term_years: int = 5
+    buy_at_age: Optional[int] = None  # None = graduation age if college configured, else 16
+
+
+@dataclass
 class CarProfile:
     """
-    Car-purchase and financing parameters.
+    Car-purchase and financing parameters for household cars.
 
     Cars are purchased every `replace_every_years` years.  Each purchase is
     financed with a down payment (from brokerage) plus an amortising loan whose
     annual P&I reduces breathing room.  When a new car is bought, the old one is
     handed down to any child who has reached `hand_down_age`, or sold for
     `residual_value`.  All dollar amounts are today's dollars; the engine inflates
-    them.  For a two-car household, set `num_cars=2`; the engine staggers
-    purchases by one year to smooth cash-flow spikes.
+    them.
+
+    `first_purchase_years`: list of projection years in which each car is first
+    bought.  e.g. [3, 5] for a two-car household buying in yr 3 and yr 5.
+    Before the first purchase year the car does not exist; no loan, no payment.
+    If None, falls back to the legacy stagger (yr 1, yr 0, ...).
+
+    `kids_car`: optional sub-profile for a first car given to each child.
+    Set buy_at_age=16 for driving age, 22 (or None) for college graduation.
     """
     car_price: float = 25_000
     down_payment: float = 5_000
@@ -260,6 +296,11 @@ class CarProfile:
     residual_value: float = 5_000
     hand_down_age: int = 16
     num_cars: int = 1
+    kids_car: Optional[KidCarProfile] = None
+    # First purchase years for each car, in projection-year terms.
+    # e.g. [3, 5] means Car 1 bought in yr 3, Car 2 in yr 5.
+    # Length must equal num_cars.  None = use legacy stagger (yr 1, yr 0, ...).
+    first_purchase_years: Optional[list[int]] = None
 
 
 # ---------------------------------------------------------------------------

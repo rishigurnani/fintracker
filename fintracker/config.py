@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from fintracker.models import (
-    CarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
+    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
@@ -119,6 +119,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         partner_salary_growth_rate=float(inv_d.get("partner_salary_growth_rate", 0.04)),
         annual_home_appreciation_rate=float(inv_d.get("annual_home_appreciation_rate", 0.035)),
         auto_invest_surplus=bool(auto_invest),
+        cash_buffer_months=float(inv_d.get("cash_buffer_months", 0.0)),
     )
 
     strategies = StrategyToggles(
@@ -202,6 +203,15 @@ def _dict_to_college(c: dict) -> CollegeProfile:
 
 
 def _dict_to_car(c: dict) -> CarProfile:
+    kc_d = c.get("kids_car")
+    kids_car = KidCarProfile(
+        car_price=float(kc_d.get("car_price", 15_000)),
+        down_payment_pct=float(kc_d.get("down_payment_pct", 0.20)),
+        loan_rate=float(kc_d.get("loan_rate", 0.07)),
+        loan_term_years=int(kc_d.get("loan_term_years", 5)),
+        buy_at_age=kc_d.get("buy_at_age"),  # None = graduation age
+    ) if kc_d else None
+    fpy = c.get("first_purchase_years")
     return CarProfile(
         car_price=float(c.get("car_price", 25_000)),
         down_payment=float(c.get("down_payment", 5_000)),
@@ -211,6 +221,8 @@ def _dict_to_car(c: dict) -> CarProfile:
         residual_value=float(c.get("residual_value", 5_000)),
         hand_down_age=int(c.get("hand_down_age", 16)),
         num_cars=int(c.get("num_cars", 1)),
+        kids_car=kids_car,
+        first_purchase_years=[int(y) for y in fpy] if fpy else None,
     )
 
 
@@ -272,6 +284,7 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "partner_salary_growth_rate": plan.investments.partner_salary_growth_rate,
             "annual_home_appreciation_rate": plan.investments.annual_home_appreciation_rate,
             "auto_invest_surplus": plan.investments.auto_invest_surplus,
+            "cash_buffer_months": plan.investments.cash_buffer_months,
         },
         "strategies": {
             "maximize_hsa": plan.strategies.maximize_hsa,
@@ -305,7 +318,7 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
         }
 
     if plan.car:
-        d["car"] = {
+        car_d: dict = {
             "car_price": plan.car.car_price,
             "down_payment": plan.car.down_payment,
             "loan_rate": plan.car.loan_rate,
@@ -314,7 +327,18 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "residual_value": plan.car.residual_value,
             "hand_down_age": plan.car.hand_down_age,
             "num_cars": plan.car.num_cars,
+            "first_purchase_years": plan.car.first_purchase_years,
         }
+        if plan.car.kids_car:
+            kc = plan.car.kids_car
+            car_d["kids_car"] = {
+                "car_price": kc.car_price,
+                "down_payment_pct": kc.down_payment_pct,
+                "loan_rate": kc.loan_rate,
+                "loan_term_years": kc.loan_term_years,
+                "buy_at_age": kc.buy_at_age,
+            }
+        d["car"] = car_d
 
     return d
 

@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from fintracker.models import (
-    CarProfile, CollegeProfile, FilingStatus, FinancialPlan,
+    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles,
 )
@@ -50,6 +50,30 @@ _AOTC_PHASEOUT_SINGLE_LOW  = 80_000
 _AOTC_PHASEOUT_SINGLE_HIGH = 90_000
 _AOTC_PHASEOUT_MFJ_LOW     = 160_000
 _AOTC_PHASEOUT_MFJ_HIGH    = 180_000
+
+
+# ---------------------------------------------------------------------------
+# Historical S&P 500 annual total returns (1926–2025)
+# Source: provided by user; used for bootstrap sampling in Monte Carlo.
+# Bootstrap preserves the true empirical distribution — fat tails, skew,
+# and crash years — rather than assuming normality.
+# ---------------------------------------------------------------------------
+_SP500_HISTORICAL_RETURNS: tuple[float, ...] = (
+    # (year, return) — only returns stored, sorted newest-first for readability
+    0.1788, 0.2502, 0.2629, -0.1811, 0.2871, 0.1840, 0.3149, -0.0438,
+    0.2183, 0.1196, 0.0138, 0.1369, 0.3239, 0.1600, 0.0211, 0.1506,
+    0.2646, -0.3700, 0.0549, 0.1579, 0.0491, 0.1088, 0.2868, -0.2210,
+    -0.1189, -0.0910, 0.2104, 0.2858, 0.3336, 0.2296, 0.3758, 0.0132,
+    0.1008, 0.0762, 0.3047, -0.0310, 0.3169, 0.1661, 0.0525, 0.1867,
+    0.3173, 0.0627, 0.2256, 0.2155, -0.0491, 0.3242, 0.1844, 0.0656,
+    -0.0718, 0.2384, 0.3720, -0.2647, -0.1466, 0.1898, 0.1431, 0.0401,
+    -0.0850, 0.1106, 0.2398, -0.1006, 0.1245, 0.1648, 0.2280, -0.0873,
+    0.2689, 0.0047, 0.1196, 0.4336, -0.1078, 0.0656, 0.3156, 0.5262,
+    -0.0099, 0.1837, 0.2402, 0.3171, 0.1879, 0.0550, 0.0571, -0.0807,
+    0.3644, 0.1975, 0.2590, 0.2034, -0.1159, -0.0978, -0.0041, 0.3112,
+    -0.3503, 0.3392, 0.4767, -0.0144, 0.5399, -0.0819, -0.4334, -0.2490,
+    -0.0842, 0.4361, 0.3749, 0.1162,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +119,15 @@ class EngineState:
     hsa_balance: float
     college_529_balance: float
     uninvested_cash: float
+    cash_buffer: float
 
     # Flags
     parent_care_active: bool
 
     # Car loan state — one dict per car
     cars: list[dict]
+    # Kid car loans — one entry per child who has received a car
+    kid_car_loans: list[dict]
 
     @property
     def gross_income(self) -> float:
@@ -164,13 +191,15 @@ class YearlySnapshot:
     # Car one-off costs (for display / debugging)
     car_purchase_cost: float = 0.0
     car_sale_proceeds: float = 0.0
+    # Intentional cash buffer (earns 0%; maintained before sweeping to brokerage)
+    cash_buffer: float = 0.0
 
     @property
     def total_assets(self) -> float:
         return (
             self.retirement_balance + self.brokerage_balance
             + self.college_529_balance + self.home_equity
-            + self.hsa_balance + self.uninvested_cash
+            + self.hsa_balance + self.uninvested_cash + self.cash_buffer
         )
 
     @property
@@ -196,20 +225,48 @@ class RetirementReadiness:
 class MonteCarloResult:
     """Result of N Monte Carlo simulation runs."""
     years: list[int]
+
+    # Net worth percentile bands
     p10_net_worth: list[float]
     p25_net_worth: list[float]
     p50_net_worth: list[float]
     p75_net_worth: list[float]
     p90_net_worth: list[float]
     mean_net_worth: list[float]
-    prob_retire_at_65: float = 0.0
+
+    # Liquidity risk: per-year probability that liquid assets (brokerage) go
+    # negative in that simulation year.  Values in [0, 1].
+    prob_negative_liquid: list[float]
+
+    # Brokerage balance percentiles (same pool as liquid assets chart)
+    p10_liquid: list[float]
+    p50_liquid: list[float]
+    p90_liquid: list[float]
+
+    # Summary statistics
     prob_millionaire_10yr: float = 0.0
     num_simulations: int = 1_000
+
+    # Simulation parameters (stored for display)
+    use_historical_returns: bool = True
+    market_return_std: float = 0.15
+    inflation_std: float = 0.015
+    salary_growth_std: float = 0.02
 
 
 # ---------------------------------------------------------------------------
 # Main engine
 # ---------------------------------------------------------------------------
+
+def _legacy_car_down(car) -> float:
+    """Sum of down payments for legacy-mode cars (no first_purchase_years)."""
+    if not car:
+        return 0.0
+    if car.first_purchase_years:
+        # All cars have explicit purchase years — no upfront deduction
+        return 0.0
+    return car.down_payment * car.num_cars
+
 
 class ProjectionEngine:
     """
@@ -245,18 +302,52 @@ class ProjectionEngine:
         self,
         n_simulations: int = 1_000,
         seed: Optional[int] = None,
+        market_return_std: float = 0.15,
+        inflation_std: float = 0.015,
+        salary_growth_std: float = 0.02,
+        use_historical_returns: bool = True,
     ) -> MonteCarloResult:
+        """
+        Run N Monte Carlo simulations with randomized economic parameters.
+
+        Parameters
+        ----------
+        n_simulations         : number of simulation runs
+        seed                  : RNG seed for reproducibility (None = random)
+        use_historical_returns: if True (default), sample market returns by
+                                bootstrap from the historical S&P 500 dataset
+                                (1926–2025).  This preserves the true empirical
+                                distribution — fat tails, skewness, -43% crashes,
+                                +54% booms — rather than assuming normality.
+                                If False, draws from N(mean, market_return_std).
+        market_return_std     : std dev used only when use_historical_returns=False
+        inflation_std         : std dev of annual inflation (always normal)
+        salary_growth_std     : std dev of annual salary growth (always normal)
+
+        In both modes, inflation and salary growth remain normally distributed
+        since those datasets are smaller and more symmetric.
+        """
         rng = np.random.default_rng(seed)
         inv = self._plan.investments
         years = list(range(1, self._plan.projection_years + 1))
-        all_nw: list[list[float]] = []
+        all_nw:  list[list[float]] = []
+        all_liq: list[list[float]] = []   # brokerage balance per sim per year
+
+        hist = np.array(_SP500_HISTORICAL_RETURNS)
 
         for _ in range(n_simulations):
-            mkt   = rng.normal(inv.annual_market_return, 0.15, len(years))
-            inf   = np.clip(rng.normal(inv.annual_inflation_rate, 0.015, len(years)), 0, 0.15)
-            sg    = np.clip(rng.normal(inv.annual_salary_growth_rate, 0.02, len(years)), -0.10, 0.20)
+            if use_historical_returns:
+                # Bootstrap: sample with replacement from the historical dataset.
+                # Each draw is an independent annual return — no autocorrelation
+                # assumed (consistent with weak-form market efficiency).
+                mkt = rng.choice(hist, size=len(years), replace=True)
+            else:
+                mkt = rng.normal(inv.annual_market_return, market_return_std, len(years))
+            inf = np.clip(rng.normal(inv.annual_inflation_rate, inflation_std, len(years)), 0, 0.15)
+            sg  = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std, len(years)), -0.10, 0.20)
             state = self._initial_state()
-            sim: list[float] = []
+            sim_nw:  list[float] = []
+            sim_liq: list[float] = []
             for i, year in enumerate(years):
                 self._apply_timeline_events(state, year)
                 snap = self._compute_year(
@@ -265,29 +356,50 @@ class ProjectionEngine:
                     inflation_override=float(inf[i]),
                     salary_growth_override=float(sg[i]),
                 )
-                sim.append(snap.net_worth)
+                sim_nw.append(snap.net_worth)
+                # Liquid position = brokerage + cash_buffer: both are accessible.
+                # Measuring brokerage alone understates liquidity when a buffer exists.
+                sim_liq.append(snap.brokerage_balance + snap.cash_buffer)
                 self._advance_state(state, snap,
                                     market_return=float(mkt[i]),
                                     inflation=float(inf[i]),
                                     salary_growth=float(sg[i]))
-            all_nw.append(sim)
+            all_nw.append(sim_nw)
+            all_liq.append(sim_liq)
 
-        by_year = list(zip(*all_nw))
+        by_year_nw  = list(zip(*all_nw))
+        by_year_liq = list(zip(*all_liq))
+
         def pct(arr, p): return float(np.percentile(arr, p))
-        yr10 = list(by_year[9]) if len(by_year) >= 10 else []
+
+        yr10 = list(by_year_nw[9]) if len(by_year_nw) >= 10 else []
+
+        # Probability of negative liquid assets in each year
+        prob_neg = [
+            sum(1 for v in yr if v < 0) / n_simulations
+            for yr in by_year_liq
+        ]
 
         return MonteCarloResult(
             years=years,
-            p10_net_worth=[pct(yr, 10) for yr in by_year],
-            p25_net_worth=[pct(yr, 25) for yr in by_year],
-            p50_net_worth=[pct(yr, 50) for yr in by_year],
-            p75_net_worth=[pct(yr, 75) for yr in by_year],
-            p90_net_worth=[pct(yr, 90) for yr in by_year],
-            mean_net_worth=[float(np.mean(yr)) for yr in by_year],
+            p10_net_worth=[pct(yr, 10) for yr in by_year_nw],
+            p25_net_worth=[pct(yr, 25) for yr in by_year_nw],
+            p50_net_worth=[pct(yr, 50) for yr in by_year_nw],
+            p75_net_worth=[pct(yr, 75) for yr in by_year_nw],
+            p90_net_worth=[pct(yr, 90) for yr in by_year_nw],
+            mean_net_worth=[float(np.mean(yr)) for yr in by_year_nw],
+            prob_negative_liquid=prob_neg,
+            p10_liquid=[pct(yr, 10) for yr in by_year_liq],
+            p50_liquid=[pct(yr, 50) for yr in by_year_liq],
+            p90_liquid=[pct(yr, 90) for yr in by_year_liq],
             prob_millionaire_10yr=(
                 sum(1 for nw in yr10 if nw >= 1_000_000) / n_simulations if yr10 else 0.0
             ),
             num_simulations=n_simulations,
+            use_historical_returns=use_historical_returns,
+            market_return_std=market_return_std,
+            inflation_std=inflation_std,
+            salary_growth_std=salary_growth_std,
         )
 
     def compute_retirement_readiness(
@@ -388,7 +500,10 @@ class ProjectionEngine:
             inv.current_liquid_cash
             - inv.one_time_upcoming_expenses
             - (p.housing.down_payment if not p.housing.is_renting else 0.0)
-            - (p.car.down_payment * p.car.num_cars if p.car else 0.0)
+            # Only deduct down payments for legacy cars (pre-purchased at projection start).
+            # Cars with first_purchase_years will have their down payment deducted
+            # in the year they are first bought via _cars().
+            - (_legacy_car_down(p.car))
             + inv.current_brokerage_balance
         )
 
@@ -416,8 +531,10 @@ class ProjectionEngine:
             hsa_balance=0.0,
             college_529_balance=0.0,
             uninvested_cash=0.0,
+            cash_buffer=0.0,
             parent_care_active=p.lifestyle.annual_parent_care_cost > 0,
             cars=self._init_cars(p.car),
+            kid_car_loans=[],
         )
 
     @staticmethod
@@ -426,19 +543,41 @@ class ProjectionEngine:
 
     @staticmethod
     def _init_cars(car: Optional[CarProfile]) -> list[dict]:
-        """Initialise one state-dict per car, staggered by one year each."""
+        """
+        Initialise one state-dict per car.
+
+        If first_purchase_years is configured, each car starts with no loan and
+        no payments until its specified purchase year, at which point _cars()
+        will buy it and start the loan.  Before that year the entry is inert.
+
+        Legacy fallback: if first_purchase_years is None, uses the old stagger
+        (car 0 bought at yr 1, car 1 at yr 0) so existing configs are unchanged.
+        """
         if car is None:
             return []
         cars = []
         for i in range(car.num_cars):
-            principal  = max(0.0, car.car_price - car.down_payment)
-            monthly_pi = ProjectionEngine._car_monthly_pi(principal, car.loan_rate, car.loan_term_years)
-            cars.append({
-                "loan_balance":   principal,
-                "loan_year":      1,
-                "purchase_year":  1 - i,  # car 0 → yr 1, car 1 → yr 2, etc.
-                "monthly_payment": monthly_pi,
-            })
+            if car.first_purchase_years and i < len(car.first_purchase_years):
+                # Explicit first purchase year — car hasn't been bought yet
+                cars.append({
+                    "loan_balance":    0.0,
+                    "loan_year":       0,
+                    "purchase_year":   None,          # None = not yet purchased
+                    "first_buy_year":  car.first_purchase_years[i],
+                    "monthly_payment": 0.0,
+                })
+            else:
+                # Legacy: treat as already purchased and financed at projection start
+                principal  = max(0.0, car.car_price - car.down_payment)
+                monthly_pi = ProjectionEngine._car_monthly_pi(
+                    principal, car.loan_rate, car.loan_term_years)
+                cars.append({
+                    "loan_balance":    principal,
+                    "loan_year":       1,
+                    "purchase_year":   1 - i,
+                    "first_buy_year":  None,
+                    "monthly_payment": monthly_pi,
+                })
         return cars
 
     # ------------------------------------------------------------------ #
@@ -572,12 +711,13 @@ class ProjectionEngine:
         )
 
         # --- Asset growth ---
-        ret_bal, hsa_bal, col529_bal, brok_bal, uninvested = self._asset_growth(
+        ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer = self._asset_growth(
             state, year, mkt, hsa, k401, partner_k401,
             annual_529_save, drawdown_529, brokerage_earmark, breathing_room,
+            annual_expenses=lifestyle_cost + housing_cost,
         )
 
-        nw = ret_bal + hsa_bal + col529_bal + brok_bal + home_equity + uninvested
+        nw = ret_bal + hsa_bal + col529_bal + brok_bal + home_equity + uninvested + new_buffer
 
         return YearlySnapshot(
             year=year,
@@ -604,6 +744,7 @@ class ProjectionEngine:
             home_equity=home_equity,
             hsa_balance=hsa_bal,
             uninvested_cash=uninvested,
+            cash_buffer=new_buffer,
             mortgage_balance=eoy_mortgage,
             net_worth=nw,
             filing_status=state.filing_status,
@@ -805,9 +946,26 @@ class ProjectionEngine:
         total_pmt, total_purchase, total_sale = 0.0, 0.0, 0.0
 
         for c in state.cars:
-            years_owned = year - c["purchase_year"]
+            # --- First purchase (explicit first_buy_year mode) ---
+            if c["purchase_year"] is None:
+                # Car hasn't been bought yet; wait for its first_buy_year
+                if c.get("first_buy_year") == year:
+                    nominal_price = car.car_price * inf_f
+                    nominal_down  = car.down_payment * inf_f
+                    state.brokerage_balance -= nominal_down
+                    total_purchase += nominal_down
+                    principal = max(0.0, nominal_price - nominal_down)
+                    monthly   = self._car_monthly_pi(principal, car.loan_rate, car.loan_term_years)
+                    c["loan_balance"]    = principal
+                    c["loan_year"]       = 1
+                    c["purchase_year"]   = year
+                    c["monthly_payment"] = monthly
+                # Nothing to do before first_buy_year — skip to next car
+                if c["purchase_year"] is None:
+                    continue
 
-            # Replacement cycle
+            # --- Replacement cycle ---
+            years_owned = year - c["purchase_year"]
             if years_owned > 0 and years_owned % car.replace_every_years == 0:
                 proceeds = self._car_old_proceeds(state, car, year)
                 state.brokerage_balance += proceeds
@@ -825,7 +983,7 @@ class ProjectionEngine:
                 c["purchase_year"]   = year
                 c["monthly_payment"] = monthly
 
-            # Annual loan payment
+            # --- Annual loan payment ---
             if c["loan_balance"] > 0 and c["loan_year"] <= car.loan_term_years:
                 annual_pmt = c["monthly_payment"] * 12
                 annual_pmt = min(annual_pmt, c["loan_balance"] * (1 + car.loan_rate / 12) * 12)
@@ -841,6 +999,55 @@ class ProjectionEngine:
                 )
                 c["loan_balance"] = max(0.0, remaining)
                 c["loan_year"]   += 1
+
+        # --- Kids' first cars ---
+        if car and car.kids_car:
+            col = self._plan.college  # may be None; buy_at_age defaulting handles it
+            kc  = car.kids_car
+            # buy_at_age default: graduation age if college configured, else 16
+            if kc.buy_at_age is not None:
+                buy_age = kc.buy_at_age
+            elif col is not None:
+                buy_age = col.start_age + col.years_per_child  # graduation age
+            else:
+                buy_age = 16
+
+            for child_idx, birth_year in enumerate(state.child_birth_years):
+                child_age = year - birth_year
+                # Buy car in exactly the graduation year
+                if child_age == buy_age:
+                    # Check not already bought for this child
+                    already = any(l["child_idx"] == child_idx for l in state.kid_car_loans)
+                    if not already:
+                        nominal_price = kc.car_price * inf_f
+                        down          = nominal_price * kc.down_payment_pct
+                        principal     = nominal_price - down
+                        monthly_pmt   = self._car_monthly_pi(principal, kc.loan_rate, kc.loan_term_years)
+                        state.brokerage_balance -= down
+                        total_purchase += down
+                        state.kid_car_loans.append({
+                            "child_idx":     child_idx,
+                            "loan_balance":  principal,
+                            "loan_year":     1,
+                            "monthly_payment": monthly_pmt,
+                        })
+
+            # Annual payments on active kid car loans
+            for loan in state.kid_car_loans:
+                if loan["loan_balance"] > 0 and loan["loan_year"] <= kc.loan_term_years:
+                    annual_pmt = loan["monthly_payment"] * 12
+                    annual_pmt = min(annual_pmt, loan["loan_balance"] * (1 + kc.loan_rate / 12) * 12)
+                    total_pmt += annual_pmt
+                    r = kc.loan_rate / 12
+                    n_paid  = (loan["loan_year"] - 1) * 12
+                    n_total = kc.loan_term_years * 12
+                    remaining = (
+                        loan["monthly_payment"] * (1 - (1 + r) ** -(n_total - n_paid)) / r
+                        if r > 0
+                        else loan["loan_balance"] - loan["monthly_payment"] * 12
+                    )
+                    loan["loan_balance"] = max(0.0, remaining)
+                    loan["loan_year"] += 1
 
         return total_pmt, total_purchase, total_sale
 
@@ -866,9 +1073,11 @@ class ProjectionEngine:
         drawdown_529: float,
         brokerage_earmark: float,
         breathing_room: float,
-    ) -> tuple[float, float, float, float, float]:
-        """Returns (retirement, hsa, col529, brokerage, uninvested_cash)."""
+        annual_expenses: float = 0.0,
+    ) -> tuple[float, float, float, float, float, float]:
+        """Returns (retirement, hsa, col529, brokerage, uninvested_cash, cash_buffer)."""
         col = self._plan.college
+        inv = self._plan.investments
 
         ret_bal  = state.retirement_balance * (1 + mkt) + k401 + partner_k401
         hsa_bal  = state.hsa_balance        * (1 + mkt) + hsa
@@ -880,22 +1089,39 @@ class ProjectionEngine:
             state.college_529_balance * (1 + r529_growth) + annual_529_save - drawdown_529
         )
 
-        inv = self._plan.investments
+        # --- Cash buffer ---
+        # Target floor = N months of annual expenses held as liquid cash (0% return).
+        # Buffer is topped up from breathing room BEFORE surplus is swept to brokerage.
+        # Deficits drain the buffer first, then brokerage (or uninvested_cash).
+        buffer_floor = annual_expenses * inv.cash_buffer_months / 12
+        current_buf  = state.cash_buffer
+
+        if breathing_room >= 0:
+            topup      = min(breathing_room, max(0.0, buffer_floor - current_buf))
+            new_buffer = current_buf + topup
+            investable = breathing_room - topup   # what remains after topping buffer
+        else:
+            deficit    = -breathing_room          # positive amount
+            buf_drawn  = min(current_buf, deficit)
+            new_buffer = current_buf - buf_drawn
+            investable = -(deficit - buf_drawn)   # remaining deficit (negative) or 0
+
+        # --- Brokerage / uninvested ---
         if inv.auto_invest_surplus:
-            brok_bal    = state.brokerage_balance * (1 + mkt) + brokerage_earmark + breathing_room
-            uninvested  = 0.0
+            brok_bal   = state.brokerage_balance * (1 + mkt) + brokerage_earmark + investable
+            uninvested = 0.0
         else:
             brok_bal = state.brokerage_balance * (1 + mkt) + brokerage_earmark
-            if breathing_room >= 0:
-                uninvested = state.uninvested_cash + breathing_room
+            if investable >= 0:
+                uninvested = state.uninvested_cash + investable
             else:
-                deficit    = breathing_room  # negative
+                deficit2   = -investable
                 avail      = state.uninvested_cash
-                drawn      = min(avail, -deficit)
+                drawn      = min(avail, deficit2)
                 uninvested = avail - drawn
-                brok_bal  += deficit + drawn  # remaining deficit hits brokerage
+                brok_bal  += -(deficit2 - drawn)
 
-        return ret_bal, hsa_bal, col529_bal, brok_bal, uninvested
+        return ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer
 
     # ------------------------------------------------------------------ #
     # State advancement                                                    #
@@ -923,6 +1149,7 @@ class ProjectionEngine:
         state.hsa_balance         = snap.hsa_balance
         state.college_529_balance = snap.college_529_balance
         state.uninvested_cash     = snap.uninvested_cash
+        state.cash_buffer         = snap.cash_buffer
 
         if not state.is_renting:
             state.home_value = snap.home_value * (1 + p.investments.annual_home_appreciation_rate)
