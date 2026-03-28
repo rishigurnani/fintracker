@@ -247,6 +247,46 @@ class CollegeProfile:
 
 
 @dataclass
+class BusinessProfile:
+    """
+    Models ownership of a business (franchise, LLC, S-corp, sole prop, etc.).
+
+    Revenue & costs
+    ---------------
+    net_profit = annual_revenue * (1 - expense_ratio)
+    Revenue compounds at revenue_growth_rate each year starting from start_year.
+    initial_investment is a one-time draw from brokerage in the start year.
+
+    Tax treatment (applied on top of W-2 income)
+    ---------------------------------------------
+    SE tax: 15.3% on 92.35% of net profit; employer-half is deductible from AGI.
+    QBI deduction: 20% of net profit if use_qbi_deduction=True (phased out above
+      $191,950 single / $383,900 MFJ at 2024 thresholds, inflated each year).
+    Self-employed health insurance: fully deductible from AGI.
+    Solo 401k: up to $69,000/yr (IRS limit); tracked in retirement balance.
+    SEP-IRA: up to 25% of net SE income; alternative or supplement to solo 401k.
+
+    Asset value
+    -----------
+    Business equity = net_profit x equity_multiple, included in net worth.
+    If sale_year is set, equity is liquidated into brokerage that year.
+    Set equity_multiple=0 to exclude business equity from net worth.
+    """
+    annual_revenue: float = 0.0           # gross revenue in today's dollars
+    expense_ratio: float = 0.60           # operating costs as fraction of revenue
+    revenue_growth_rate: float = 0.05     # annual nominal revenue growth rate
+    initial_investment: float = 0.0       # one-time startup/acquisition cost (in start_year)
+    start_year: int = 1                   # projection year business starts earning
+
+    use_qbi_deduction: bool = True        # 20% QBI pass-through deduction
+    self_employed_health_insurance: float = 0.0   # annual premium, AGI-deductible
+    solo_401k_contribution: float = 0.0   # owner solo 401k contribution (IRS limit: $69k)
+    sep_ira_contribution: float = 0.0     # SEP-IRA contribution (<=25% net SE income)
+
+    equity_multiple: float = 3.0          # business value = net_profit * this
+    sale_year: Optional[int] = None       # sell business in this year; proceeds -> brokerage
+
+
 @dataclass
 class KidCarProfile:
     """
@@ -364,7 +404,8 @@ class FinancialPlan:
     projection_years: int = 30
     retirement: Optional[RetirementProfile] = None
     college: Optional[CollegeProfile] = None
-    car: Optional[CarProfile] = None
+    car:      Optional[CarProfile]      = None
+    business: Optional[BusinessProfile]  = None
 
     def events_for_year(self, year: int) -> list[TimelineEvent]:
         return [e for e in self.timeline_events if e.year == year]

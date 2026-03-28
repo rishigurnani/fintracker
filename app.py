@@ -149,7 +149,7 @@ def build_sidebar() -> FinancialPlan:
     st.sidebar.title("⚙️ Configure Your Plan")
 
     # --- Load from file ---
-    with st.sidebar.expander("📂 Load / Save Config", expanded=False):
+    with st.sidebar.expander("📂 Load Config", expanded=False):
         uploaded = st.file_uploader("Load YAML config", type=["yaml", "yml"], label_visibility="collapsed")
         if uploaded:
             import yaml, tempfile, os
@@ -440,6 +440,83 @@ def build_sidebar() -> FinancialPlan:
             ),
         )
 
+    # ── Business ─────────────────────────────────────────────
+    st.sidebar.header("🏢 Business")
+    d_biz = defaults.business if defaults else None
+    has_business = st.sidebar.toggle("Model business ownership", value=d_biz is not None)
+    business = None
+    if has_business:
+        with st.sidebar.expander("Business parameters", expanded=True):
+            biz_revenue = st.number_input(
+                "Annual gross revenue ($)", min_value=0, max_value=10_000_000,
+                value=int(d_biz.annual_revenue) if d_biz else 200_000, step=5_000,
+            )
+            biz_expense_ratio = st.slider(
+                "Operating expense ratio (%)", 0.0, 95.0,
+                float(d_biz.expense_ratio * 100) if d_biz else 60.0, 1.0,
+                help="Operating costs as % of revenue. Net profit = revenue × (1 − ratio).",
+            ) / 100
+            biz_growth = st.slider(
+                "Revenue growth rate (%/yr)", 0.0, 30.0,
+                float(d_biz.revenue_growth_rate * 100) if d_biz else 5.0, 0.5,
+            ) / 100
+            biz_start = st.number_input(
+                "Start year", min_value=1, max_value=50,
+                value=int(d_biz.start_year) if d_biz else 1,
+                help="Projection year the business starts generating income.",
+            )
+            biz_invest = st.number_input(
+                "Initial investment ($)", min_value=0, max_value=5_000_000,
+                value=int(d_biz.initial_investment) if d_biz else 0, step=5_000,
+                help="One-time acquisition/startup cost drawn from brokerage in start year.",
+            )
+            biz_equity_mult = st.slider(
+                "Equity multiple", 0.0, 10.0,
+                float(d_biz.equity_multiple) if d_biz else 3.0, 0.5,
+                help="Business value = net profit × this. Set 0 to exclude from net worth.",
+            )
+            biz_sale_yr = st.number_input(
+                "Sale year (0 = never sell)", min_value=0, max_value=50,
+                value=int(d_biz.sale_year) if (d_biz and d_biz.sale_year) else 0,
+                help="Sell business in this year; equity proceeds go to brokerage.",
+            )
+            st.markdown("**Tax & Retirement**")
+            biz_qbi = st.toggle(
+                "QBI deduction (20% pass-through)",
+                value=d_biz.use_qbi_deduction if d_biz else True,
+                help="20% deduction on qualified business income for pass-through entities.",
+            )
+            biz_health = st.number_input(
+                "Self-employed health insurance ($)", min_value=0, max_value=50_000,
+                value=int(d_biz.self_employed_health_insurance) if d_biz else 0, step=500,
+                help="Annual premium — 100% deductible from AGI for self-employed.",
+            )
+            biz_solo_k = st.number_input(
+                "Solo 401k contribution ($)", min_value=0, max_value=69_000,
+                value=int(d_biz.solo_401k_contribution) if d_biz else 0, step=500,
+                help="Owner solo 401k (up to $69k IRS limit). Tracked in retirement balance.",
+            )
+            biz_sep = st.number_input(
+                "SEP-IRA contribution ($)", min_value=0, max_value=69_000,
+                value=int(d_biz.sep_ira_contribution) if d_biz else 0, step=500,
+                help="SEP-IRA (up to 25% of net self-employment income).",
+            )
+        _biz_base = d_biz if d_biz else BusinessProfile()
+        business = dataclasses.replace(
+            _biz_base,
+            annual_revenue=float(biz_revenue),
+            expense_ratio=float(biz_expense_ratio),
+            revenue_growth_rate=float(biz_growth),
+            start_year=int(biz_start),
+            initial_investment=float(biz_invest),
+            equity_multiple=float(biz_equity_mult),
+            sale_year=int(biz_sale_yr) if biz_sale_yr > 0 else None,
+            use_qbi_deduction=bool(biz_qbi),
+            self_employed_health_insurance=float(biz_health),
+            solo_401k_contribution=float(biz_solo_k),
+            sep_ira_contribution=float(biz_sep),
+        )
+
     # ── Timeline Events ──────────────────────────────────────
     st.sidebar.header("🗓️ Timeline Events")
     st.sidebar.caption("Add life events that change your financial picture.")
@@ -649,21 +726,22 @@ def build_sidebar() -> FinancialPlan:
         retirement=defaults.retirement if defaults else None,
         college=defaults.college if defaults else None,
         car=car,
+        business=business,
     )
 
     # Save config button
     with st.sidebar.expander("💾 Export Config", expanded=False):
-        if st.button("Download as YAML"):
-            import io, yaml
-            from fintracker.config import _plan_to_dict
-            buf = io.StringIO()
-            yaml.dump(_plan_to_dict(plan), buf, default_flow_style=False, sort_keys=False)
-            st.download_button(
-                "⬇️ Download personal.yaml",
-                data=buf.getvalue(),
-                file_name="personal.yaml",
-                mime="text/yaml",
-            )
+        import io, yaml
+        from fintracker.config import _plan_to_dict
+        buf = io.StringIO()
+        yaml.dump(_plan_to_dict(plan), buf, default_flow_style=False, sort_keys=False)
+        st.download_button(
+            "⬇️ Download personal.yaml",
+            data=buf.getvalue(),
+            file_name="personal.yaml",
+            mime="text/yaml",
+            use_container_width=True,
+        )
 
     return plan
 

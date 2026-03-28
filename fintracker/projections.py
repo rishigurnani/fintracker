@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from fintracker.models import (
-    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan,
+    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles,
 )
@@ -45,6 +45,11 @@ from fintracker.mortgage import MortgageCalculator
 _HSA_LIMIT_SINGLE         = 4_150
 _HSA_LIMIT_FAMILY         = 8_300
 _401K_LIMIT               = 30_500
+_SOLO_401K_LIMIT          = 69_000
+_SE_TAX_RATE              = 0.1530
+_SE_TAX_DEDUCTIBLE_SHARE  = 0.9235
+_QBI_PHASEOUT_SINGLE      = 191_950
+_QBI_PHASEOUT_MFJ         = 383_900
 _AOTC_MAX_CREDIT          = 2_500
 _AOTC_PHASEOUT_SINGLE_LOW  = 80_000
 _AOTC_PHASEOUT_SINGLE_HIGH = 90_000
@@ -120,6 +125,8 @@ class EngineState:
     college_529_balance: float
     uninvested_cash: float
     cash_buffer: float
+    business_equity: float
+    business_revenue: float
 
     # Flags
     parent_care_active: bool
@@ -188,6 +195,9 @@ class YearlySnapshot:
     is_working: bool
     is_partner_working: bool
 
+    # Business income and equity
+    annual_business_income: float = 0.0
+    business_equity: float = 0.0
     # Car one-off costs (for display / debugging)
     car_purchase_cost: float = 0.0
     car_sale_proceeds: float = 0.0
@@ -200,6 +210,7 @@ class YearlySnapshot:
             self.retirement_balance + self.brokerage_balance
             + self.college_529_balance + self.home_equity
             + self.hsa_balance + self.uninvested_cash + self.cash_buffer
+            + self.business_equity
         )
 
     @property
@@ -535,6 +546,8 @@ class ProjectionEngine:
             parent_care_active=p.lifestyle.annual_parent_care_cost > 0,
             cars=self._init_cars(p.car),
             kid_car_loans=[],
+            business_equity=0.0,
+            business_revenue=(p.business.annual_revenue if p.business else 0.0),
         )
 
     @staticmethod
@@ -688,8 +701,9 @@ class ProjectionEngine:
 
         # --- Contributions & tax ---
         hsa, k401, partner_k401, r529 = self._contributions(state, year)
+        biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year)
         tax, aotc = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
-        net_income = state.gross_income - tax - hsa - k401 - partner_k401
+        net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k
 
         # --- Expenses ---
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
@@ -712,12 +726,12 @@ class ProjectionEngine:
 
         # --- Asset growth ---
         ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer = self._asset_growth(
-            state, year, mkt, hsa, k401, partner_k401,
+            state, year, mkt, hsa, k401 + biz_solo_401k, partner_k401,
             annual_529_save, drawdown_529, brokerage_earmark, breathing_room,
             annual_expenses=lifestyle_cost + housing_cost,
         )
 
-        nw = ret_bal + hsa_bal + col529_bal + brok_bal + home_equity + uninvested + new_buffer
+        nw = ret_bal + hsa_bal + col529_bal + brok_bal + home_equity + uninvested + new_buffer + biz_equity
 
         return YearlySnapshot(
             year=year,
@@ -753,6 +767,8 @@ class ProjectionEngine:
             is_married=state.is_married,
             is_working=state.is_working,
             is_partner_working=state.is_partner_working,
+            annual_business_income=biz_net,
+            business_equity=biz_equity,
             car_purchase_cost=car_purchase,
             car_sale_proceeds=car_sale,
         )
@@ -934,6 +950,89 @@ class ProjectionEngine:
         return rate * sum(
             1 for by in state.child_birth_years if (year - by) <= 25
         )
+
+    def _business(
+        self,
+        state: EngineState,
+        year: int,
+    ) -> tuple[float, float, float, float]:
+        """
+        Returns (net_income, se_tax, business_equity, solo_401k_contribution).
+
+        net_income   — owner's draw after SE tax, QBI deduction, and health
+                       insurance deduction; flows into breathing room
+        se_tax       — self-employment tax owed (shown separately in cash flow)
+        business_equity — current business asset value (net_profit × multiple)
+        solo_401k_contribution — amount deposited to retirement this year
+
+        Revenue is stored in state.business_revenue and grown in _advance_state.
+        The initial_investment is deducted from brokerage in the start year.
+        """
+        biz = self._plan.business
+        if biz is None or year < biz.start_year:
+            return 0.0, 0.0, state.business_equity, 0.0
+
+        # One-time initial investment in start year
+        if year == biz.start_year and biz.initial_investment > 0:
+            state.brokerage_balance -= biz.initial_investment
+
+        # Business sale: liquidate equity into brokerage once, then silence permanently.
+        if biz.sale_year is not None and year >= biz.sale_year:
+            if year == biz.sale_year:
+                proceeds = state.business_equity
+                state.brokerage_balance += proceeds
+            return 0.0, 0.0, 0.0, 0.0
+
+        revenue    = state.business_revenue
+        net_profit = revenue * (1.0 - biz.expense_ratio)
+
+        # --- Self-employment tax ---
+        # SE tax is 15.3% on 92.35% of net profit.
+        # The employer half (7.65%) is deductible from AGI — reduces taxable income.
+        se_base     = net_profit * _SE_TAX_DEDUCTIBLE_SHARE
+        se_tax      = se_base * _SE_TAX_RATE
+        employer_half_deduction = se_tax / 2.0
+
+        # --- Health insurance deduction ---
+        hi_deduction = min(biz.self_employed_health_insurance, net_profit)
+
+        # --- QBI deduction ---
+        # 20% of qualified business income, phased out above income thresholds.
+        # Simplified: apply phase-out linearly over a $50k window above the limit.
+        qbi_deduction = 0.0
+        if biz.use_qbi_deduction:
+            limit = (_QBI_PHASEOUT_MFJ if state.is_married else _QBI_PHASEOUT_SINGLE)
+            total_income = state.gross_income + net_profit
+            if total_income <= limit:
+                phase = 1.0
+            elif total_income >= limit + 50_000:
+                phase = 0.0
+            else:
+                phase = 1.0 - (total_income - limit) / 50_000
+            qbi_deduction = net_profit * 0.20 * phase
+
+        # --- Solo 401k ---
+        # Capped at IRS limit and net profit (can't contribute more than earned)
+        solo_k = min(biz.solo_401k_contribution, _SOLO_401K_LIMIT, max(0.0, net_profit))
+
+        # --- SEP-IRA ---
+        # Up to 25% of net self-employment income (after SE tax deduction)
+        sep_base = max(0.0, net_profit - employer_half_deduction)
+        sep = min(biz.sep_ira_contribution, 0.25 * sep_base)
+        # SEP flows into retirement alongside solo 401k
+        solo_k_total = min(solo_k + sep, _SOLO_401K_LIMIT)
+
+        # --- Net income to owner ---
+        # Gross profit minus all deductions; the actual tax impact on W-2 income
+        # is handled in _tax_and_credits via the normal tax engine (which will see
+        # a lower AGI because of employer_half_deduction + hi_deduction + qbi_deduction).
+        # Here we return the owner's take-home after SE tax and retirement contributions.
+        net_income = net_profit - se_tax - solo_k_total
+
+        # --- Business equity ---
+        biz_equity = net_profit * biz.equity_multiple
+
+        return net_income, se_tax, biz_equity, solo_k_total
 
     def _cars(
         self, state: EngineState, year: int, inf_f: float
@@ -1150,6 +1249,9 @@ class ProjectionEngine:
         state.college_529_balance = snap.college_529_balance
         state.uninvested_cash     = snap.uninvested_cash
         state.cash_buffer         = snap.cash_buffer
+        state.business_equity     = snap.business_equity
+        if self._plan.business and snap.year >= self._plan.business.start_year:
+            state.business_revenue *= (1 + self._plan.business.revenue_growth_rate)
 
         if not state.is_renting:
             state.home_value = snap.home_value * (1 + p.investments.annual_home_appreciation_rate)

@@ -8,7 +8,8 @@ Tests for the five new feature groups:
 """
 import pytest
 from fintracker.models import (
-    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan, HousingProfile,
+    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile,
+    FilingStatus, FinancialPlan, HousingProfile,
     IncomeProfile, InvestmentProfile, LifestyleProfile, RetirementProfile,
     State, StrategyToggles, TimelineEvent,
 )
@@ -1547,8 +1548,7 @@ class TestMonteCarloLiquidity:
         assert max(mc.prob_negative_liquid) == 0.0,             f"Expected zero risk, got {max(mc.prob_negative_liquid):.1%}"
 
     def test_higher_market_std_widens_liquid_spread(self):
-        """Higher volatility should produce a wider p10–p90 liquid band.
-        Must use use_historical_returns=False: bootstrap ignores market_return_std."""
+        """Higher volatility should produce a wider p10–p90 liquid band."""
         engine = ProjectionEngine(self._plan(years=20))
         mc_low  = engine.run_monte_carlo(200, seed=42, market_return_std=0.05, use_historical_returns=False)
         mc_high = engine.run_monte_carlo(200, seed=42, market_return_std=0.30, use_historical_returns=False)
@@ -2039,3 +2039,181 @@ class TestExportFidelity:
                 assert a == b, f"{path}: {a!r} != {b!r}"
 
         compare_dicts(d_original, d_merged)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Business Ownership
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBusinessProfile:
+    """Tests for BusinessProfile — franchise / LLC / sole-prop business ownership."""
+
+    def _base(self, biz=None):
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=200_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            business=biz, projection_years=10,
+        )
+
+    def _biz(self, **kw):
+        defaults = dict(annual_revenue=200_000, expense_ratio=0.60,
+                        revenue_growth_rate=0.0, start_year=1, equity_multiple=0)
+        defaults.update(kw)
+        return BusinessProfile(**defaults)
+
+    # ── No-business baseline ────────────────────────────────────────────────
+
+    def test_no_business_produces_zeros(self):
+        """Without a BusinessProfile, all business fields must be zero every year."""
+        for s in ProjectionEngine(self._base()).run_deterministic():
+            assert s.annual_business_income == 0.0, f"Yr{s.year}: unexpected income"
+            assert s.business_equity == 0.0,        f"Yr{s.year}: unexpected equity"
+
+    # ── Income & equity ─────────────────────────────────────────────────────
+
+    def test_business_income_positive(self):
+        """Profitable business (revenue > costs) must produce positive owner income."""
+        s1 = ProjectionEngine(self._base(self._biz())).run_deterministic()[0]
+        assert s1.annual_business_income > 0
+
+    def test_equity_equals_profit_times_multiple(self):
+        """business_equity = net_profit × equity_multiple, exactly."""
+        biz = self._biz(equity_multiple=3.0)
+        s1 = ProjectionEngine(self._base(biz)).run_deterministic()[0]
+        net_profit = 200_000 * (1 - 0.60)   # 80_000
+        assert abs(s1.business_equity - net_profit * 3.0) < 1.0
+
+    def test_se_tax_reduces_net_income_vs_gross_profit(self):
+        """Self-employment tax must reduce owner take-home below gross profit."""
+        biz = self._biz(use_qbi_deduction=False)
+        s1 = ProjectionEngine(self._base(biz)).run_deterministic()[0]
+        gross_profit = 200_000 * 0.40
+        assert s1.annual_business_income < gross_profit
+
+    def test_net_worth_integrity_with_business_equity(self):
+        """NW must equal sum of all components including business_equity."""
+        biz = self._biz(equity_multiple=3.0)
+        for s in ProjectionEngine(self._base(biz)).run_deterministic():
+            components = (s.retirement_balance + s.brokerage_balance
+                          + s.college_529_balance + s.home_equity + s.hsa_balance
+                          + s.uninvested_cash + s.cash_buffer + s.business_equity)
+            assert abs(components - s.net_worth) < 1.0, \
+                f"Yr{s.year}: NW mismatch {components:.2f} vs {s.net_worth:.2f}"
+
+    # ── Timing ──────────────────────────────────────────────────────────────
+
+    def test_start_year_respected(self):
+        """No income or equity before start_year; both appear from start_year onward."""
+        biz = self._biz(start_year=3, equity_multiple=3.0)
+        snaps = ProjectionEngine(self._base(biz)).run_deterministic()
+        assert snaps[0].annual_business_income == 0.0, "yr1 should have no income"
+        assert snaps[1].annual_business_income == 0.0, "yr2 should have no income"
+        assert snaps[2].annual_business_income  > 0.0, "yr3 should have income"
+
+    def test_revenue_grows_at_growth_rate(self):
+        """Owner income in yr3 should be > yr1 by at least (1+rate)^2."""
+        biz = self._biz(annual_revenue=100_000, expense_ratio=0.50,
+                        revenue_growth_rate=0.10)
+        snaps = ProjectionEngine(self._base(biz)).run_deterministic()
+        assert snaps[2].annual_business_income > snaps[0].annual_business_income * 1.10
+
+    # ── Initial investment ──────────────────────────────────────────────────
+
+    def test_initial_investment_deducted_from_brokerage(self):
+        """50k initial investment should reduce year-1 brokerage by exactly 50k."""
+        biz_0  = self._biz(initial_investment=0)
+        biz_50 = self._biz(initial_investment=50_000)
+        br0 = ProjectionEngine(self._base(biz_0)).run_deterministic()[0].brokerage_balance
+        br1 = ProjectionEngine(self._base(biz_50)).run_deterministic()[0].brokerage_balance
+        assert abs((br0 - br1) - 50_000) < 1.0
+
+    def test_initial_investment_only_in_start_year(self):
+        """Investment must only hit brokerage once (in start_year, not every year)."""
+        biz_0  = self._biz(initial_investment=0,      start_year=2)
+        biz_50 = self._biz(initial_investment=50_000, start_year=2)
+        snaps0 = ProjectionEngine(self._base(biz_0)).run_deterministic()
+        snaps1 = ProjectionEngine(self._base(biz_50)).run_deterministic()
+        # Difference should be constant from yr2 onward (not accumulating)
+        diff_yr2 = snaps0[1].brokerage_balance - snaps1[1].brokerage_balance
+        diff_yr5 = snaps0[4].brokerage_balance - snaps1[4].brokerage_balance
+        assert abs(diff_yr2 - 50_000) < 1.0
+        assert abs(diff_yr5 - diff_yr2) < 1.0, "Investment hit more than once"
+
+    # ── Business sale ───────────────────────────────────────────────────────
+
+    def test_sale_year_zeroes_equity(self):
+        """After sale_year, business_equity must be 0 permanently."""
+        biz = self._biz(equity_multiple=3.0, sale_year=5)
+        snaps = ProjectionEngine(self._base(biz)).run_deterministic()
+        for s in snaps[4:]:   # yr5 and beyond
+            assert s.business_equity == 0.0,           f"Yr{s.year}: equity should be 0 after sale"
+            assert s.annual_business_income == 0.0,    f"Yr{s.year}: no income after sale"
+
+    def test_sale_year_proceeds_hit_brokerage(self):
+        """Business sale proceeds (equity) must flow into brokerage in sale_year."""
+        biz = self._biz(equity_multiple=3.0, sale_year=5)
+        snaps = ProjectionEngine(self._base(biz)).run_deterministic()
+        # brokerage in yr5 should spike relative to yr4
+        jump = snaps[4].brokerage_balance - snaps[3].brokerage_balance
+        expected_equity = 200_000 * 0.40 * 3.0   # 240_000
+        assert jump > expected_equity * 0.8, f"Sale proceeds not in brokerage: jump={jump:.0f}"
+
+    # ── Retirement contributions ─────────────────────────────────────────────
+
+    def test_solo_401k_increases_retirement_balance(self):
+        """Solo 401k contributions must appear in retirement_balance."""
+        biz_no  = self._biz(solo_401k_contribution=0)
+        biz_yes = self._biz(annual_revenue=300_000, expense_ratio=0.50,
+                            solo_401k_contribution=20_000)
+        ret_no  = ProjectionEngine(self._base(biz_no)).run_deterministic()[-1].retirement_balance
+        ret_yes = ProjectionEngine(self._base(biz_yes)).run_deterministic()[-1].retirement_balance
+        assert ret_yes > ret_no
+
+    def test_solo_401k_cap_enforced(self):
+        """Solo 401k must be capped at $69,000 IRS limit even if stated higher."""
+        biz = self._biz(annual_revenue=5_000_000, expense_ratio=0.20,
+                        solo_401k_contribution=200_000)
+        # Engine should cap at 69k without crashing
+        snaps = ProjectionEngine(self._base(biz)).run_deterministic()
+        assert snaps[0].annual_business_income > 0  # still runs
+
+    # ── Config round-trip ───────────────────────────────────────────────────
+
+    def test_config_roundtrip_preserves_all_fields(self):
+        """All BusinessProfile fields must survive _plan_to_dict → _dict_to_plan."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        biz = BusinessProfile(
+            annual_revenue=300_000, expense_ratio=0.45,
+            revenue_growth_rate=0.08, initial_investment=100_000,
+            start_year=2, use_qbi_deduction=True,
+            self_employed_health_insurance=15_000,
+            solo_401k_contribution=35_000, sep_ira_contribution=8_000,
+            equity_multiple=4.5, sale_year=20,
+        )
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(biz)))
+        b2 = plan2.business
+        assert b2 is not None
+        assert b2.annual_revenue                  == 300_000
+        assert b2.expense_ratio                   == 0.45
+        assert b2.revenue_growth_rate             == 0.08
+        assert b2.initial_investment              == 100_000
+        assert b2.start_year                      == 2
+        assert b2.use_qbi_deduction               is True
+        assert b2.self_employed_health_insurance  == 15_000
+        assert b2.solo_401k_contribution          == 35_000
+        assert b2.sep_ira_contribution            == 8_000
+        assert b2.equity_multiple                 == 4.5
+        assert b2.sale_year                       == 20
+
+    def test_none_business_stays_none_after_config_roundtrip(self):
+        """Plans without a business must not gain one on round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(None)))
+        assert plan2.business is None

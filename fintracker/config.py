@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from fintracker.models import (
-    CarProfile, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
+    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
@@ -135,6 +135,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
     retirement = _dict_to_retirement(d["retirement"]) if "retirement" in d else None
     college    = _dict_to_college(d["college"])    if "college"    in d else None
     car        = _dict_to_car(d["car"])            if "car"        in d else None
+    business   = _dict_to_business(d["business"]) if "business"   in d else None
 
     return FinancialPlan(
         income=income,
@@ -147,6 +148,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         retirement=retirement,
         college=college,
         car=car,
+        business=business,
     )
 
 
@@ -199,6 +201,22 @@ def _dict_to_college(c: dict) -> CollegeProfile:
         early_529_return=float(c.get("early_529_return", 0.08)),
         late_529_return=float(c.get("late_529_return", 0.04)),
         glide_path_years=int(c.get("glide_path_years", 10)),
+    )
+
+
+def _dict_to_business(b: dict) -> BusinessProfile:
+    return BusinessProfile(
+        annual_revenue=float(b.get("annual_revenue", 0.0)),
+        expense_ratio=float(b.get("expense_ratio", 0.60)),
+        revenue_growth_rate=float(b.get("revenue_growth_rate", 0.05)),
+        initial_investment=float(b.get("initial_investment", 0.0)),
+        start_year=int(b.get("start_year", 1)),
+        use_qbi_deduction=bool(b.get("use_qbi_deduction", True)),
+        self_employed_health_insurance=float(b.get("self_employed_health_insurance", 0.0)),
+        solo_401k_contribution=float(b.get("solo_401k_contribution", 0.0)),
+        sep_ira_contribution=float(b.get("sep_ira_contribution", 0.0)),
+        equity_multiple=float(b.get("equity_multiple", 3.0)),
+        sale_year=b.get("sale_year"),
     )
 
 
@@ -315,6 +333,22 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "early_529_return": plan.college.early_529_return,
             "late_529_return": plan.college.late_529_return,
             "glide_path_years": plan.college.glide_path_years,
+        }
+
+    if plan.business:
+        b = plan.business
+        d["business"] = {
+            "annual_revenue":                 b.annual_revenue,
+            "expense_ratio":                  b.expense_ratio,
+            "revenue_growth_rate":            b.revenue_growth_rate,
+            "initial_investment":             b.initial_investment,
+            "start_year":                     b.start_year,
+            "use_qbi_deduction":              b.use_qbi_deduction,
+            "self_employed_health_insurance": b.self_employed_health_insurance,
+            "solo_401k_contribution":         b.solo_401k_contribution,
+            "sep_ira_contribution":           b.sep_ira_contribution,
+            "equity_multiple":                b.equity_multiple,
+            "sale_year":                      b.sale_year,
         }
 
     if plan.car:
