@@ -16,7 +16,8 @@ from plotly.subplots import make_subplots
 from fintracker.models import (
     FilingStatus, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
-    CarProfile, InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier,
+    InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
 )
 from fintracker.tax_engine import TaxEngine
 from fintracker.mortgage import MortgageCalculator
@@ -147,6 +148,22 @@ def metric_card(label: str, value: str, delta: str = "", positive: bool = True) 
 
 def build_sidebar() -> FinancialPlan:
     st.sidebar.title("⚙️ Configure Your Plan")
+    section = st.sidebar.radio(
+        "section",
+        ["💵 Income", "🏠 Housing", "🌿 Lifestyle", "📊 Investments",
+         "🎯 Strategies", "🚗 Car", "🏢 Business", "🗓️ Events"],
+        label_visibility="collapsed",
+    )
+    st.sidebar.markdown(
+        "<small>"
+        "<b>inflated yearly</b> — enter today's value; the engine increases it by your CPI assumption each year. &nbsp;"
+        "<b>fixed</b> — stays the same nominal amount every year. &nbsp;"
+        "<b>current</b> — enter the actual dollar amount as it stands today. &nbsp;"
+        "<b>own rate</b> — grows at its own configured rate, not by CPI."
+        "</small>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.divider()
 
     # --- Load from file ---
     with st.sidebar.expander("📂 Load Config", expanded=False):
@@ -173,546 +190,708 @@ def build_sidebar() -> FinancialPlan:
     d_inv = defaults.investments if defaults else None
     d_str = defaults.strategies if defaults else None
 
-    # ── Income ───────────────────────────────────────────────
-    st.sidebar.header("💵 Income")
-    gross = st.sidebar.number_input(
-        "Gross Annual Income ($)",
-        min_value=0, max_value=5_000_000,
-        value=int(d_inc.gross_annual_income) if d_inc else 120_000, step=5_000,
-    )
-    spouse = st.sidebar.number_input(
-        "Spouse Gross Income ($)",
-        min_value=0, max_value=5_000_000,
-        value=int(d_inc.spouse_gross_annual_income) if d_inc else 0, step=5_000,
-    )
-    filing = st.sidebar.selectbox(
-        "Filing Status",
-        options=[f.value for f in FilingStatus],
-        index=[f.value for f in FilingStatus].index(d_inc.filing_status.value) if d_inc else 0,
-        format_func=lambda x: x.replace("_", " ").title(),
-    )
-    state_options = [s.value for s in State]
-    state_val = st.sidebar.selectbox(
-        "State",
-        options=state_options,
-        index=state_options.index(d_inc.state.value) if d_inc else state_options.index("GA"),
-    )
-    other_rate = 0.05
-    if state_val == "OTHER":
-        other_rate = st.sidebar.slider("State Flat Tax Rate (%)", 0.0, 15.0, 5.0, 0.1) / 100
+    # Pre-initialise all plan components from the loaded plan (or defaults).
+    # Each section block may override its own variable; variables for
+    # sections not currently shown stay as these pass-through values so
+    # FinancialPlan() below always has all required arguments.
+    income      = defaults.income      if defaults else IncomeProfile()
+    housing     = defaults.housing     if defaults else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
+    lifestyle   = defaults.lifestyle   if defaults else LifestyleProfile()
+    investments = defaults.investments if defaults else InvestmentProfile()
+    strategies  = defaults.strategies  if defaults else StrategyToggles()
+    car         = defaults.car         if defaults else None
+    business    = defaults.business    if defaults else None
+    events: list[TimelineEvent] = defaults.timeline_events if defaults else []
+    # Cross-section scalar values — defined here so every section can reference them
+    gross  = int(defaults.income.gross_annual_income)             if defaults else 120_000
+    spouse = int(defaults.income.spouse_gross_annual_income)      if defaults else 0
+    employer_match = defaults.investments.employer_match          if defaults else None
 
-    income = IncomeProfile(
-        gross_annual_income=float(gross),
-        spouse_gross_annual_income=float(spouse),
-        filing_status=FilingStatus(filing),
-        state=State(state_val),
-        other_state_flat_rate=other_rate,
-    )
+    if section == "💵 Income":
+        # ── Income ───────────────────────────────────────────────
+        st.sidebar.header("💵 Income")
+        gross = st.sidebar.number_input(
+            "Gross Annual Income  (own rate)",
+            min_value=0, max_value=5_000_000,
+            value=int(d_inc.gross_annual_income) if d_inc else 120_000, step=5_000,
+        )
+        spouse = st.sidebar.number_input(
+            "Spouse Gross Income  (own rate)",
+            min_value=0, max_value=5_000_000,
+            value=int(d_inc.spouse_gross_annual_income) if d_inc else 0, step=5_000,
+        )
+        filing = st.sidebar.selectbox(
+            "Filing Status",
+            options=[f.value for f in FilingStatus],
+            index=[f.value for f in FilingStatus].index(d_inc.filing_status.value) if d_inc else 0,
+            format_func=lambda x: x.replace("_", " ").title(),
+        )
+        state_options = [s.value for s in State]
+        state_val = st.sidebar.selectbox(
+            "State",
+            options=state_options,
+            index=state_options.index(d_inc.state.value) if d_inc else state_options.index("GA"),
+        )
+        other_rate = 0.05
+        if state_val == "OTHER":
+            other_rate = st.sidebar.slider("State Flat Tax Rate (%)", 0.0, 15.0, 5.0, 0.1) / 100
 
-    # ── Housing ──────────────────────────────────────────────
-    st.sidebar.header("🏠 Housing")
-    is_renting = st.sidebar.toggle("I'm Renting", value=d_hou.is_renting if d_hou else False)
-
-    if is_renting:
-        monthly_rent = st.sidebar.number_input(
-            "Monthly Rent ($)", min_value=0, max_value=20_000,
-            value=int(d_hou.monthly_rent) if d_hou else 2_000, step=100,
-        )
-        _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
-        housing = dataclasses.replace(
-            _hou_base,
-            home_price=0.0, down_payment=0.0, interest_rate=0.0,
-            is_renting=True, monthly_rent=float(monthly_rent),
-        )
-    else:
-        home_price = st.sidebar.number_input(
-            "Home Price ($)", min_value=0, max_value=10_000_000,
-            value=int(d_hou.home_price) if d_hou else 400_000, step=10_000,
-        )
-        down_pmt = st.sidebar.number_input(
-            "Down Payment ($)", min_value=0, max_value=home_price,
-            value=min(int(d_hou.down_payment) if d_hou else 80_000, home_price), step=5_000,
-        )
-        rate = st.sidebar.slider(
-            "Mortgage Rate (%)", 2.0, 12.0,
-            float(d_hou.interest_rate * 100) if d_hou else 6.5, 0.125,
-        )
-        _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
-        housing = dataclasses.replace(
-            _hou_base,
-            home_price=float(home_price),
-            down_payment=float(down_pmt),
-            interest_rate=rate / 100,
-            is_renting=False,
-            annual_property_tax_rate=float(d_hou.annual_property_tax_rate) if d_hou else 0.012,
-            annual_insurance=float(d_hou.annual_insurance) if d_hou else 2_000,
+        income = IncomeProfile(
+            gross_annual_income=float(gross),
+            spouse_gross_annual_income=float(spouse),
+            filing_status=FilingStatus(filing),
+            state=State(state_val),
+            other_state_flat_rate=other_rate,
         )
 
-    # ── Lifestyle ────────────────────────────────────────────
-    st.sidebar.header("🌿 Lifestyle")
-    num_children = st.sidebar.number_input(
-        "Current Children", min_value=0, max_value=10,
-        value=int(d_lif.num_children) if d_lif else 0,
-    )
-    # Always show childcare cost — even with 0 current kids the user may be planning
-    # for future children via timeline events. The projection engine multiplies this
-    # by num_children at each year, so it correctly shows $0 until a child arrives.
-    monthly_childcare = st.sidebar.number_input(
-        "Monthly Childcare per Child ($)",
-        min_value=0, max_value=10_000,
-        value=int(d_lif.monthly_childcare) if d_lif else 0,
-        step=100,
-        help="Cost per child per month. Applied automatically when children are added via Timeline Events.",
-    )
-    num_pets = st.sidebar.number_input(
-        "Pets", min_value=0, max_value=10,
-        value=int(d_lif.num_pets) if d_lif else 0,
-    )
-    annual_pet = 0.0
-    if num_pets > 0:
-        annual_pet = st.sidebar.number_input(
-            "Annual Pet Cost ($)", min_value=0, max_value=20_000,
-            value=int(d_lif.annual_pet_cost) if d_lif else 1_800, step=100,
+
+    if section == "🏠 Housing":
+        # ── Housing ──────────────────────────────────────────────
+        st.sidebar.header("🏠 Housing")
+        is_renting = st.sidebar.toggle("I'm Renting", value=d_hou.is_renting if d_hou else False)
+
+        if is_renting:
+            monthly_rent = st.sidebar.number_input(
+                "Monthly Rent  (own rate)", min_value=0, max_value=20_000,
+                value=int(d_hou.monthly_rent) if d_hou else 2_000, step=100,
+            )
+            _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
+            housing = dataclasses.replace(
+                _hou_base,
+                home_price=0.0, down_payment=0.0, interest_rate=0.0,
+                is_renting=True, monthly_rent=float(monthly_rent),
+            )
+        else:
+            home_price = st.sidebar.number_input(
+                "Home Price  (current)", min_value=0, max_value=10_000_000,
+                value=int(d_hou.home_price) if d_hou else 400_000, step=10_000,
+            )
+            down_pmt = st.sidebar.number_input(
+                "Down Payment  (current)", min_value=0, max_value=home_price,
+                value=min(int(d_hou.down_payment) if d_hou else 80_000, home_price), step=5_000,
+            )
+            rate = st.sidebar.slider(
+                "Mortgage Rate (%)", 2.0, 12.0,
+                float(d_hou.interest_rate * 100) if d_hou else 6.5, 0.125,
+            )
+            _hou_base = d_hou if d_hou else HousingProfile(home_price=0, down_payment=0, interest_rate=0.0)
+            housing = dataclasses.replace(
+                _hou_base,
+                home_price=float(home_price),
+                down_payment=float(down_pmt),
+                interest_rate=rate / 100,
+                is_renting=False,
+                annual_property_tax_rate=float(d_hou.annual_property_tax_rate) if d_hou else 0.012,
+                annual_insurance=float(d_hou.annual_insurance) if d_hou else 2_000,
+            )
+
+
+    if section == "🌿 Lifestyle":
+        # ── Lifestyle ────────────────────────────────────────────
+        st.sidebar.header("🌿 Lifestyle")
+        num_children = st.sidebar.number_input(
+            "Current Children", min_value=0, max_value=10,
+            value=int(d_lif.num_children) if d_lif else 0,
         )
-    medical = st.sidebar.number_input(
-        "Annual Medical OOP ($)", min_value=0, max_value=50_000,
-        value=int(d_lif.annual_medical_oop) if d_lif else 3_000, step=500,
-    )
-    vacation = st.sidebar.number_input(
-        "Annual Vacation ($)", min_value=0, max_value=100_000,
-        value=int(d_lif.annual_vacation) if d_lif else 5_000, step=500,
-    )
-    other_monthly = st.sidebar.number_input(
-        "Other Monthly ($)", min_value=0, max_value=10_000,
-        value=int(d_lif.monthly_other_recurring) if d_lif else 500, step=100,
-    )
-    _lif_base = d_lif if d_lif else LifestyleProfile()
-    lifestyle = dataclasses.replace(
-        _lif_base,
-        num_children=int(num_children),
-        monthly_childcare=float(monthly_childcare),
-        num_pets=int(num_pets),
-        annual_pet_cost=float(annual_pet),
-        annual_medical_oop=float(medical),
-        annual_vacation=float(vacation),
-        monthly_other_recurring=float(other_monthly),
-    )
-
-    # ── Investments ──────────────────────────────────────────
-    st.sidebar.header("📊 Investments & Savings")
-    liquid_cash = st.sidebar.number_input(
-        "Current Liquid Cash ($)", min_value=0, max_value=10_000_000,
-        value=int(d_inv.current_liquid_cash) if d_inv else 100_000, step=5_000,
-    )
-    retirement_bal = st.sidebar.number_input(
-        "Current Retirement Balance ($)", min_value=0, max_value=10_000_000,
-        value=int(d_inv.current_retirement_balance) if d_inv else 0, step=5_000,
-    )
-    brokerage_bal = st.sidebar.number_input(
-        "Current Brokerage / Taxable Balance ($)", min_value=0, max_value=10_000_000,
-        value=int(d_inv.current_brokerage_balance) if d_inv else 0, step=5_000,
-        help="Existing taxable investment accounts (separate from 401k/IRA/HSA).",
-    )
-    one_time = st.sidebar.number_input(
-        "Upcoming One-Time Expenses ($)", min_value=0, max_value=1_000_000,
-        value=int(d_inv.one_time_upcoming_expenses) if d_inv else 0, step=1_000,
-        help="Wedding, car purchase, etc. Subtracted from investable cash.",
-    )
-    k401 = st.sidebar.number_input(
-        "Your Annual 401k Contribution ($)", min_value=0, max_value=30_500,
-        value=int(d_inv.annual_401k_contribution) if d_inv else 23_000, step=500,
-    )
-    partner_k401 = 0
-    if spouse > 0:
-        partner_k401 = st.sidebar.number_input(
-            "Partner Annual 401k Contribution ($)", min_value=0, max_value=30_500,
-            value=int(d_inv.partner_annual_401k_contribution) if d_inv else 0, step=500,
-            help="Partner's independent 401k — each person has their own IRS limit.",
+        d_cp = d_lif.childcare_profile if d_lif else None
+        childcare_mode = st.sidebar.radio(
+            "Childcare cost model",
+            ["Flat monthly rate", "Age-based schedule"],
+            index=1 if d_cp else 0,
+            horizontal=True,
+            help="Age-based schedule reflects how costs change from infant daycare through school-age activities.",
         )
-    hsa = st.sidebar.number_input(
-        "Annual HSA Contribution ($)", min_value=0, max_value=8_300,
-        value=int(d_inv.annual_hsa_contribution) if d_inv else 4_150, step=100,
-    )
-    c529 = st.sidebar.number_input(
-        "Annual 529 Contribution per Child ($)", min_value=0, max_value=50_000,
-        value=int(d_inv.annual_529_contribution) if d_inv else 0, step=500,
-    )
-
-    investments = InvestmentProfile(
-        current_liquid_cash=float(liquid_cash),
-        current_retirement_balance=float(retirement_bal),
-        current_brokerage_balance=float(brokerage_bal),
-        one_time_upcoming_expenses=float(one_time),
-        annual_401k_contribution=float(k401),
-        partner_annual_401k_contribution=float(partner_k401),
-        annual_hsa_contribution=float(hsa),
-        annual_529_contribution=float(c529),
-        annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
-        annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
-        annual_salary_growth_rate=float(st.sidebar.slider("Your Salary Growth (%)", 0.0, 15.0,
-            float(d_inv.annual_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100,
-        partner_salary_growth_rate=float(st.sidebar.slider("Partner Salary Growth (%)", 0.0, 15.0,
-            float(d_inv.partner_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100
-            if spouse > 0 else 0.04,
-        annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
-        auto_invest_surplus=st.sidebar.toggle(
-            "Auto-Invest Surplus",
-            value=d_inv.auto_invest_surplus if d_inv else True,
-            help="ON: surplus swept into brokerage each year (earns market return). "
-                 "OFF: surplus stays in cash (0% return).",
-        ),
-        cash_buffer_months=st.sidebar.slider(
-            "Cash Buffer (months of expenses)",
-            min_value=0.0, max_value=24.0,
-            value=float(d_inv.cash_buffer_months) if d_inv else 0.0,
-            step=1.0,
-            help="Keep this many months of living expenses as liquid cash (0% return) "
-                 "before sweeping surplus to brokerage. Reduces liquidity risk in bad years. "
-                 "Set to 0 to invest all surplus (default).",
-        ),
-    )
-    # Preserve fields not exposed in sidebar (partner_salary_growth_rate when solo,
-    # annual_roth_ira_contribution, annual_brokerage_contribution)
-    _inv_base = d_inv if d_inv else InvestmentProfile()
-    investments = dataclasses.replace(
-        investments,
-        annual_roth_ira_contribution=_inv_base.annual_roth_ira_contribution,
-        annual_brokerage_contribution=_inv_base.annual_brokerage_contribution,
-        # partner_salary_growth_rate: sidebar only shows it when spouse > 0;
-        # preserve the loaded value when spouse income is 0 at sidebar time
-        partner_salary_growth_rate=(
-            investments.partner_salary_growth_rate
-            if spouse > 0 else _inv_base.partner_salary_growth_rate
-        ),
-    )
-
-    # ── Strategies ───────────────────────────────────────────
-    st.sidebar.header("🎯 Tax Strategies")
-    _str_base = d_str if d_str else StrategyToggles()
-    strategies = dataclasses.replace(
-        _str_base,
-        maximize_hsa=st.sidebar.toggle("Maximize HSA", value=d_str.maximize_hsa if d_str else True),
-        maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
-        use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
-        use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
-    )
-
-    # ── Car ─────────────────────────────────────────────────
-    st.sidebar.header("🚗 Car")
-    d_car = defaults.car if defaults else None
-    has_car = st.sidebar.toggle("Model car purchases", value=d_car is not None)
-    car = None
-    if has_car:
-        car = CarProfile(
-            car_price=st.sidebar.number_input(
-                "Car price ($)", min_value=0, max_value=200_000,
-                value=int(d_car.car_price) if d_car else 25_000, step=1_000,
-            ),
-            down_payment=st.sidebar.number_input(
-                "Down payment ($)", min_value=0, max_value=100_000,
-                value=int(d_car.down_payment) if d_car else 5_000, step=500,
-            ),
-            loan_rate=st.sidebar.slider(
-                "Loan rate (%)", 0.0, 20.0,
-                float(d_car.loan_rate * 100) if d_car else 6.5, 0.25,
-            ) / 100,
-            loan_term_years=st.sidebar.selectbox(
-                "Loan term (years)", [3, 4, 5, 6, 7],
-                index=[3,4,5,6,7].index(d_car.loan_term_years) if d_car else 2,
-            ),
-            replace_every_years=st.sidebar.selectbox(
-                "Replace every (years)", [5, 7, 8, 10, 12, 15],
-                index=[5,7,8,10,12,15].index(d_car.replace_every_years) if d_car else 3,
-            ),
-            residual_value=st.sidebar.number_input(
-                "Sell old car for ($)", min_value=0, max_value=30_000,
-                value=int(d_car.residual_value) if d_car else 5_000, step=500,
-                help="Amount received when selling the old car if no child is old enough to receive it.",
-            ),
-            hand_down_age=st.sidebar.number_input(
-                "Hand-down age (child)", min_value=14, max_value=25,
-                value=int(d_car.hand_down_age) if d_car else 16, step=1,
-                help="Minimum child age to receive the handed-down car instead of selling it.",
-            ),
-            num_cars=st.sidebar.selectbox(
-                "Number of cars", [1, 2, 3],
-                index=(d_car.num_cars - 1) if d_car else 0,
-            ),
-        )
-
-    # ── Business ─────────────────────────────────────────────
-    st.sidebar.header("🏢 Business")
-    d_biz = defaults.business if defaults else None
-    has_business = st.sidebar.toggle("Model business ownership", value=d_biz is not None)
-    business = None
-    if has_business:
-        with st.sidebar.expander("Business parameters", expanded=True):
-            biz_revenue = st.number_input(
-                "Annual gross revenue ($)", min_value=0, max_value=10_000_000,
-                value=int(d_biz.annual_revenue) if d_biz else 200_000, step=5_000,
+        childcare_profile = None
+        if childcare_mode == "Flat monthly rate":
+            monthly_childcare = st.sidebar.number_input(
+                "Monthly Childcare per Child  (inflated yearly)",
+                min_value=0, max_value=10_000,
+                value=int(d_lif.monthly_childcare) if d_lif else 0,
+                step=100,
+                help="Single rate applied to every child, every year. Inflated annually.",
             )
-            biz_expense_ratio = st.slider(
-                "Operating expense ratio (%)", 0.0, 95.0,
-                float(d_biz.expense_ratio * 100) if d_biz else 60.0, 1.0,
-                help="Operating costs as % of revenue. Net profit = revenue × (1 − ratio).",
-            ) / 100
-            biz_growth = st.slider(
-                "Revenue growth rate (%/yr)", 0.0, 30.0,
-                float(d_biz.revenue_growth_rate * 100) if d_biz else 5.0, 0.5,
-            ) / 100
-            biz_start = st.number_input(
-                "Start year", min_value=1, max_value=50,
-                value=int(d_biz.start_year) if d_biz else 1,
-                help="Projection year the business starts generating income.",
+        else:
+            monthly_childcare = 0  # unused when profile is set
+            st.sidebar.caption(
+                "Define monthly costs per child at each age. "
+                "Ages not covered default to $0. Costs inflate annually."
             )
-            biz_invest = st.number_input(
-                "Initial investment ($)", min_value=0, max_value=5_000_000,
-                value=int(d_biz.initial_investment) if d_biz else 0, step=5_000,
-                help="One-time acquisition/startup cost drawn from brokerage in start year.",
-            )
-            biz_equity_mult = st.slider(
-                "Equity multiple", 0.0, 10.0,
-                float(d_biz.equity_multiple) if d_biz else 3.0, 0.5,
-                help="Business value = net profit × this. Set 0 to exclude from net worth.",
-            )
-            biz_sale_yr = st.number_input(
-                "Sale year (0 = never sell)", min_value=0, max_value=50,
-                value=int(d_biz.sale_year) if (d_biz and d_biz.sale_year) else 0,
-                help="Sell business in this year; equity proceeds go to brokerage.",
-            )
-            st.markdown("**Tax & Retirement**")
-            biz_qbi = st.toggle(
-                "QBI deduction (20% pass-through)",
-                value=d_biz.use_qbi_deduction if d_biz else True,
-                help="20% deduction on qualified business income for pass-through entities.",
-            )
-            biz_health = st.number_input(
-                "Self-employed health insurance ($)", min_value=0, max_value=50_000,
-                value=int(d_biz.self_employed_health_insurance) if d_biz else 0, step=500,
-                help="Annual premium — 100% deductible from AGI for self-employed.",
-            )
-            biz_solo_k = st.number_input(
-                "Solo 401k contribution ($)", min_value=0, max_value=69_000,
-                value=int(d_biz.solo_401k_contribution) if d_biz else 0, step=500,
-                help="Owner solo 401k (up to $69k IRS limit). Tracked in retirement balance.",
-            )
-            biz_sep = st.number_input(
-                "SEP-IRA contribution ($)", min_value=0, max_value=69_000,
-                value=int(d_biz.sep_ira_contribution) if d_biz else 0, step=500,
-                help="SEP-IRA (up to 25% of net self-employment income).",
-            )
-        _biz_base = d_biz if d_biz else BusinessProfile()
-        business = dataclasses.replace(
-            _biz_base,
-            annual_revenue=float(biz_revenue),
-            expense_ratio=float(biz_expense_ratio),
-            revenue_growth_rate=float(biz_growth),
-            start_year=int(biz_start),
-            initial_investment=float(biz_invest),
-            equity_multiple=float(biz_equity_mult),
-            sale_year=int(biz_sale_yr) if biz_sale_yr > 0 else None,
-            use_qbi_deduction=bool(biz_qbi),
-            self_employed_health_insurance=float(biz_health),
-            solo_401k_contribution=float(biz_solo_k),
-            sep_ira_contribution=float(biz_sep),
-        )
-
-    # ── Timeline Events ──────────────────────────────────────
-    st.sidebar.header("🗓️ Timeline Events")
-    st.sidebar.caption("Add life events that change your financial picture.")
-
-    # Seed defaults from loaded plan so YAML events appear in the UI
-    loaded_events = defaults.timeline_events if defaults else []
-    default_n_events = len(loaded_events)
-
-    n_events = st.sidebar.number_input(
-        "Number of events", min_value=0, max_value=15, value=default_n_events
-    )
-    events: list[TimelineEvent] = []
-    for i in range(int(n_events)):
-        # Pull defaults for this slot from the loaded plan (if available)
-        ev_def = loaded_events[i] if i < len(loaded_events) else None
-
-        with st.sidebar.expander(
-            f"Event {i+1}" + (f": {ev_def.description}" if ev_def and ev_def.description else ""),
-            expanded=(i == 0),
-        ):
-            yr = st.number_input(
-                "Year", min_value=1, max_value=50,
-                value=int(ev_def.year) if ev_def else 1,
-                key=f"ev_yr_{i}",
-            )
-            desc = st.text_input(
-                "Description",
-                value=ev_def.description if ev_def else "",
-                key=f"ev_desc_{i}",
-            )
-            ev_marriage = st.checkbox(
-                "Marriage (→ MFJ filing)",
-                value=ev_def.marriage if ev_def else False,
-                key=f"ev_marry_{i}",
-            )
-            ev_child = st.checkbox(
-                "New child",
-                value=ev_def.new_child if ev_def else False,
-                key=f"ev_child_{i}",
-            )
-            ev_pet = st.checkbox(
-                "New pet",
-                value=ev_def.new_pet if ev_def else False,
-                key=f"ev_pet_{i}",
-            )
-
-            st.markdown("**Work changes**")
-            ev_stop = st.checkbox(
-                "You stop working",
-                value=ev_def.stop_working if ev_def else False,
-                key=f"ev_stop_{i}",
-            )
-            ev_resume = st.checkbox(
-                "You resume working",
-                value=ev_def.resume_working if ev_def else False,
-                key=f"ev_resume_{i}",
-            )
-            ev_partner_stop = st.checkbox(
-                "Partner stops working",
-                value=ev_def.partner_stop_working if ev_def else False,
-                key=f"ev_pstop_{i}",
-            )
-            ev_partner_resume = st.checkbox(
-                "Partner resumes working",
-                value=ev_def.partner_resume_working if ev_def else False,
-                key=f"ev_presume_{i}",
-            )
-
-            ev_start_care = st.checkbox(
-                "Start parent care",
-                value=ev_def.start_parent_care if ev_def else False,
-                key=f"ev_startcare_{i}",
-                help="Activates annual_parent_care_cost from Lifestyle settings.",
-            )
-            ev_stop_care = st.checkbox(
-                "Stop parent care",
-                value=ev_def.stop_parent_care if ev_def else False,
-                key=f"ev_stopcare_{i}",
-            )
-            ev_birth_yr_override = st.number_input(
-                "Child birth year override (0 = this year)",
-                min_value=-30, max_value=0,
-                value=int(ev_def.child_birth_year_override) if (ev_def and ev_def.child_birth_year_override is not None) else 0,
-                key=f"ev_birthyr_{i}",
-                help="Set negative to indicate a child already born before the projection. "
-                     "0 means born in this event's year (default).",
-            )
-
-            ev_income = st.number_input(
-                "Your new gross income (0 = no change)",
-                min_value=0, max_value=5_000_000,
-                value=int(ev_def.income_change) if (ev_def and ev_def.income_change) else 0,
-                key=f"ev_inc_{i}",
-            )
-            ev_partner_income = st.number_input(
-                "Partner new gross income (0 = no change)",
-                min_value=0, max_value=5_000_000,
-                value=int(ev_def.partner_income_change) if (ev_def and ev_def.partner_income_change) else 0,
-                key=f"ev_pinc_{i}",
-            )
-            ev_expense = st.number_input(
-                "One-time expense ($)",
-                min_value=0, max_value=1_000_000,
-                value=int(ev_def.extra_one_time_expense) if ev_def else 0,
-                key=f"ev_exp_{i}",
-            )
-            ev_bonus = st.number_input(
-                "One-time income ($)",
-                min_value=0, max_value=1_000_000,
-                value=int(ev_def.extra_one_time_income) if ev_def else 0,
-                key=f"ev_bonus_{i}",
-            )
-            # Home purchase fields — shown only when buy_home is set in YAML
-            # or if the user explicitly toggles it on
-            ev_buy_home = st.checkbox(
-                "Buy home",
-                value=ev_def.buy_home if ev_def else False,
-                key=f"ev_buyhome_{i}",
-            )
-            ev_new_home_price = None
-            ev_new_home_down = None
-            ev_new_home_rate = None
-            ev_sell_current = True
-            ev_buyer_closing = 0.02   # default; only overridden when ev_buy_home=True
-            ev_seller_closing = 0.06  # default; only overridden when ev_buy_home=True
-            if ev_buy_home:
-                ev_new_home_price = st.number_input(
-                    "New home price ($)",
-                    min_value=0, max_value=10_000_000,
-                    value=int(ev_def.new_home_price) if (ev_def and ev_def.new_home_price) else 500_000,
-                    key=f"ev_hp_{i}",
+            _default_phases = [
+                (0,  2,  int(d_cp.phases[0].monthly_cost) if d_cp and len(d_cp.phases) > 0 else 2_500),
+                (3,  4,  int(d_cp.phases[1].monthly_cost) if d_cp and len(d_cp.phases) > 1 else 1_500),
+                (5,  12, int(d_cp.phases[2].monthly_cost) if d_cp and len(d_cp.phases) > 2 else 600),
+                (13, 17, int(d_cp.phases[3].monthly_cost) if d_cp and len(d_cp.phases) > 3 else 150),
+            ]
+            _phase_labels = ["Infant/Toddler (0–2)", "Preschool (3–4)",
+                             "School-age (5–12)", "Teen (13–17)"]
+            phases = []
+            for (a_start, a_end, default_cost), label in zip(_default_phases, _phase_labels):
+                cost = st.sidebar.number_input(
+                    f"{label} – monthly cost/child ($)",
+                    min_value=0, max_value=15_000,
+                    value=default_cost, step=50,
+                    key=f"cc_{a_start}_{a_end}",
                 )
-                ev_new_home_down = st.number_input(
-                    "Down payment ($)",
-                    min_value=0, max_value=int(ev_new_home_price),
-                    value=int(ev_def.new_home_down_payment) if (ev_def and ev_def.new_home_down_payment) else int(ev_new_home_price * 0.20),
-                    key=f"ev_hd_{i}",
+                phases.append(ChildcarePhase(age_start=a_start, age_end=a_end, monthly_cost=float(cost)))
+            childcare_profile = ChildcareProfile(phases=phases)
+        num_pets = st.sidebar.number_input(
+            "Pets", min_value=0, max_value=10,
+            value=int(d_lif.num_pets) if d_lif else 0,
+        )
+        annual_pet = 0.0
+        if num_pets > 0:
+            annual_pet = st.sidebar.number_input(
+                "Annual Pet Cost  (inflated yearly)", min_value=0, max_value=20_000,
+                value=int(d_lif.annual_pet_cost) if d_lif else 1_800, step=100,
+            )
+        medical = st.sidebar.number_input(
+            "Annual Medical OOP  (inflated yearly)", min_value=0, max_value=50_000,
+            value=int(d_lif.annual_medical_oop) if d_lif else 3_000, step=500,
+        )
+        vacation = st.sidebar.number_input(
+            "Annual Vacation  (inflated yearly)", min_value=0, max_value=100_000,
+            value=int(d_lif.annual_vacation) if d_lif else 5_000, step=1_000,
+        )
+        other_monthly = st.sidebar.number_input(
+            "Other Monthly  (inflated yearly)", min_value=0, max_value=10_000,
+            value=int(d_lif.monthly_other_recurring) if d_lif else 500, step=100,
+        )
+        _lif_base = d_lif if d_lif else LifestyleProfile()
+        lifestyle = dataclasses.replace(
+            _lif_base,
+            num_children=int(num_children),
+            monthly_childcare=float(monthly_childcare),
+            childcare_profile=childcare_profile,
+            num_pets=int(num_pets),
+            annual_pet_cost=float(annual_pet),
+            annual_medical_oop=float(medical),
+            annual_vacation=float(vacation),
+            monthly_other_recurring=float(other_monthly),
+        )
+
+
+    if section == "📊 Investments":
+        # ── Investments ──────────────────────────────────────────
+        st.sidebar.header("📊 Investments & Savings")
+        liquid_cash = st.sidebar.number_input(
+            "Current Liquid Cash  (current)", min_value=0, max_value=10_000_000,
+            value=int(d_inv.current_liquid_cash) if d_inv else 100_000, step=5_000,
+        )
+        retirement_bal = st.sidebar.number_input(
+            "Current Retirement Balance  (current)", min_value=0, max_value=10_000_000,
+            value=int(d_inv.current_retirement_balance) if d_inv else 0, step=5_000,
+        )
+        brokerage_bal = st.sidebar.number_input(
+            "Current Brokerage / Taxable Balance  (current)", min_value=0, max_value=10_000_000,
+            value=int(d_inv.current_brokerage_balance) if d_inv else 0, step=5_000,
+            help="Existing taxable investment accounts (separate from 401k/IRA/HSA).",
+        )
+        one_time = st.sidebar.number_input(
+            "Upcoming One-Time Expenses  (current)", min_value=0, max_value=1_000_000,
+            value=int(d_inv.one_time_upcoming_expenses) if d_inv else 0, step=5_000,
+            help="Wedding, car purchase, etc. Subtracted from investable cash.",
+        )
+        _401k_mode = st.sidebar.radio(
+            "401k contribution input mode",
+            ["$ amount", "% of salary"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        _IRS_401K_LIMIT = 30_500
+        if _401k_mode == "% of salary":
+            _k401_pct = st.sidebar.slider(
+                "Your 401k (% of gross salary)", 0.0, 30.0,
+                round(d_inv.annual_401k_contribution / float(gross) * 100, 1) if (d_inv and gross > 0) else 6.0,
+                0.5,
+                help=f"Will be capped at the IRS limit (${_IRS_401K_LIMIT:,}) automatically.",
+            )
+            k401 = min(float(gross) * _k401_pct / 100, _IRS_401K_LIMIT)
+            st.sidebar.caption(f"= ${k401:,.0f}/yr")
+        else:
+            k401 = st.sidebar.number_input(
+                "Your Annual 401k Contribution  (fixed)", min_value=0, max_value=_IRS_401K_LIMIT,
+                value=int(d_inv.annual_401k_contribution) if d_inv else 23_000, step=500,
+            )
+        partner_k401 = 0
+        if spouse > 0:
+            _pk401_mode = st.sidebar.radio(
+                "Partner 401k input mode",
+                ["$ amount", "% of salary"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            if _pk401_mode == "% of salary":
+                _pk401_pct = st.sidebar.slider(
+                    "Partner 401k (% of gross salary)", 0.0, 30.0,
+                    round(d_inv.partner_annual_401k_contribution / float(spouse) * 100, 1) if (d_inv and spouse > 0) else 6.0,
+                    0.5,
+                    help=f"Will be capped at the IRS limit (${_IRS_401K_LIMIT:,}) automatically.",
                 )
-                ev_new_home_rate = st.slider(
-                    "Mortgage rate (%)",
-                    2.0, 12.0,
-                    float(ev_def.new_home_interest_rate * 100) if (ev_def and ev_def.new_home_interest_rate) else 6.5,
-                    0.125,
-                    key=f"ev_hr_{i}",
+                partner_k401 = min(float(spouse) * _pk401_pct / 100, _IRS_401K_LIMIT)
+                st.sidebar.caption(f"= ${partner_k401:,.0f}/yr")
+            else:
+                partner_k401 = st.sidebar.number_input(
+                    "Partner Annual 401k Contribution  (fixed)", min_value=0, max_value=_IRS_401K_LIMIT,
+                    value=int(d_inv.partner_annual_401k_contribution) if d_inv else 0, step=500,
+                    help="Partner's independent 401k — each person has their own IRS limit.",
                 )
-                ev_sell_current = st.checkbox(
-                    "Sell current home (add equity to cash)",
-                    value=ev_def.sell_current_home if ev_def else True,
-                    key=f"ev_sell_{i}",
+        hsa = st.sidebar.number_input(
+            "Annual HSA Contribution  (fixed)", min_value=0, max_value=8_300,
+            value=int(d_inv.annual_hsa_contribution) if d_inv else 4_150, step=100,
+        )
+        c529 = st.sidebar.number_input(
+            "Annual 529 Contribution per Child  (fixed)", min_value=0, max_value=50_000,
+            value=int(d_inv.annual_529_contribution) if d_inv else 0, step=500,
+        )
+
+        # ── Employer 401k Match ─────────────────────────────────
+        st.sidebar.subheader("🏦 Employer 401k Match")
+        d_em = d_inv.employer_match if d_inv else None
+        has_match = st.sidebar.toggle("Employer offers 401k match", value=d_em is not None)
+        employer_match = None
+        if has_match:
+            with st.sidebar.expander("Match formula", expanded=True):
+                st.caption(
+                    "Build your match formula tier by tier. "
+                    "Example: 100% on first 3% + 50% on next 2% = two tiers."
                 )
-                ev_buyer_closing = st.slider(
-                    "Buyer closing costs (% of price)",
-                    0.0, 5.0,
-                    float(ev_def.buyer_closing_cost_rate * 100) if ev_def else 2.0,
-                    0.25,
-                    key=f"ev_bcc_{i}",
-                    help="Title, lender fees, escrow, transfer tax — typically 1.5–3%",
-                ) / 100
-                ev_seller_closing = 0.06
-                if ev_sell_current:
-                    ev_seller_closing = st.slider(
-                        "Seller closing costs (% of sale price)",
-                        0.0, 10.0,
-                        float(ev_def.seller_closing_cost_rate * 100) if ev_def else 6.0,
-                        0.25,
-                        key=f"ev_scc_{i}",
-                        help="Agent commissions, transfer tax — typically 5–7%",
+                n_tiers = st.number_input(
+                    "Number of tiers", min_value=0, max_value=5,
+                    value=len(d_em.tiers) if d_em else 1, step=1,
+                    help="Most plans have 1–2 tiers. 0 = profit sharing only.",
+                )
+                tiers = []
+                existing_tiers = d_em.tiers if d_em else []
+                for ti in range(int(n_tiers)):
+                    prev = existing_tiers[ti] if ti < len(existing_tiers) else None
+                    tc1, tc2 = st.columns(2)
+                    mp = tc1.number_input(
+                        f"Tier {ti+1}: match %", 0, 200,
+                        int((prev.match_pct if prev else (1.0 if ti == 0 else 0.5)) * 100),
+                        key=f"em_mp_{ti}",
+                        help="Employer matches this % of your contribution in this tier.",
                     ) / 100
+                    up = tc2.number_input(
+                        f"Tier {ti+1}: up to % salary", 1, 25,
+                        int((prev.up_to_pct_of_salary if prev else 0.06) * 100),
+                        key=f"em_up_{ti}",
+                        help="Employee contribution eligible for this tier (% of gross salary).",
+                    ) / 100
+                    tiers.append(MatchTier(match_pct=mp, up_to_pct_of_salary=up))
+                em_cap = st.number_input(
+                    "Annual match cap  (fixed)", min_value=0, max_value=100_000,
+                    value=int(d_em.annual_cap) if (d_em and d_em.annual_cap) else 0, step=500,
+                    help="Absolute dollar ceiling on total employer match per year.",
+                )
+                em_vest = st.number_input(
+                    "Vesting (years, 0 = immediate)", min_value=0, max_value=10,
+                    value=int(d_em.vesting_years) if d_em else 0,
+                    help="Cliff vesting: match forfeited if you leave before this year.",
+                )
+                em_ps = st.number_input(
+                    "Profit sharing per year  (fixed)", min_value=0, max_value=100_000,
+                    value=int(d_em.profit_sharing_annual) if d_em else 0, step=500,
+                    help="Flat employer contribution regardless of your own contribution.",
+                )
+            employer_match = EmployerMatch(
+                tiers=tiers,
+                annual_cap=float(em_cap) if em_cap > 0 else None,
+                vesting_years=int(em_vest),
+                profit_sharing_annual=float(em_ps),
+            )
 
-            _ev_base = ev_def if ev_def else TimelineEvent(year=int(yr), description=desc)
-            events.append(dataclasses.replace(
-                _ev_base,
-                year=int(yr),
-                description=desc,
-                marriage=ev_marriage,
-                new_child=ev_child,
-                new_pet=ev_pet,
-                stop_working=ev_stop,
-                resume_working=ev_resume,
-                partner_stop_working=ev_partner_stop,
-                partner_resume_working=ev_partner_resume,
-                start_parent_care=ev_start_care,
-                stop_parent_care=ev_stop_care,
-                child_birth_year_override=int(ev_birth_yr_override) if ev_birth_yr_override != 0 else None,
-                income_change=float(ev_income) if ev_income > 0 else None,
-                partner_income_change=float(ev_partner_income) if ev_partner_income > 0 else None,
-                extra_one_time_expense=float(ev_expense),
-                extra_one_time_income=float(ev_bonus),
-                buy_home=ev_buy_home,
-                new_home_price=float(ev_new_home_price) if ev_new_home_price else None,
-                new_home_down_payment=float(ev_new_home_down) if ev_new_home_down else None,
-                new_home_interest_rate=float(ev_new_home_rate) / 100 if ev_new_home_rate else None,
-                sell_current_home=ev_sell_current,
-                buyer_closing_cost_rate=ev_buyer_closing,
-                seller_closing_cost_rate=ev_seller_closing,
-            ))
+        investments = InvestmentProfile(
+            current_liquid_cash=float(liquid_cash),
+            current_retirement_balance=float(retirement_bal),
+            current_brokerage_balance=float(brokerage_bal),
+            one_time_upcoming_expenses=float(one_time),
+            annual_401k_contribution=float(k401),
+            partner_annual_401k_contribution=float(partner_k401),
+            annual_hsa_contribution=float(hsa),
+            annual_529_contribution=float(c529),
+            annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
+            annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
+            annual_salary_growth_rate=float(st.sidebar.slider("Your Salary Growth (%)", 0.0, 15.0,
+                float(d_inv.annual_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100,
+            partner_salary_growth_rate=float(st.sidebar.slider("Partner Salary Growth (%)", 0.0, 15.0,
+                float(d_inv.partner_salary_growth_rate * 100) if d_inv else 4.0, 0.5)) / 100
+                if spouse > 0 else 0.04,
+            annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
+            auto_invest_surplus=st.sidebar.toggle(
+                "Auto-Invest Surplus",
+                value=d_inv.auto_invest_surplus if d_inv else True,
+                help="ON: surplus swept into brokerage each year (earns market return). "
+                     "OFF: surplus stays in cash (0% return).",
+            ),
+            cash_buffer_months=st.sidebar.slider(
+                "Cash Buffer (months of expenses)",
+                min_value=0.0, max_value=24.0,
+                value=float(d_inv.cash_buffer_months) if d_inv else 0.0,
+                step=1.0,
+                help="Keep this many months of living expenses as liquid cash (0% return) "
+                     "before sweeping surplus to brokerage. Reduces liquidity risk in bad years. "
+                     "Set to 0 to invest all surplus (default).",
+            ),
+            employer_match=employer_match,
+        )
+        # Preserve fields not exposed in sidebar (partner_salary_growth_rate when solo,
+        # annual_roth_ira_contribution, annual_brokerage_contribution)
+        _inv_base = d_inv if d_inv else InvestmentProfile()
+        investments = dataclasses.replace(
+            investments,
+            annual_roth_ira_contribution=_inv_base.annual_roth_ira_contribution,
+            annual_brokerage_contribution=_inv_base.annual_brokerage_contribution,
+            # partner_salary_growth_rate: sidebar only shows it when spouse > 0;
+            # preserve the loaded value when spouse income is 0 at sidebar time
+            partner_salary_growth_rate=(
+                investments.partner_salary_growth_rate
+                if spouse > 0 else _inv_base.partner_salary_growth_rate
+            ),
+        )
+
+
+    if section == "🎯 Strategies":
+        # ── Strategies ───────────────────────────────────────────
+        st.sidebar.header("🎯 Tax Strategies")
+        _str_base = d_str if d_str else StrategyToggles()
+        strategies = dataclasses.replace(
+            _str_base,
+            maximize_hsa=st.sidebar.toggle("Maximize HSA", value=d_str.maximize_hsa if d_str else True),
+            maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
+            use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
+            use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
+        )
+
+
+    if section == "🚗 Car":
+        # ── Car ─────────────────────────────────────────────────
+        st.sidebar.header("🚗 Car")
+        d_car = defaults.car if defaults else None
+        has_car = st.sidebar.toggle("Model car purchases", value=d_car is not None)
+        car = None
+        if has_car:
+            car = CarProfile(
+                car_price=st.sidebar.number_input(
+                    "Car price  (inflated yearly)", min_value=0, max_value=200_000,
+                    value=int(d_car.car_price) if d_car else 25_000, step=1_000,
+                ),
+                down_payment=st.sidebar.number_input(
+                    "Down payment  (current)", min_value=0, max_value=100_000,
+                    value=int(d_car.down_payment) if d_car else 5_000, step=500,
+                ),
+                loan_rate=st.sidebar.slider(
+                    "Loan rate (%)", 0.0, 20.0,
+                    float(d_car.loan_rate * 100) if d_car else 6.5, 0.25,
+                ) / 100,
+                loan_term_years=st.sidebar.selectbox(
+                    "Loan term (years)", [3, 4, 5, 6, 7],
+                    index=[3,4,5,6,7].index(d_car.loan_term_years) if d_car else 2,
+                ),
+                replace_every_years=st.sidebar.selectbox(
+                    "Replace every (years)", [5, 7, 8, 10, 12, 15],
+                    index=[5,7,8,10,12,15].index(d_car.replace_every_years) if d_car else 3,
+                ),
+                residual_value=st.sidebar.number_input(
+                    "Sell old car for  (inflated yearly)", min_value=0, max_value=30_000,
+                    value=int(d_car.residual_value) if d_car else 5_000, step=500,
+                    help="Amount received when selling the old car if no child is old enough to receive it.",
+                ),
+                hand_down_age=st.sidebar.number_input(
+                    "Hand-down age (child)", min_value=14, max_value=25,
+                    value=int(d_car.hand_down_age) if d_car else 16, step=1,
+                    help="Minimum child age to receive the handed-down car instead of selling it.",
+                ),
+                num_cars=st.sidebar.selectbox(
+                    "Number of cars", [1, 2, 3],
+                    index=(d_car.num_cars - 1) if d_car else 0,
+                ),
+            )
+
+
+    if section == "🏢 Business":
+        # ── Business ─────────────────────────────────────────────
+        st.sidebar.header("🏢 Business")
+        d_biz = defaults.business if defaults else None
+        has_business = st.sidebar.toggle("Model business ownership", value=d_biz is not None)
+        business = None
+        if has_business:
+            with st.sidebar.expander("Business parameters", expanded=True):
+                biz_revenue = st.number_input(
+                    "Annual gross revenue  (own rate)", min_value=0, max_value=10_000_000,
+                    value=int(d_biz.annual_revenue) if d_biz else 200_000, step=5_000,
+                )
+                biz_expense_ratio = st.slider(
+                    "Operating expense ratio (%)", 0.0, 95.0,
+                    float(d_biz.expense_ratio * 100) if d_biz else 60.0, 1.0,
+                    help="Operating costs as % of revenue. Net profit = revenue × (1 − ratio).",
+                ) / 100
+                biz_growth = st.slider(
+                    "Revenue growth rate (%/yr)", 0.0, 30.0,
+                    float(d_biz.revenue_growth_rate * 100) if d_biz else 5.0, 0.5,
+                ) / 100
+                biz_start = st.number_input(
+                    "Start year", min_value=1, max_value=50,
+                    value=int(d_biz.start_year) if d_biz else 1,
+                    help="Projection year the business starts generating income.",
+                )
+                biz_invest = st.number_input(
+                    "Initial investment  (current)", min_value=0, max_value=5_000_000,
+                    value=int(d_biz.initial_investment) if d_biz else 0, step=5_000,
+                    help="One-time acquisition/startup cost drawn from brokerage in start year.",
+                )
+                biz_equity_mult = st.slider(
+                    "Equity multiple", 0.0, 10.0,
+                    float(d_biz.equity_multiple) if d_biz else 3.0, 0.5,
+                    help="Business value = net profit × this. Set 0 to exclude from net worth.",
+                )
+                biz_sale_yr = st.number_input(
+                    "Sale year (0 = never sell)", min_value=0, max_value=50,
+                    value=int(d_biz.sale_year) if (d_biz and d_biz.sale_year) else 0,
+                    help="Sell business in this year; equity proceeds go to brokerage.",
+                )
+                st.markdown("**Tax & Retirement**")
+                biz_qbi = st.toggle(
+                    "QBI deduction (20% pass-through)",
+                    value=d_biz.use_qbi_deduction if d_biz else True,
+                    help="20% deduction on qualified business income for pass-through entities.",
+                )
+                biz_health = st.number_input(
+                    "Self-employed health insurance  (fixed)", min_value=0, max_value=50_000,
+                    value=int(d_biz.self_employed_health_insurance) if d_biz else 0, step=500,
+                    help="Annual premium — 100% deductible from AGI for self-employed.",
+                )
+                biz_solo_k = st.number_input(
+                    "Solo 401k contribution  (fixed)", min_value=0, max_value=69_000,
+                    value=int(d_biz.solo_401k_contribution) if d_biz else 0, step=500,
+                    help="Owner solo 401k (up to $69k IRS limit). Tracked in retirement balance.",
+                )
+                biz_sep = st.number_input(
+                    "SEP-IRA contribution  (fixed)", min_value=0, max_value=69_000,
+                    value=int(d_biz.sep_ira_contribution) if d_biz else 0, step=500,
+                    help="SEP-IRA (up to 25% of net self-employment income).",
+                )
+                biz_ownership = st.slider(
+                    "Your ownership share (%)", 1.0, 100.0,
+                    float((d_biz.ownership_pct if d_biz else 1.0) * 100), 1.0,
+                    help="Your % stake in the business. 100% = sole owner. "
+                         "50% = equal partnership. Profit, equity, and taxes all scale by this.",
+                ) / 100
+            _biz_base = d_biz if d_biz else BusinessProfile()
+            business = dataclasses.replace(
+                _biz_base,
+                annual_revenue=float(biz_revenue),
+                expense_ratio=float(biz_expense_ratio),
+                revenue_growth_rate=float(biz_growth),
+                start_year=int(biz_start),
+                initial_investment=float(biz_invest),
+                equity_multiple=float(biz_equity_mult),
+                sale_year=int(biz_sale_yr) if biz_sale_yr > 0 else None,
+                use_qbi_deduction=bool(biz_qbi),
+                self_employed_health_insurance=float(biz_health),
+                solo_401k_contribution=float(biz_solo_k),
+                sep_ira_contribution=float(biz_sep),
+                ownership_pct=float(biz_ownership),
+            )
+
+
+    if section == "🗓️ Events":
+        # ── Timeline Events ──────────────────────────────────────
+        st.sidebar.header("🗓️ Timeline Events")
+        st.sidebar.caption("Add life events that change your financial picture.")
+
+        # Seed defaults from loaded plan so YAML events appear in the UI
+        loaded_events = defaults.timeline_events if defaults else []
+        default_n_events = len(loaded_events)
+
+        n_events = st.sidebar.number_input(
+            "Number of events", min_value=0, max_value=15, value=default_n_events
+        )
+        events: list[TimelineEvent] = []
+        for i in range(int(n_events)):
+            # Pull defaults for this slot from the loaded plan (if available)
+            ev_def = loaded_events[i] if i < len(loaded_events) else None
+
+            with st.sidebar.expander(
+                f"Event {i+1}" + (f": {ev_def.description}" if ev_def and ev_def.description else ""),
+                expanded=(i == 0),
+            ):
+                yr = st.number_input(
+                    "Year", min_value=1, max_value=50,
+                    value=int(ev_def.year) if ev_def else 1,
+                    key=f"ev_yr_{i}",
+                )
+                desc = st.text_input(
+                    "Description",
+                    value=ev_def.description if ev_def else "",
+                    key=f"ev_desc_{i}",
+                )
+                ev_marriage = st.checkbox(
+                    "Marriage (→ MFJ filing)",
+                    value=ev_def.marriage if ev_def else False,
+                    key=f"ev_marry_{i}",
+                )
+                ev_child = st.checkbox(
+                    "New child",
+                    value=ev_def.new_child if ev_def else False,
+                    key=f"ev_child_{i}",
+                )
+                ev_pet = st.checkbox(
+                    "New pet",
+                    value=ev_def.new_pet if ev_def else False,
+                    key=f"ev_pet_{i}",
+                )
+
+                st.markdown("**Work changes**")
+                ev_stop = st.checkbox(
+                    "You stop working",
+                    value=ev_def.stop_working if ev_def else False,
+                    key=f"ev_stop_{i}",
+                )
+                ev_resume = st.checkbox(
+                    "You resume working",
+                    value=ev_def.resume_working if ev_def else False,
+                    key=f"ev_resume_{i}",
+                )
+                ev_partner_stop = st.checkbox(
+                    "Partner stops working",
+                    value=ev_def.partner_stop_working if ev_def else False,
+                    key=f"ev_pstop_{i}",
+                )
+                ev_partner_resume = st.checkbox(
+                    "Partner resumes working",
+                    value=ev_def.partner_resume_working if ev_def else False,
+                    key=f"ev_presume_{i}",
+                )
+
+                ev_start_care = st.checkbox(
+                    "Start parent care",
+                    value=ev_def.start_parent_care if ev_def else False,
+                    key=f"ev_startcare_{i}",
+                    help="Activates annual_parent_care_cost from Lifestyle settings.",
+                )
+                ev_stop_care = st.checkbox(
+                    "Stop parent care",
+                    value=ev_def.stop_parent_care if ev_def else False,
+                    key=f"ev_stopcare_{i}",
+                )
+                ev_birth_yr_override = st.number_input(
+                    "Child birth year override (0 = this year)",
+                    min_value=-30, max_value=0,
+                    value=int(ev_def.child_birth_year_override) if (ev_def and ev_def.child_birth_year_override is not None) else 0,
+                    key=f"ev_birthyr_{i}",
+                    help="Set negative to indicate a child already born before the projection. "
+                         "0 means born in this event's year (default).",
+                )
+
+                ev_income = st.number_input(
+                    "Your new gross income (0 = no change)",
+                    min_value=0, max_value=5_000_000,
+                    value=int(ev_def.income_change) if (ev_def and ev_def.income_change) else 0,
+                    key=f"ev_inc_{i}",
+                )
+                ev_partner_income = st.number_input(
+                    "Partner new gross income (0 = no change)",
+                    min_value=0, max_value=5_000_000,
+                    value=int(ev_def.partner_income_change) if (ev_def and ev_def.partner_income_change) else 0,
+                    key=f"ev_pinc_{i}",
+                )
+                ev_expense = st.number_input(
+                    "One-time expense ($)",
+                    min_value=0, max_value=1_000_000,
+                    value=int(ev_def.extra_one_time_expense) if ev_def else 0,
+                    key=f"ev_exp_{i}",
+                )
+                ev_bonus = st.number_input(
+                    "One-time income ($)",
+                    min_value=0, max_value=1_000_000,
+                    value=int(ev_def.extra_one_time_income) if ev_def else 0,
+                    key=f"ev_bonus_{i}",
+                )
+                # Home purchase fields — shown only when buy_home is set in YAML
+                # or if the user explicitly toggles it on
+                ev_buy_home = st.checkbox(
+                    "Buy home",
+                    value=ev_def.buy_home if ev_def else False,
+                    key=f"ev_buyhome_{i}",
+                )
+                ev_new_home_price = None
+                ev_new_home_down = None
+                ev_new_home_rate = None
+                ev_sell_current = True
+                ev_buyer_closing = 0.02   # default; only overridden when ev_buy_home=True
+                ev_seller_closing = 0.06  # default; only overridden when ev_buy_home=True
+                if ev_buy_home:
+                    ev_new_home_price = st.number_input(
+                        "New home price ($)",
+                        min_value=0, max_value=10_000_000,
+                        value=int(ev_def.new_home_price) if (ev_def and ev_def.new_home_price) else 500_000,
+                        key=f"ev_hp_{i}",
+                    )
+                    ev_new_home_down = st.number_input(
+                        "Down payment  (current)",
+                        min_value=0, max_value=int(ev_new_home_price),
+                        value=int(ev_def.new_home_down_payment) if (ev_def and ev_def.new_home_down_payment) else int(ev_new_home_price * 0.20),
+                        key=f"ev_hd_{i}",
+                    )
+                    ev_new_home_rate = st.slider(
+                        "Mortgage rate (%)",
+                        2.0, 12.0,
+                        float(ev_def.new_home_interest_rate * 100) if (ev_def and ev_def.new_home_interest_rate) else 6.5,
+                        0.125,
+                        key=f"ev_hr_{i}",
+                    )
+                    ev_sell_current = st.checkbox(
+                        "Sell current home (add equity to cash)",
+                        value=ev_def.sell_current_home if ev_def else True,
+                        key=f"ev_sell_{i}",
+                    )
+                    ev_buyer_closing = st.slider(
+                        "Buyer closing costs (% of price)",
+                        0.0, 5.0,
+                        float(ev_def.buyer_closing_cost_rate * 100) if ev_def else 2.0,
+                        0.25,
+                        key=f"ev_bcc_{i}",
+                        help="Title, lender fees, escrow, transfer tax — typically 1.5–3%",
+                    ) / 100
+                    ev_seller_closing = 0.06
+                    if ev_sell_current:
+                        ev_seller_closing = st.slider(
+                            "Seller closing costs (% of sale price)",
+                            0.0, 10.0,
+                            float(ev_def.seller_closing_cost_rate * 100) if ev_def else 6.0,
+                            0.25,
+                            key=f"ev_scc_{i}",
+                            help="Agent commissions, transfer tax — typically 5–7%",
+                        ) / 100
+
+                _ev_base = ev_def if ev_def else TimelineEvent(year=int(yr), description=desc)
+                events.append(dataclasses.replace(
+                    _ev_base,
+                    year=int(yr),
+                    description=desc,
+                    marriage=ev_marriage,
+                    new_child=ev_child,
+                    new_pet=ev_pet,
+                    stop_working=ev_stop,
+                    resume_working=ev_resume,
+                    partner_stop_working=ev_partner_stop,
+                    partner_resume_working=ev_partner_resume,
+                    start_parent_care=ev_start_care,
+                    stop_parent_care=ev_stop_care,
+                    child_birth_year_override=int(ev_birth_yr_override) if ev_birth_yr_override != 0 else None,
+                    income_change=float(ev_income) if ev_income > 0 else None,
+                    partner_income_change=float(ev_partner_income) if ev_partner_income > 0 else None,
+                    extra_one_time_expense=float(ev_expense),
+                    extra_one_time_income=float(ev_bonus),
+                    buy_home=ev_buy_home,
+                    new_home_price=float(ev_new_home_price) if ev_new_home_price else None,
+                    new_home_down_payment=float(ev_new_home_down) if ev_new_home_down else None,
+                    new_home_interest_rate=float(ev_new_home_rate) / 100 if ev_new_home_rate else None,
+                    sell_current_home=ev_sell_current,
+                    buyer_closing_cost_rate=ev_buyer_closing,
+                    seller_closing_cost_rate=ev_seller_closing,
+                ))
+
 
     projection_years = st.sidebar.slider(
         "Projection Horizon (Years)", 5, 40,
@@ -1116,7 +1295,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 yaxis="y1",
             ))
             fig_cf.add_trace(go.Scatter(
-                x=df["Year"], y=df["Brokerage"], name="Liquid Assets (cash + brokerage)",
+                x=df["Year"], y=df["Brokerage"], name="Liquid Assets (brokerage + cash, excl. retirement accounts)",
                 line=dict(color="#f59e0b", width=2, dash="dot"),
                 yaxis="y2",
                 fill="tozeroy",
@@ -1124,18 +1303,15 @@ def render_dashboard(plan: FinancialPlan) -> None:
             ))
 
             # ── Total investable assets + retirement target ─────────────
-            # "Total investable assets" = retirement + brokerage + HSA.
-            # This is the SAME pool compute_retirement_readiness() projects
-            # against, so the line and the target are always comparable.
-            # Showing just retirement_balance here would conflict with the
-            # Retirement Readiness panel (single source of truth rule).
+            # Total investable = retirement + HSA + brokerage + cash (all accessible funds).
             total_investable = [
                 s.retirement_balance + s.hsa_balance + s.brokerage_balance
+                + s.uninvested_cash + s.cash_buffer
                 for s in snapshots
             ]
             fig_cf.add_trace(go.Scatter(
                 x=df["Year"], y=total_investable,
-                name="Total Investable Assets",
+                name="Total Investable Assets (401k + HSA + brokerage + cash)",
                 line=dict(color="#818cf8", width=2, dash="dashdot"),
                 yaxis="y2",
             ))
@@ -1360,6 +1536,11 @@ def render_dashboard(plan: FinancialPlan) -> None:
         st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
         st.markdown(
             "Runs N simulations with randomized annual shocks. "
+            "**p10 / p50 / p90** = the 10th, 50th (median), and 90th percentile outcomes — "
+            "p10 is a bad-luck scenario, p50 is the middle outcome, p90 is a good-luck scenario. "
+            "**Liquidity risk** = probability of brokerage + cash going negative in a given year "
+            "(having to liquidate retirement accounts or take on debt). "
+
             "**Historical mode** (recommended): market returns sampled from 100 years of S&P 500 "
             "actuals (1926–2025) — preserving fat tails, crash years, and boom years as they "
             "really happened. "
@@ -1369,18 +1550,25 @@ def render_dashboard(plan: FinancialPlan) -> None:
 
         # ── Simulation parameters ────────────────────────────────
         with st.expander("⚙️ Simulation Parameters", expanded=False):
-            use_hist = st.toggle(
-                "Use Historical S&P 500 Returns (1926–2025)",
+            col_t1, col_t2 = st.columns(2)
+            use_hist = col_t1.toggle(
+                "Historical S&P 500 returns",
                 value=True,
-                help="ON (recommended): each simulation year draws a return sampled at random "
-                     "from 100 years of actual S&P 500 history — capturing fat tails, -43% crashes, "
-                     "and +54% booms as they really occurred. "
-                     "OFF: draws from a normal distribution with the std dev below.",
+                help="ON (recommended): bootstrap from 100 years of actual S&P 500 data "
+                     "(1926–2025), capturing fat tails, -43% crashes, and +54% booms. "
+                     "OFF: draws from a normal distribution.",
+            )
+            use_hist_inf = col_t2.toggle(
+                "Historical US inflation",
+                value=True,
+                help="ON (recommended): bootstrap from 96 years of actual CPI data "
+                     "(1929–2024), including deflation, 1970s stagflation (13.3%), "
+                     "and 2021–22 surge (7%). OFF: draws from a normal distribution.",
             )
             mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
             n_sims = mc_col1.number_input(
                 "Simulations", min_value=100, max_value=10_000,
-                value=1_000, step=100,
+                value=5_000, step=100,
                 help="More simulations = smoother percentile bands but slower.",
             )
             mkt_std = mc_col2.slider(
@@ -1391,7 +1579,9 @@ def render_dashboard(plan: FinancialPlan) -> None:
             ) / 100
             inf_std = mc_col3.slider(
                 "Inflation Std Dev (%)", 0.0, 5.0, 1.5, 0.25,
-                help="Year-to-year variation in inflation rate.",
+                disabled=use_hist_inf,
+                help="Only used when historical inflation is OFF. "
+                     "Historical CPI std dev is ~3.9%.",
             ) / 100
             sg_std = mc_col4.slider(
                 "Salary Growth Std Dev (%)", 0.0, 10.0, 2.0, 0.5,
@@ -1404,6 +1594,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
                 n_simulations=int(n_sims),
                 seed=42 if mc_seed else None,
                 use_historical_returns=use_hist,
+                use_historical_inflation=use_hist_inf,
                 market_return_std=mkt_std,
                 inflation_std=inf_std,
                 salary_growth_std=sg_std,
@@ -1417,7 +1608,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
         worst_liq_prob = max(mc.prob_negative_liquid)
         worst_liq_yr   = mc.years[mc.prob_negative_liquid.index(worst_liq_prob)]
         mc4.metric(
-            "Peak Liquidity Risk",
+            "Peak Liquidity Risk (worst-year chance of running out of liquid cash)",
             f"{worst_liq_prob:.1%}",
             delta=f"worst in year {worst_liq_yr}",
             delta_color="inverse",
@@ -1456,7 +1647,11 @@ def render_dashboard(plan: FinancialPlan) -> None:
             x=[s.year for s in snapshots], y=[s.net_worth for s in snapshots],
             name="Deterministic", line=dict(color="#f59e0b", width=2, dash="dash"),
         ))
-        mode_label = "Historical Returns" if use_hist else "Normal Distribution"
+        hist_parts = []
+        if mc.use_historical_returns:   hist_parts.append("hist. returns")
+        if mc.use_historical_inflation: hist_parts.append("hist. inflation")
+        mode_label = (", ".join(hist_parts) if hist_parts
+                      else f"Normal(σ_mkt={mc.market_return_std:.0%}, σ_inf={mc.inflation_std:.0%})")
         fig_mc.update_layout(
             title=f"Net Worth Distribution — {n_sims:,} Simulations ({mode_label})",
             **PLOTLY_DARK, height=460, yaxis_title="Net Worth ($)", xaxis_title="Year",

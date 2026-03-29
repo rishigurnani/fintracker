@@ -297,7 +297,7 @@ All fields are optional unless noted. Multiple events can fire in the same year.
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v --tb=short
 ```
 
 The test suite covers all financial logic with explicit regression tests for every known bug. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full list of documented regressions and rules for adding new tests.

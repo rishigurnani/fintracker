@@ -8,7 +8,8 @@ Tests for the five new feature groups:
 """
 import pytest
 from fintracker.models import (
-    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile,
+    EmployerMatch, KidCarProfile, MatchTier, CollegeProfile,
     FilingStatus, FinancialPlan, HousingProfile,
     IncomeProfile, InvestmentProfile, LifestyleProfile, RetirementProfile,
     State, StrategyToggles, TimelineEvent,
@@ -2217,3 +2218,740 @@ class TestBusinessProfile:
         from fintracker.config import _plan_to_dict, _dict_to_plan
         plan2 = _dict_to_plan(_plan_to_dict(self._base(None)))
         assert plan2.business is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Employer 401k Match
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEmployerMatch:
+    """
+    Tests for EmployerMatch / MatchTier — employer 401k matching logic.
+
+    The employer match flows directly into retirement_balance each year with no
+    impact on breathing room (it's free money from the employer, not from
+    the employee's income). Vesting, annual caps, and tiered structures are all
+    supported.
+    """
+
+    def _base(self, em=None, k401=15_000, salary=100_000):
+        return FinancialPlan(
+            income=IncomeProfile(salary, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=0, current_retirement_balance=0,
+                annual_401k_contribution=k401,
+                annual_market_return=0.0, annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+                employer_match=em,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=10,
+        )
+
+    # ── Baseline ────────────────────────────────────────────────────────────
+
+    def test_no_match_retirement_equals_employee_contrib(self):
+        """Without an employer match, retirement balance = employee contribution only."""
+        s1 = ProjectionEngine(self._base()).run_deterministic()[0]
+        assert abs(s1.retirement_balance - 15_000) < 1.0
+
+    def test_none_match_is_default(self):
+        """Default InvestmentProfile has no employer match."""
+        assert InvestmentProfile().employer_match is None
+
+    # ── Match formulas ───────────────────────────────────────────────────────
+
+    def test_simple_match_50pct_on_6pct(self):
+        """50% match on first 6% of $100k salary = $3,000 employer contribution."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=0.50, up_to_pct_of_salary=0.06)])
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        # employee $15k + employer $3k = $18k
+        assert abs(s1.retirement_balance - 18_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    def test_dollar_for_dollar_on_3pct(self):
+        """100% match on first 3% of $100k = $3,000."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.03)])
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        assert abs(s1.retirement_balance - 18_000) < 1.0
+
+    def test_tiered_match(self):
+        """100% on first 3% ($3k) + 50% on next 2% ($1k) = $4k total match."""
+        em = EmployerMatch(tiers=[
+            MatchTier(match_pct=1.00, up_to_pct_of_salary=0.03),
+            MatchTier(match_pct=0.50, up_to_pct_of_salary=0.02),
+        ])
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        # employee $15k + employer $4k = $19k
+        assert abs(s1.retirement_balance - 19_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    def test_match_capped_at_employee_contribution(self):
+        """Match cannot exceed what the employee actually contributes per tier."""
+        # Employee contributes $2k, tier ceiling = 6% × $100k = $6k
+        # match = min($2k, $6k) × 100% = $2k
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.06)])
+        s1 = ProjectionEngine(self._base(em, k401=2_000)).run_deterministic()[0]
+        assert abs(s1.retirement_balance - 4_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    # ── Annual cap ───────────────────────────────────────────────────────────
+
+    def test_annual_cap_limits_total_match(self):
+        """annual_cap is an absolute ceiling on total employer match per year."""
+        # Without cap: 100% match on 10% of $100k = $10k
+        # With $5k cap: match is $5k
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.10)],
+                           annual_cap=5_000)
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        assert abs(s1.retirement_balance - 20_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    def test_no_cap_means_full_match(self):
+        """Without a cap, full match is paid even if large."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.10)])
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        # 100% × 10% × $100k = $10k match → $25k total
+        assert abs(s1.retirement_balance - 25_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    # ── Vesting ──────────────────────────────────────────────────────────────
+
+    def test_cliff_vesting_withholds_match_before_vest_date(self):
+        """With vesting_years=3, no match is paid in years 1 and 2."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.06)],
+                           vesting_years=3)
+        snaps = ProjectionEngine(self._base(em)).run_deterministic()
+        assert abs(snaps[0].retirement_balance - 15_000) < 1.0, "yr1: no match expected"
+        assert abs(snaps[1].retirement_balance - 30_000) < 1.0, "yr2: no match expected"
+
+    def test_cliff_vesting_match_begins_at_vest_year(self):
+        """Match starts in projection_year == vesting_years."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.06)],
+                           vesting_years=3)
+        snaps = ProjectionEngine(self._base(em)).run_deterministic()
+        # yr3: employee $15k + employer $6k = $21k on top of prior $30k
+        assert snaps[2].retirement_balance > 45_000,             f"yr3 should include match, got {snaps[2].retirement_balance:.0f}"
+
+    def test_immediate_vesting_pays_from_year_1(self):
+        """vesting_years=0 means match is paid starting in year 1."""
+        em = EmployerMatch(tiers=[MatchTier(match_pct=1.00, up_to_pct_of_salary=0.03)],
+                           vesting_years=0)
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        assert s1.retirement_balance > 15_000  # has employer contribution
+
+    # ── Profit sharing ───────────────────────────────────────────────────────
+
+    def test_profit_sharing_no_tiers(self):
+        """Profit sharing pays a flat amount regardless of employee contribution."""
+        em = EmployerMatch(tiers=[], profit_sharing_annual=3_000)
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        assert abs(s1.retirement_balance - 18_000) < 1.0
+
+    def test_profit_sharing_combined_with_tier_match(self):
+        """Profit sharing stacks on top of tier match."""
+        em = EmployerMatch(
+            tiers=[MatchTier(match_pct=0.50, up_to_pct_of_salary=0.06)],
+            profit_sharing_annual=2_000,
+        )
+        s1 = ProjectionEngine(self._base(em)).run_deterministic()[0]
+        # 50% × 6% × $100k = $3k tier + $2k profit sharing = $5k employer
+        assert abs(s1.retirement_balance - 20_000) < 1.0, f"got {s1.retirement_balance:.0f}"
+
+    # ── Config round-trip ────────────────────────────────────────────────────
+
+    def test_config_roundtrip_preserves_all_fields(self):
+        """All EmployerMatch and MatchTier fields must survive YAML round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        em = EmployerMatch(
+            tiers=[
+                MatchTier(match_pct=1.00, up_to_pct_of_salary=0.03),
+                MatchTier(match_pct=0.50, up_to_pct_of_salary=0.02),
+            ],
+            annual_cap=8_000,
+            vesting_years=2,
+            profit_sharing_annual=1_500,
+        )
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(em)))
+        em2 = plan2.investments.employer_match
+        assert em2 is not None
+        assert len(em2.tiers) == 2
+        assert em2.tiers[0].match_pct == 1.00
+        assert em2.tiers[0].up_to_pct_of_salary == 0.03
+        assert em2.tiers[1].match_pct == 0.50
+        assert em2.tiers[1].up_to_pct_of_salary == 0.02
+        assert em2.annual_cap == 8_000
+        assert em2.vesting_years == 2
+        assert em2.profit_sharing_annual == 1_500
+
+    def test_none_match_roundtrips_as_none(self):
+        """Plans with no employer match must not gain one on config round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(None)))
+        assert plan2.investments.employer_match is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Childcare Profile — age-bracketed costs
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestChildcareProfile:
+    """
+    Tests for ChildcareProfile — age-bracketed childcare cost schedule.
+
+    Replaces the flat monthly_childcare rate with realistic age-based costs.
+    The flat rate is retained for backward compatibility (used when
+    childcare_profile is None).
+    """
+
+    _std_profile = ChildcareProfile(phases=[
+        ChildcarePhase(age_start=0,  age_end=2,  monthly_cost=2_500),
+        ChildcarePhase(age_start=3,  age_end=4,  monthly_cost=1_500),
+        ChildcarePhase(age_start=5,  age_end=12, monthly_cost=600),
+        ChildcarePhase(age_start=13, age_end=17, monthly_cost=150),
+    ])
+
+    def _base(self, cp=None, flat=0, events=None):
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(
+                monthly_childcare=flat, num_children=0,
+                annual_vacation=0, monthly_other_recurring=0,
+                annual_medical_oop=0, medical_auto_scale=False,
+                childcare_profile=cp,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=500_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=events or [],
+            projection_years=20,
+        )
+
+    def test_flat_rate_still_works_without_profile(self):
+        """Backward compat: flat monthly_childcare is used when no profile is set."""
+        plan = self._base(flat=2_500, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        s1 = ProjectionEngine(plan).run_deterministic()[0]
+        assert abs(s1.annual_lifestyle_cost - 30_000) < 1.0   # $2500 × 12
+
+    def test_infant_cost_applied_at_age_0(self):
+        """Child born in yr1 has age 0 in yr1 → infant phase cost applies."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        s1 = ProjectionEngine(plan).run_deterministic()[0]
+        assert abs(s1.annual_lifestyle_cost - 30_000) < 1.0   # $2500 × 12
+
+    def test_preschool_phase_cheaper_than_infant(self):
+        """Cost drops when child enters preschool phase (age 3)."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr4: child age = 3 → preschool $1500/mo = $18k/yr
+        assert snaps[3].annual_lifestyle_cost < snaps[0].annual_lifestyle_cost
+        assert abs(snaps[3].annual_lifestyle_cost - 18_000) < 1.0
+
+    def test_school_age_cheaper_than_preschool(self):
+        """Cost drops again entering school-age phase (age 5)."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr6: age=5 → $600/mo = $7,200/yr
+        assert snaps[5].annual_lifestyle_cost < snaps[3].annual_lifestyle_cost
+        assert abs(snaps[5].annual_lifestyle_cost - 7_200) < 1.0
+
+    def test_teen_phase_cheapest(self):
+        """Teen phase (age 13+) is cheapest covered age."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr14: age=13 → $150/mo = $1,800/yr
+        assert snaps[13].annual_lifestyle_cost < snaps[5].annual_lifestyle_cost
+        assert abs(snaps[13].annual_lifestyle_cost - 1_800) < 1.0
+
+    def test_zero_cost_past_last_phase(self):
+        """Ages not covered by any phase return $0 childcare."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr19: age=18, no phase covers it → $0
+        assert snaps[18].annual_lifestyle_cost == 0.0
+
+    def test_two_children_different_ages_independent_lookup(self):
+        """Each child's cost is looked up by their individual age, not averaged."""
+        # Child1 born yr1 → age 5 at yr6 ($600/mo)
+        # Child2 born yr3 → age 3 at yr6 ($1500/mo)
+        # Total yr6 = ($600 + $1500) × 12 = $25,200
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child1", new_child=True),
+            TimelineEvent(year=3, description="Child2", new_child=True),
+        ])
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert abs(snaps[5].annual_lifestyle_cost - 25_200) < 1.0
+
+    def test_nw_integrity_with_profile(self):
+        """NW integrity must hold with age-based childcare costs each year."""
+        plan = self._base(cp=self._std_profile, events=[
+            TimelineEvent(year=1, description="Child", new_child=True)
+        ])
+        for s in ProjectionEngine(plan).run_deterministic():
+            components = (s.retirement_balance + s.brokerage_balance
+                          + s.college_529_balance + s.home_equity + s.hsa_balance
+                          + s.uninvested_cash + s.cash_buffer + s.business_equity)
+            assert abs(components - s.net_worth) < 1.0, f"Yr{s.year}"
+
+    def test_config_roundtrip_preserves_all_phases(self):
+        """All ChildcarePhase fields must survive YAML round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(cp=self._std_profile)))
+        cp2 = plan2.lifestyle.childcare_profile
+        assert cp2 is not None
+        assert len(cp2.phases) == 4
+        assert cp2.phases[0].age_start == 0 and cp2.phases[0].age_end == 2
+        assert cp2.phases[0].monthly_cost == 2_500
+        assert cp2.phases[2].age_start == 5 and cp2.phases[2].monthly_cost == 600
+        assert cp2.phases[3].monthly_cost == 150
+
+    def test_none_profile_roundtrips_as_none(self):
+        """Plans using flat rate must not gain a profile on round-trip."""
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(flat=1_500)))
+        assert plan2.lifestyle.childcare_profile is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gaps — tests added to cover features that shipped without tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHistoricalBootstrap:
+    """
+    Tests for use_historical_returns and use_historical_inflation bootstrap
+    sampling in run_monte_carlo().
+    """
+
+    def _plan(self):
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=100_000, annual_market_return=0.08,
+                annual_inflation_rate=0.03, annual_salary_growth_rate=0.04,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=20,
+        )
+
+    def test_historical_returns_produces_different_distribution(self):
+        """Bootstrap from historical S&P data must differ from normal distribution."""
+        engine = ProjectionEngine(self._plan())
+        mc_hist = engine.run_monte_carlo(500, seed=42, use_historical_returns=True)
+        mc_norm = engine.run_monte_carlo(500, seed=42, use_historical_returns=False)
+        assert mc_hist.p10_net_worth[-1] != mc_norm.p10_net_worth[-1]
+
+    def test_historical_inflation_produces_different_distribution(self):
+        """Bootstrap from historical CPI data must differ from normal distribution."""
+        engine = ProjectionEngine(self._plan())
+        mc_hist = engine.run_monte_carlo(500, seed=42, use_historical_inflation=True)
+        mc_norm = engine.run_monte_carlo(500, seed=42, use_historical_inflation=False)
+        assert mc_hist.p10_net_worth[-1] != mc_norm.p10_net_worth[-1]
+
+    def test_use_historical_returns_flag_stored(self):
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(100, seed=1,
+                                                            use_historical_returns=True)
+        assert mc.use_historical_returns is True
+
+    def test_use_historical_inflation_flag_stored(self):
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(100, seed=1,
+                                                            use_historical_inflation=True)
+        assert mc.use_historical_inflation is True
+
+    def test_historical_inflation_flag_false_stored(self):
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(100, seed=1,
+                                                            use_historical_inflation=False)
+        assert mc.use_historical_inflation is False
+
+    def test_seeded_reproducible_with_both_historical(self):
+        """Same seed must produce identical results when both bootstrap modes are on."""
+        engine = ProjectionEngine(self._plan())
+        mc1 = engine.run_monte_carlo(200, seed=99,
+                                      use_historical_returns=True,
+                                      use_historical_inflation=True)
+        mc2 = engine.run_monte_carlo(200, seed=99,
+                                      use_historical_returns=True,
+                                      use_historical_inflation=True)
+        assert mc1.p50_net_worth == mc2.p50_net_worth
+        assert mc1.prob_negative_liquid == mc2.prob_negative_liquid
+
+    def test_historical_inflation_dataset_has_96_years(self):
+        """Sanity-check the embedded constant."""
+        from fintracker.projections import _US_HISTORICAL_INFLATION
+        assert len(_US_HISTORICAL_INFLATION) == 96
+
+    def test_historical_inflation_includes_stagflation(self):
+        """Dataset must include at least one year above 10% (1946, 1974, 1979–80)."""
+        from fintracker.projections import _US_HISTORICAL_INFLATION
+        assert max(_US_HISTORICAL_INFLATION) > 0.10
+
+    def test_historical_inflation_includes_deflation(self):
+        """Dataset must include deflation years (1930s Great Depression)."""
+        from fintracker.projections import _US_HISTORICAL_INFLATION
+        assert min(_US_HISTORICAL_INFLATION) < 0.0
+
+
+class TestOwnershipPct:
+    """Tests for BusinessProfile.ownership_pct — scales profit, equity, and taxes."""
+
+    def _plan(self, ownership_pct):
+        biz = BusinessProfile(
+            annual_revenue=400_000, expense_ratio=0.50,
+            revenue_growth_rate=0.0, start_year=1,
+            equity_multiple=3.0, ownership_pct=ownership_pct,
+        )
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=200_000,
+                                          annual_market_return=0.0,
+                                          annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            business=biz, projection_years=5,
+        )
+
+    def test_full_owner_gets_full_profit(self):
+        s = ProjectionEngine(self._plan(1.0)).run_deterministic()[0]
+        assert s.annual_business_income > 0
+
+    def test_half_owner_gets_half_income(self):
+        s_full = ProjectionEngine(self._plan(1.0)).run_deterministic()[0]
+        s_half = ProjectionEngine(self._plan(0.5)).run_deterministic()[0]
+        ratio = s_half.annual_business_income / s_full.annual_business_income
+        assert abs(ratio - 0.5) < 0.01
+
+    def test_half_owner_gets_half_equity(self):
+        s_full = ProjectionEngine(self._plan(1.0)).run_deterministic()[0]
+        s_half = ProjectionEngine(self._plan(0.5)).run_deterministic()[0]
+        ratio = s_half.business_equity / s_full.business_equity
+        assert abs(ratio - 0.5) < 0.01
+
+    def test_ownership_pct_default_is_1(self):
+        assert BusinessProfile().ownership_pct == 1.0
+
+    def test_nw_integrity_with_partial_ownership(self):
+        for s in ProjectionEngine(self._plan(0.6)).run_deterministic():
+            c = (s.retirement_balance + s.brokerage_balance + s.college_529_balance
+                 + s.home_equity + s.hsa_balance + s.uninvested_cash
+                 + s.cash_buffer + s.business_equity)
+            assert abs(c - s.net_worth) < 1.0, f"Yr{s.year}"
+
+
+class TestChildcareYAMLValidation:
+    """Tests for the improved _dict_to_childcare_profile validation."""
+
+    def test_valid_profile_parses_correctly(self):
+        from fintracker.config import _dict_to_childcare_profile
+        cp = _dict_to_childcare_profile({"phases": [
+            {"age_start": 0, "age_end": 2, "monthly_cost": 2500},
+            {"age_start": 3, "age_end": 4, "monthly_cost": 1500},
+        ]})
+        assert len(cp.phases) == 2
+        assert cp.phases[0].monthly_cost == 2500
+
+    def test_broken_yaml_split_phase_raises_valueerror(self):
+        """The common mistake of splitting one phase across two list items
+        must raise a clear ValueError, not a silent KeyError crash."""
+        from fintracker.config import _dict_to_childcare_profile
+        import pytest
+        # Phase 2 is missing age_start (split YAML produces two incomplete dicts)
+        broken = {"phases": [
+            {"age_start": 0, "age_end": 2, "monthly_cost": 2500},
+            {"age_start": 3},                          # missing age_end and monthly_cost
+            {"age_end": 4, "monthly_cost": 1600},      # missing age_start
+        ]}
+        with pytest.raises(ValueError, match="missing"):
+            _dict_to_childcare_profile(broken)
+
+    def test_error_message_names_the_bad_phase(self):
+        """Error message must identify which phase number is broken."""
+        from fintracker.config import _dict_to_childcare_profile
+        import pytest
+        broken = {"phases": [
+            {"age_start": 0, "age_end": 2, "monthly_cost": 2500},
+            {"age_end": 4, "monthly_cost": 1600},   # phase 2, missing age_start
+        ]}
+        with pytest.raises(ValueError, match="phase 2"):
+            _dict_to_childcare_profile(broken)
+
+    def test_empty_phases_list_returns_empty_profile(self):
+        from fintracker.config import _dict_to_childcare_profile
+        cp = _dict_to_childcare_profile({"phases": []})
+        assert cp.phases == []
+
+
+class TestMCLiquidityWithBuffer:
+    """
+    Regression: prob_negative_liquid must measure brokerage + cash_buffer,
+    not brokerage alone. A buffer should never increase apparent liquidity risk.
+    """
+
+    def _tight_plan(self, buffer_months):
+        return FinancialPlan(
+            income=IncomeProfile(40_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(400_000, 80_000, 0.07),
+            lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=1_000,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=150_000,
+                                          annual_market_return=0.08,
+                                          annual_inflation_rate=0.03,
+                                          annual_salary_growth_rate=0.0,
+                                          cash_buffer_months=buffer_months),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=10,
+        )
+
+    def test_buffer_does_not_increase_peak_liquidity_risk(self):
+        """Adding a cash buffer must not increase peak prob_negative_liquid.
+        REGRESSION: when metric used brokerage only (not brokerage + buffer),
+        a larger buffer meant smaller brokerage → higher apparent risk."""
+        mc0 = ProjectionEngine(self._tight_plan(0)).run_monte_carlo(300, seed=42)
+        mc6 = ProjectionEngine(self._tight_plan(6)).run_monte_carlo(300, seed=42)
+        assert max(mc6.prob_negative_liquid) <= max(mc0.prob_negative_liquid), (
+            f"Buffer should not increase risk: 0mo={max(mc0.prob_negative_liquid):.1%} "
+            f"6mo={max(mc6.prob_negative_liquid):.1%}"
+        )
+
+    def test_prob_negative_liquid_all_valid_probabilities(self):
+        mc = ProjectionEngine(self._tight_plan(3)).run_monte_carlo(200, seed=1)
+        for p in mc.prob_negative_liquid:
+            assert 0.0 <= p <= 1.0
+
+
+class TestCumulativeInflationFix:
+    """
+    REGRESSION: inf_f = (1 + this_year_rate)^(year-1) is only correct when
+    inflation is constant.  With variable per-year rates (Monte Carlo), it
+    raises the sampled rate to the power of all years elapsed — a single draw
+    of 13.3% at year 15 makes expenses 5.7× base instead of 1.7×.
+
+    Fix: track cumulative_inflation in EngineState as a rolling product of
+    (1 + rate_t) for each year t, so the factor is always correct.
+    """
+
+    def _plan(self, inflation=0.03):
+        return FinancialPlan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000),
+            lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=200_000,
+                                          annual_market_return=0.08,
+                                          annual_inflation_rate=inflation,
+                                          annual_salary_growth_rate=0.04),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=20,
+        )
+
+    def test_year1_inf_f_is_one(self):
+        """In year 1, no inflation has been applied yet — inf_f must equal 1.0."""
+        s1 = ProjectionEngine(self._plan()).run_deterministic()[0]
+        # Rent = 1000/mo × 12 × inf_f; at inf_f=1.0 this is exactly 12,000
+        assert abs(s1.annual_housing_cost - 12_000) < 10
+
+    def test_deterministic_costs_inflate_correctly(self):
+        """At constant 3%, year-3 costs must be 1.03² × year-1 costs."""
+        snaps = ProjectionEngine(self._plan(0.03)).run_deterministic()
+        housing_yr1 = snaps[0].annual_housing_cost
+        housing_yr3 = snaps[2].annual_housing_cost
+        expected_ratio = 1.03 ** 2
+        actual_ratio = housing_yr3 / housing_yr1
+        assert abs(actual_ratio - expected_ratio) < 0.01, \
+            f"Expected ratio {expected_ratio:.4f}, got {actual_ratio:.4f}"
+
+    def test_zero_inflation_costs_are_flat(self):
+        """With 0% inflation AND 0% rent_increase_rate, rent costs must be flat.
+        Note: rent_increase_rate is independent of CPI — set both to 0 to get flat costs."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(0.0),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000,
+                                   annual_rent_increase_rate=0.0),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        h1 = snaps[0].annual_housing_cost
+        h10 = snaps[9].annual_housing_cost
+        assert abs(h1 - h10) < 1.0
+
+    def test_mc_historical_inflation_p10_positive(self):
+        """REGRESSION: before fix, a single draw of 18% inflation at year 15
+        produced inf_f = 1.18^14 ≈ 10, making expenses 10× base and wiping
+        out all liquid assets.  After fix, p10 NW must be positive."""
+        mc = ProjectionEngine(self._plan()).run_monte_carlo(
+            200, seed=42,
+            use_historical_returns=True,
+            use_historical_inflation=True,
+        )
+        assert mc.p10_net_worth[-1] > 0, \
+            f"p10 NW negative ({mc.p10_net_worth[-1]:,.0f}) — cumulative inflation bug may have returned"
+
+    def test_mc_hist_and_normal_inflation_medians_similar(self):
+        """Historical and normal inflation have the same mean (~3%), so medians
+        should be within 30% of each other — only tails differ."""
+        engine = ProjectionEngine(self._plan())
+        mc_hist = engine.run_monte_carlo(500, seed=42, use_historical_inflation=True)
+        mc_norm = engine.run_monte_carlo(500, seed=42, use_historical_inflation=False)
+        ratio = mc_hist.p50_net_worth[-1] / mc_norm.p50_net_worth[-1]
+        assert 0.70 < ratio < 1.30, \
+            f"Medians diverge too much: ratio={ratio:.2f} (expected 0.7–1.3)"
+
+
+class TestMCCalculationAudit:
+    """
+    Systematic audit of every MC-sensitive calculation.
+    Confirms no other calculation has the same bug as the inf_f issue:
+    i.e. that all rolling rates use proper state-based compounding,
+    not (current_year_rate)^(years_elapsed).
+    """
+
+    def _plan(self, **kw):
+        defaults = dict(
+            income=IncomeProfile(100_000,FilingStatus.SINGLE,State.TEXAS),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=1_000,
+                                   annual_rent_increase_rate=0.03),
+            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
+                                       annual_medical_oop=0,medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=0,annual_market_return=0.0,
+                                          annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            projection_years=5,
+        )
+        defaults.update(kw)
+        return FinancialPlan(**defaults)
+
+    # ── Salary growth ────────────────────────────────────────────────────
+
+    def test_salary_compounding_is_rolling_product(self):
+        """income_primary *= (1+sg) each year in _advance_state — correct rolling product."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            investments=InvestmentProfile(current_liquid_cash=0, annual_market_return=0.0,
+                                          annual_inflation_rate=0.0, annual_salary_growth_rate=0.10),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert abs(snaps[2].gross_income - 100_000 * 1.10**2) < 1
+
+    # ── Market returns ───────────────────────────────────────────────────
+
+    def test_market_return_compounding_is_rolling_product(self):
+        """balance *= (1+mkt) each year — correct rolling product on state."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            investments=InvestmentProfile(current_liquid_cash=0,
+                                          current_retirement_balance=100_000,
+                                          annual_401k_contribution=0,
+                                          annual_market_return=0.10,
+                                          annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert abs(snaps[2].retirement_balance - 100_000 * 1.10**3) < 1
+
+    # ── Rent ─────────────────────────────────────────────────────────────
+
+    def test_rent_inflates_at_rent_increase_rate_not_cpi(self):
+        """Rent uses annual_rent_increase_rate, NOT general CPI (inf_f)."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=1_000,
+                                   annual_rent_increase_rate=0.05),
+            investments=InvestmentProfile(current_liquid_cash=200_000, annual_market_return=0.0,
+                                          annual_inflation_rate=0.03, annual_salary_growth_rate=0.0),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr3: base 1000 × 1.05^2 × 12 = 13,230 (rent rate only, not CPI)
+        assert abs(snaps[2].annual_housing_cost - 12_000 * 1.05**2) < 5
+
+    def test_rent_not_double_inflated(self):
+        """When rent_increase_rate == CPI, rent must NOT be inflated twice."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=1_000,
+                                   annual_rent_increase_rate=0.03),
+            investments=InvestmentProfile(current_liquid_cash=200_000, annual_market_return=0.0,
+                                          annual_inflation_rate=0.03, annual_salary_growth_rate=0.0),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # Should be 12,000 × 1.03^2 = 12,731; NOT 12,000 × 1.06^2 = 13,499
+        assert abs(snaps[2].annual_housing_cost - 12_000 * 1.03**2) < 5
+        assert abs(snaps[2].annual_housing_cost - 12_000 * 1.06**2) > 100
+
+    # ── Other costs use cumulative inf_f correctly ────────────────────────
+
+    def test_lifestyle_costs_use_cumulative_inflation(self):
+        """Vacation, medical, etc. inflate via cumulative inf_f (rolling product)."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0,
+                                   annual_rent_increase_rate=0.0),
+            lifestyle=LifestyleProfile(annual_vacation=10_000, monthly_other_recurring=0,
+                                       annual_medical_oop=0, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=200_000, annual_market_return=0.0,
+                                          annual_inflation_rate=0.05, annual_salary_growth_rate=0.0),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        ratio = snaps[2].annual_lifestyle_cost / snaps[0].annual_lifestyle_cost
+        assert abs(ratio - 1.05**2) < 0.01
+
+    # ── MC with variable rates ────────────────────────────────────────────
+
+    def test_mc_salary_growth_correct_for_variable_rates(self):
+        """MC salary growth uses rolling product — a high-growth year doesn't
+        compound that rate over all prior years."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            investments=InvestmentProfile(current_liquid_cash=0, annual_market_return=0.0,
+                                          annual_inflation_rate=0.0, annual_salary_growth_rate=0.05),
+            projection_years=20,
+        )
+        mc_high = ProjectionEngine(plan).run_monte_carlo(200, seed=42, salary_growth_std=0.10,
+                                                          use_historical_returns=False,
+                                                          use_historical_inflation=False)
+        mc_low  = ProjectionEngine(plan).run_monte_carlo(200, seed=42, salary_growth_std=0.01,
+                                                          use_historical_returns=False,
+                                                          use_historical_inflation=False)
+        # Higher variance should widen the band but medians should be similar
+        spread_high = mc_high.p90_net_worth[-1] - mc_high.p10_net_worth[-1]
+        spread_low  = mc_low.p90_net_worth[-1]  - mc_low.p10_net_worth[-1]
+        assert spread_high > spread_low, "Higher salary std should widen NW spread"
+
+    def test_mc_market_return_correct_for_variable_rates(self):
+        """MC market returns use rolling balance product — each year's return
+        applies to the current balance, not some fixed initial amount."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._plan(),
+            investments=InvestmentProfile(current_liquid_cash=0,
+                                          current_retirement_balance=100_000,
+                                          annual_401k_contribution=0,
+                                          annual_market_return=0.08,
+                                          annual_inflation_rate=0.0,
+                                          annual_salary_growth_rate=0.0),
+            projection_years=10,
+        )
+        mc = ProjectionEngine(plan).run_monte_carlo(500, seed=42, use_historical_returns=True,
+                                                     use_historical_inflation=False)
+        # After 10 years, even p10 should be well above zero (rolling returns, not fixed)
+        assert mc.p10_net_worth[-1] > 50_000

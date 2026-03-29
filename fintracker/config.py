@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from fintracker.models import (
-    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
@@ -96,6 +96,8 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         monthly_other_recurring=float(l_d.get("monthly_other_recurring", 500)),
         annual_parent_care_cost=float(l_d.get("annual_parent_care_cost", 0)),
         annual_wedding_fund_per_child=float(l_d.get("annual_wedding_fund_per_child", 0)),
+        childcare_profile=_dict_to_childcare_profile(l_d["childcare_profile"])
+            if "childcare_profile" in l_d else None,
     )
 
     inv_d = d.get("investments", {})
@@ -120,6 +122,8 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         annual_home_appreciation_rate=float(inv_d.get("annual_home_appreciation_rate", 0.035)),
         auto_invest_surplus=bool(auto_invest),
         cash_buffer_months=float(inv_d.get("cash_buffer_months", 0.0)),
+        employer_match=(_dict_to_employer_match(inv_d["employer_match"])
+                        if "employer_match" in inv_d else None),
     )
 
     strategies = StrategyToggles(
@@ -204,6 +208,56 @@ def _dict_to_college(c: dict) -> CollegeProfile:
     )
 
 
+def _dict_to_childcare_profile(cp: dict) -> ChildcareProfile:
+    """
+    Parse a childcare_profile dict into a ChildcareProfile.
+
+    Validates each phase and raises a descriptive ValueError if a phase is
+    missing required fields (age_start, age_end, monthly_cost).  A common
+    YAML mistake is splitting one phase across two list items:
+
+        Bad (two separate items):       Good (one item with all fields):
+          - age_start: 3                  - age_start: 3
+          - age_end:   4                    age_end:   4
+            monthly_cost: 1500              monthly_cost: 1500
+
+    The bad form is valid YAML but produces {age_start: 3} and
+    {age_end: 4, monthly_cost: 1500} as separate dicts — both missing fields.
+    """
+    phases = []
+    for i, p in enumerate(cp.get("phases", [])):
+        missing = [f for f in ("age_start", "age_end", "monthly_cost") if f not in p]
+        if missing:
+            raise ValueError(
+                f"childcare_profile phase {i+1} is missing: {missing}. "
+                f"Got: {p}. "
+                f"Common fix: ensure age_start, age_end, and monthly_cost are all "
+                f"indented under the same '- ' list marker (not separate list items)."
+            )
+        phases.append(ChildcarePhase(
+            age_start=int(p["age_start"]),
+            age_end=int(p["age_end"]),
+            monthly_cost=float(p["monthly_cost"]),
+        ))
+    return ChildcareProfile(phases=phases)
+
+
+def _dict_to_employer_match(em: dict) -> EmployerMatch:
+    tiers = [
+        MatchTier(
+            match_pct=float(t["match_pct"]),
+            up_to_pct_of_salary=float(t["up_to_pct_of_salary"]),
+        )
+        for t in em.get("tiers", [])
+    ]
+    return EmployerMatch(
+        tiers=tiers,
+        annual_cap=em.get("annual_cap"),          # None = no cap
+        vesting_years=int(em.get("vesting_years", 0)),
+        profit_sharing_annual=float(em.get("profit_sharing_annual", 0.0)),
+    )
+
+
 def _dict_to_business(b: dict) -> BusinessProfile:
     return BusinessProfile(
         annual_revenue=float(b.get("annual_revenue", 0.0)),
@@ -217,6 +271,7 @@ def _dict_to_business(b: dict) -> BusinessProfile:
         sep_ira_contribution=float(b.get("sep_ira_contribution", 0.0)),
         equity_multiple=float(b.get("equity_multiple", 3.0)),
         sale_year=b.get("sale_year"),
+        ownership_pct=float(b.get("ownership_pct", 1.0)),
     )
 
 
@@ -284,6 +339,11 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "monthly_other_recurring": plan.lifestyle.monthly_other_recurring,
             "annual_parent_care_cost": plan.lifestyle.annual_parent_care_cost,
             "annual_wedding_fund_per_child": plan.lifestyle.annual_wedding_fund_per_child,
+            **( {"childcare_profile": {"phases": [
+                    {"age_start": p.age_start, "age_end": p.age_end, "monthly_cost": p.monthly_cost}
+                    for p in plan.lifestyle.childcare_profile.phases
+                ]}}
+                if plan.lifestyle.childcare_profile else {} ),
         },
         "investments": {
             "current_liquid_cash": plan.investments.current_liquid_cash,
@@ -303,6 +363,17 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "annual_home_appreciation_rate": plan.investments.annual_home_appreciation_rate,
             "auto_invest_surplus": plan.investments.auto_invest_surplus,
             "cash_buffer_months": plan.investments.cash_buffer_months,
+            **( {
+                "employer_match": {
+                    "tiers": [
+                        {"match_pct": t.match_pct, "up_to_pct_of_salary": t.up_to_pct_of_salary}
+                        for t in plan.investments.employer_match.tiers
+                    ],
+                    "annual_cap":            plan.investments.employer_match.annual_cap,
+                    "vesting_years":         plan.investments.employer_match.vesting_years,
+                    "profit_sharing_annual": plan.investments.employer_match.profit_sharing_annual,
+                }
+            } if plan.investments.employer_match else {} ),
         },
         "strategies": {
             "maximize_hsa": plan.strategies.maximize_hsa,
@@ -349,6 +420,7 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "sep_ira_contribution":           b.sep_ira_contribution,
             "equity_multiple":                b.equity_multiple,
             "sale_year":                      b.sale_year,
+            "ownership_pct":                  b.ownership_pct,
         }
 
     if plan.car:

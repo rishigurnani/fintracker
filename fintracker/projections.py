@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from fintracker.models import (
-    BusinessProfile, CarProfile, KidCarProfile, CollegeProfile, FilingStatus, FinancialPlan,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, KidCarProfile, MatchTier, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles,
 )
@@ -82,6 +82,26 @@ _SP500_HISTORICAL_RETURNS: tuple[float, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Historical US CPI annual inflation rates (1929–2024), 96 years.
+# Source: US Bureau of Labor Statistics. Used for bootstrap Monte Carlo sampling.
+# Fat tails: deflation (Great Depression), 1970s stagflation (13.3%),
+# post-WWII spike (18.1%), 2021-22 surge (7%). Normal(3%, 1.5%) misses all of these.
+_US_HISTORICAL_INFLATION: tuple[float, ...] = (
+     0.0060, -0.0640, -0.0930, -0.1030,  0.0080,  0.0150,  0.0300,  0.0140,
+     0.0290, -0.0280,  0.0000,  0.0070,  0.0990,  0.0900,  0.0300,  0.0230,
+     0.0220,  0.1810,  0.0880,  0.0300, -0.0210,  0.0590,  0.0600,  0.0080,
+     0.0070, -0.0070,  0.0040,  0.0300,  0.0290,  0.0180,  0.0170,  0.0140,
+     0.0070,  0.0130,  0.0160,  0.0100,  0.0190,  0.0350,  0.0300,  0.0470,
+     0.0620,  0.0560,  0.0330,  0.0340,  0.0870,  0.1230,  0.0690,  0.0490,
+     0.0670,  0.0900,  0.1330,  0.1250,  0.0890,  0.0380,  0.0380,  0.0390,
+     0.0380,  0.0110,  0.0440,  0.0440,  0.0460,  0.0610,  0.0310,  0.0290,
+     0.0270,  0.0270,  0.0250,  0.0330,  0.0170,  0.0160,  0.0270,  0.0340,
+     0.0160,  0.0240,  0.0190,  0.0330,  0.0340,  0.0250,  0.0410,  0.0010,
+     0.0270,  0.0150,  0.0300,  0.0170,  0.0150,  0.0080,  0.0070,  0.0210,
+     0.0210,  0.0190,  0.0230,  0.0140,  0.0700,  0.0650,  0.0340,  0.0290,
+)
+
+# ---------------------------------------------------------------------------
 # Engine state — typed, explicit, no loose dicts
 # ---------------------------------------------------------------------------
 
@@ -130,6 +150,11 @@ class EngineState:
 
     # Flags
     parent_care_active: bool
+
+    # Cumulative inflation factor — rolling product of (1+inf_t) for t=1..year-1.
+    # Tracked in state so each year's factor is correct regardless of whether inflation
+    # is constant (deterministic) or sampled per-year (Monte Carlo).
+    cumulative_inflation: float
 
     # Car loan state — one dict per car
     cars: list[dict]
@@ -260,6 +285,7 @@ class MonteCarloResult:
 
     # Simulation parameters (stored for display)
     use_historical_returns: bool = True
+    use_historical_inflation: bool = True
     market_return_std: float = 0.15
     inflation_std: float = 0.015
     salary_growth_std: float = 0.02
@@ -317,6 +343,7 @@ class ProjectionEngine:
         inflation_std: float = 0.015,
         salary_growth_std: float = 0.02,
         use_historical_returns: bool = True,
+        use_historical_inflation: bool = True,
     ) -> MonteCarloResult:
         """
         Run N Monte Carlo simulations with randomized economic parameters.
@@ -346,21 +373,46 @@ class ProjectionEngine:
 
         hist = np.array(_SP500_HISTORICAL_RETURNS)
 
-        for _ in range(n_simulations):
-            if use_historical_returns:
-                # Bootstrap: sample with replacement from the historical dataset.
-                # Each draw is an independent annual return — no autocorrelation
-                # assumed (consistent with weak-form market efficiency).
-                mkt = rng.choice(hist, size=len(years), replace=True)
-            else:
-                mkt = rng.normal(inv.annual_market_return, market_return_std, len(years))
-            inf = np.clip(rng.normal(inv.annual_inflation_rate, inflation_std, len(years)), 0, 0.15)
-            sg  = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std, len(years)), -0.10, 0.20)
+        # Pre-compute mortgage amortization lookups — identical every simulation.
+        _amort_cache: dict = {}
+        for _ev in self._plan.timeline_events:
+            if _ev.buy_home and _ev.new_home_price and _ev.new_home_interest_rate:
+                _p = _ev.new_home_price
+                _d = _ev.new_home_down_payment or _p * 0.20
+                _r = _ev.new_home_interest_rate
+                _t = self._plan.housing.loan_term_years
+                _k = (_p, _d, _r, _t)
+                if _k not in _amort_cache:
+                    _hp_tmp = HousingProfile(home_price=_p, down_payment=_d,
+                                             interest_rate=_r, loan_term_years=_t)
+                    _mc_tmp = MortgageCalculator(_hp_tmp, self._plan.investments.annual_home_appreciation_rate)
+                    _amort_cache[_k] = self._amort_lookup(_mc_tmp)
+
+        # Pre-draw all random matrices (n_simulations × n_years) at once.
+        # Eliminates per-simulation RNG call overhead.
+        n_years = len(years)
+        if use_historical_returns:
+            all_mkt = rng.choice(hist, size=(n_simulations, n_years), replace=True)
+        else:
+            all_mkt = rng.normal(inv.annual_market_return, market_return_std, (n_simulations, n_years))
+        if use_historical_inflation:
+            all_inf = np.clip(rng.choice(np.array(_US_HISTORICAL_INFLATION),
+                                         size=(n_simulations, n_years), replace=True), -0.15, 0.20)
+        else:
+            all_inf = np.clip(rng.normal(inv.annual_inflation_rate, inflation_std,
+                                          (n_simulations, n_years)), 0, 0.15)
+        all_sg = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std,
+                                     (n_simulations, n_years)), -0.10, 0.20)
+
+        for sim_idx in range(n_simulations):
+            mkt = all_mkt[sim_idx]
+            inf = all_inf[sim_idx]
+            sg  = all_sg[sim_idx]
             state = self._initial_state()
             sim_nw:  list[float] = []
             sim_liq: list[float] = []
             for i, year in enumerate(years):
-                self._apply_timeline_events(state, year)
+                self._apply_timeline_events(state, year, _amort_cache)
                 snap = self._compute_year(
                     state, year,
                     market_return_override=float(mkt[i]),
@@ -408,6 +460,7 @@ class ProjectionEngine:
             ),
             num_simulations=n_simulations,
             use_historical_returns=use_historical_returns,
+            use_historical_inflation=use_historical_inflation,
             market_return_std=market_return_std,
             inflation_std=inflation_std,
             salary_growth_std=salary_growth_std,
@@ -449,7 +502,8 @@ class ProjectionEngine:
         # Projected balance = all investable assets at retirement year
         # (same pool used by the Retirement Readiness panel — single source of truth)
         snap = next((s for s in snapshots if s.year == years_to_ret), snapshots[-1])
-        projected = snap.retirement_balance + snap.hsa_balance + snap.brokerage_balance
+        projected = (snap.retirement_balance + snap.hsa_balance + snap.brokerage_balance
+                    + snap.uninvested_cash + snap.cash_buffer)
 
         # Income need at retirement start (nominal dollars)
         nominal_income = rp.desired_annual_income * (1 + inflation) ** years_to_ret
@@ -544,6 +598,7 @@ class ProjectionEngine:
             uninvested_cash=0.0,
             cash_buffer=0.0,
             parent_care_active=p.lifestyle.annual_parent_care_cost > 0,
+            cumulative_inflation=1.0,
             cars=self._init_cars(p.car),
             kid_car_loans=[],
             business_equity=0.0,
@@ -597,7 +652,7 @@ class ProjectionEngine:
     # Timeline events                                                      #
     # ------------------------------------------------------------------ #
 
-    def _apply_timeline_events(self, state: EngineState, year: int) -> None:
+    def _apply_timeline_events(self, state: EngineState, year: int, _amort_cache: Optional[dict] = None) -> None:
         p = self._plan
         for ev in p.events_for_year(year):
 
@@ -647,9 +702,9 @@ class ProjectionEngine:
 
             # Home purchase
             if ev.buy_home:
-                self._apply_home_purchase(state, ev)
+                self._apply_home_purchase(state, ev, _amort_cache)
 
-    def _apply_home_purchase(self, state: EngineState, ev) -> None:
+    def _apply_home_purchase(self, state: EngineState, ev, _amort_cache: Optional[dict] = None) -> None:
         p          = self._plan
         new_price  = ev.new_home_price or ev.home_price_override or state.home_value
         new_down   = ev.new_home_down_payment or new_price * 0.20
@@ -671,9 +726,11 @@ class ProjectionEngine:
             pmi_annual_rate=p.housing.pmi_annual_rate,
         )
         new_calc = MortgageCalculator(new_hp, p.investments.annual_home_appreciation_rate)
+        _ck = (new_price, new_down, new_rate, p.housing.loan_term_years)
 
         state.mortgage_calc        = new_calc
-        state.amort_lookup         = self._amort_lookup(new_calc)
+        state.amort_lookup         = (_amort_cache[_ck] if _amort_cache and _ck in _amort_cache
+                                      else self._amort_lookup(new_calc))
         state.mortgage_year_offset = ev.year - 1
         state.mortgage_interest_rate = new_rate
         state.home_price_ref       = new_price
@@ -697,17 +754,20 @@ class ProjectionEngine:
         inv = p.investments
         mkt = market_return_override if market_return_override is not None else inv.annual_market_return
         inf = inflation_override if inflation_override is not None else inv.annual_inflation_rate
-        inf_f = (1 + inf) ** (year - 1)
+        # cumulative_inflation is the rolling product of (1+rate) for all prior years.
+        # Using it directly — rather than (1+this_year_rate)^(year-1) — is correct
+        # whether inflation is constant OR varies year-to-year (Monte Carlo).
+        inf_f = state.cumulative_inflation
 
         # --- Contributions & tax ---
-        hsa, k401, partner_k401, r529 = self._contributions(state, year)
+        hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
         biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year)
         tax, aotc = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
         net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k
 
         # --- Expenses ---
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
-        lifestyle_cost, medical_oop, parent_care = self._lifestyle(state, inf_f)
+        lifestyle_cost, medical_oop, parent_care = self._lifestyle(state, inf_f, year)
         college_gross, drawdown_529, net_college, annual_529_save = self._college(state, year, inf_f, r529)
         wedding_save = self._wedding_save(state, year, inf_f)
         car_pmt, car_purchase, car_sale = self._cars(state, year, inf_f)
@@ -726,7 +786,7 @@ class ProjectionEngine:
 
         # --- Asset growth ---
         ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer = self._asset_growth(
-            state, year, mkt, hsa, k401 + biz_solo_401k, partner_k401,
+            state, year, mkt, hsa, k401 + biz_solo_401k + employer_match, partner_k401,
             annual_529_save, drawdown_529, brokerage_earmark, breathing_room,
             annual_expenses=lifestyle_cost + housing_cost,
         )
@@ -744,7 +804,7 @@ class ProjectionEngine:
             annual_college_cost=college_gross,
             annual_529_drawdown=drawdown_529,
             annual_parent_care_cost=parent_care,
-            annual_retirement_contributions=k401 + partner_k401,
+            annual_retirement_contributions=k401 + partner_k401 + employer_match,
             annual_hsa_contributions=hsa,
             annual_brokerage_contribution=brokerage_earmark,
             annual_aotc_credit=aotc,
@@ -794,6 +854,15 @@ class ProjectionEngine:
             if state.income_partner > 0 else 0.0
         )
 
+        # Employer match — free money, goes straight to retirement, no tax impact on employee
+        employer_match = 0.0
+        if inv.employer_match is not None:
+            employer_match = inv.employer_match.compute_match(
+                employee_contribution=k401,
+                gross_salary=state.income_primary,
+                projection_year=year,
+            )
+
         # 529: stop contributing once all children have graduated (only enforced
         # when a CollegeProfile is configured)
         col = self._plan.college
@@ -806,7 +875,7 @@ class ProjectionEngine:
         else:
             r529 = inv.annual_529_contribution
 
-        return hsa, k401, partner_k401, r529
+        return hsa, k401, partner_k401, r529, employer_match
 
     def _tax_and_credits(
         self,
@@ -842,7 +911,9 @@ class ProjectionEngine:
         """Returns (annual_cost, home_equity, home_value, eoy_mortgage_balance)."""
         p = self._plan
         if state.is_renting:
-            return state.monthly_rent * 12 * inf_f, 0.0, 0.0, 0.0
+            # monthly_rent is advanced each year by annual_rent_increase_rate
+            # in _advance_state — already in nominal terms, no inf_f needed.
+            return state.monthly_rent * 12, 0.0, 0.0, 0.0
 
         mc = state.mortgage_calc
         if mc:
@@ -872,17 +943,26 @@ class ProjectionEngine:
         return cost, state.home_value, state.home_value, 0.0
 
     def _lifestyle(
-        self, state: EngineState, inf_f: float
+        self, state: EngineState, inf_f: float, year: int = 1
     ) -> tuple[float, float, float]:
         """Returns (annual_lifestyle, medical_oop, parent_care)."""
         lif = self._plan.lifestyle
 
         medical     = lif.scaled_medical_oop(state.is_married, state.num_children) * inf_f
         pets        = state.num_pets * lif.annual_pet_cost * inf_f
-        childcare   = state.num_children * lif.monthly_childcare * 12 * inf_f
         vacation    = lif.annual_vacation * inf_f
         other       = lif.monthly_other_recurring * 12 * inf_f
         parent_care = lif.annual_parent_care_cost * inf_f if state.parent_care_active else 0.0
+
+        # Childcare: age-bracketed profile takes priority over flat monthly_childcare.
+        # Each child's age is computed from their birth year for accurate per-child costs.
+        if lif.childcare_profile and state.child_birth_years:
+            childcare = sum(
+                lif.childcare_profile.monthly_cost_at_age(year - by) * 12 * inf_f
+                for by in state.child_birth_years
+            )
+        else:
+            childcare = state.num_children * lif.monthly_childcare * 12 * inf_f
 
         return medical + pets + childcare + vacation + other + parent_care, medical, parent_care
 
@@ -979,12 +1059,12 @@ class ProjectionEngine:
         # Business sale: liquidate equity into brokerage once, then silence permanently.
         if biz.sale_year is not None and year >= biz.sale_year:
             if year == biz.sale_year:
-                proceeds = state.business_equity
+                proceeds = state.business_equity  # already scaled by ownership_pct
                 state.brokerage_balance += proceeds
             return 0.0, 0.0, 0.0, 0.0
 
         revenue    = state.business_revenue
-        net_profit = revenue * (1.0 - biz.expense_ratio)
+        net_profit = revenue * (1.0 - biz.expense_ratio) * biz.ownership_pct
 
         # --- Self-employment tax ---
         # SE tax is 15.3% on 92.35% of net profit.
@@ -1247,13 +1327,18 @@ class ProjectionEngine:
         state.brokerage_balance   = snap.brokerage_balance
         state.hsa_balance         = snap.hsa_balance
         state.college_529_balance = snap.college_529_balance
-        state.uninvested_cash     = snap.uninvested_cash
-        state.cash_buffer         = snap.cash_buffer
+        state.uninvested_cash       = snap.uninvested_cash
+        state.cash_buffer           = snap.cash_buffer
+        # Advance cumulative inflation: multiply by this year's rate
+        actual_inf = inflation if inflation is not None else p.investments.annual_inflation_rate
+        state.cumulative_inflation *= (1 + actual_inf)
         state.business_equity     = snap.business_equity
         if self._plan.business and snap.year >= self._plan.business.start_year:
             state.business_revenue *= (1 + self._plan.business.revenue_growth_rate)
 
-        if not state.is_renting:
+        if state.is_renting:
+            state.monthly_rent *= (1 + p.housing.annual_rent_increase_rate)
+        else:
             state.home_value = snap.home_value * (1 + p.investments.annual_home_appreciation_rate)
             self._advance_mortgage(state, snap)
 

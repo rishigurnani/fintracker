@@ -87,6 +87,62 @@ class HousingProfile:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ChildcarePhase:
+    """
+    Cost of childcare for a child in a given age range.
+
+    age_start and age_end are inclusive (e.g. age_start=0, age_end=2 covers ages 0, 1, 2).
+    monthly_cost is in today's dollars — the engine inflates it each year.
+    Any age not covered by a phase costs $0 (child is self-sufficient or at college).
+    """
+    age_start: int          # first age this phase applies to (inclusive)
+    age_end:   int          # last age this phase applies to (inclusive)
+    monthly_cost: float     # today's dollars per month per child at this age
+
+
+@dataclass
+class ChildcareProfile:
+    """
+    Age-bracketed childcare cost schedule.
+
+    Replaces the flat monthly_childcare field in LifestyleProfile with a
+    realistic cost curve that tracks what childcare actually costs at each
+    life stage.  The engine looks up each child's current age each year and
+    applies the matching phase.
+
+    Example YAML::
+
+        childcare_profile:
+          phases:
+            - age_start: 0
+              age_end:   2
+              monthly_cost: 2500   # infant/toddler — full-time daycare or nanny
+            - age_start: 3
+              age_end:   4
+              monthly_cost: 1500   # preschool
+            - age_start: 5
+              age_end:  12
+              monthly_cost: 600    # before/after school + summer camps
+            - age_start: 13
+              age_end:  17
+              monthly_cost: 150    # activities, minimal supervision
+            # age 18+ → handled by CollegeProfile; defaults to $0 here
+
+    Backward compatibility: if childcare_profile is None (the default),
+    the engine falls back to LifestyleProfile.monthly_childcare × num_children,
+    preserving all existing plans unchanged.
+    """
+    phases: list = field(default_factory=list)  # list[ChildcarePhase]
+
+    def monthly_cost_at_age(self, age: int) -> float:
+        """Return the monthly cost for a child of the given age. 0 if not covered."""
+        for phase in self.phases:
+            if phase.age_start <= age <= phase.age_end:
+                return phase.monthly_cost
+        return 0.0
+
+
+@dataclass
 class LifestyleProfile:
     """Recurring lifestyle expenses, scaled automatically with family size."""
     monthly_childcare: float = 0.0
@@ -113,6 +169,10 @@ class LifestyleProfile:
     # Activated / deactivated via start_parent_care / stop_parent_care events.
     annual_parent_care_cost: float = 0.0
 
+    # Age-bracketed childcare schedule. When set, overrides monthly_childcare.
+    # monthly_childcare is retained for backward compatibility.
+    childcare_profile: Optional[ChildcareProfile] = None
+
     @property
     def annual_total(self) -> float:
         return (
@@ -138,6 +198,91 @@ class LifestyleProfile:
 # ---------------------------------------------------------------------------
 # Investments & savings
 # ---------------------------------------------------------------------------
+
+@dataclass
+class MatchTier:
+    """One tier of an employer 401k match formula.
+
+    Examples::
+
+        # 50% match on first 6% of salary
+        MatchTier(match_pct=0.50, up_to_pct_of_salary=0.06)
+
+        # Second tier: 25% match on next 4%
+        MatchTier(match_pct=0.25, up_to_pct_of_salary=0.04)
+    """
+    match_pct: float             # employer matches this fraction of employee contribution
+    up_to_pct_of_salary: float   # up to this percentage of gross salary per tier
+
+
+@dataclass
+class EmployerMatch:
+    """
+    Employer 401k matching formula. Supports any combination of:
+
+    * Tiered match (list of MatchTier) — handles simple and complex structures
+    * Absolute annual dollar cap (annual_cap)
+    * Cliff vesting schedule (vesting_years; 0 = immediate)
+    * Profit sharing (flat employer contribution regardless of employee amount)
+
+    The total employer match is:
+        sum over tiers of (employee_contrib_in_tier × match_pct)
+        + profit_sharing_annual
+        capped at annual_cap (if set)
+        zeroed if projection_year < vesting_years (cliff vesting)
+
+    Common configurations::
+
+        # Simple: 50% match on first 6% of salary (most common)
+        EmployerMatch(tiers=[MatchTier(0.50, 0.06)])
+
+        # Dollar-for-dollar on first 3%
+        EmployerMatch(tiers=[MatchTier(1.00, 0.03)])
+
+        # Tiered: 100% on first 3%, 50% on next 2%
+        EmployerMatch(tiers=[MatchTier(1.00, 0.03), MatchTier(0.50, 0.02)])
+
+        # Any tier structure capped at $5,000/yr
+        EmployerMatch(tiers=[MatchTier(1.00, 0.10)], annual_cap=5000.0)
+
+        # 3-year cliff vesting, dollar-for-dollar on 4%
+        EmployerMatch(tiers=[MatchTier(1.00, 0.04)], vesting_years=3)
+
+        # Profit sharing only ($3k/yr, no tier match)
+        EmployerMatch(tiers=[], profit_sharing_annual=3000.0)
+    """
+    tiers: list = field(default_factory=list)  # list[MatchTier]
+    annual_cap: Optional[float] = None         # absolute $ ceiling on total match
+    vesting_years: int = 0                     # cliff: forfeit if leaving before this year
+    profit_sharing_annual: float = 0.0         # flat employer add regardless of employee contrib
+
+    def compute_match(self, employee_contribution: float, gross_salary: float,
+                      projection_year: int) -> float:
+        """
+        Compute employer match for one year.
+
+        projection_year counts from 1 (i.e. the vesting clock starts at employment
+        start, which we approximate as projection year 1).
+        """
+        if self.vesting_years > 0 and projection_year < self.vesting_years:
+            return 0.0
+
+        match = self.profit_sharing_annual
+        employee_remaining = employee_contribution   # track how much contrib is "used up"
+
+        for tier in self.tiers:
+            tier_ceiling = gross_salary * tier.up_to_pct_of_salary
+            contrib_in_tier = min(employee_remaining, tier_ceiling)
+            match += contrib_in_tier * tier.match_pct
+            employee_remaining -= contrib_in_tier
+            if employee_remaining <= 0:
+                break
+
+        if self.annual_cap is not None:
+            match = min(match, self.annual_cap)
+
+        return match
+
 
 @dataclass
 class InvestmentProfile:
@@ -169,6 +314,9 @@ class InvestmentProfile:
     # Stored here rather than StrategyToggles because it is a cash-flow routing
     # decision, not a tax-optimisation strategy.
     auto_invest_surplus: bool = True
+
+    # Employer 401k match — set to None if your employer offers no match
+    employer_match: Optional[EmployerMatch] = None
 
     # Cash buffer: target number of months of total expenses to keep as
     # liquid cash (0% return) before sweeping surplus to brokerage.
@@ -285,6 +433,7 @@ class BusinessProfile:
 
     equity_multiple: float = 3.0          # business value = net_profit * this
     sale_year: Optional[int] = None       # sell business in this year; proceeds -> brokerage
+    ownership_pct: float = 1.0            # your ownership share (e.g. 0.50 for 50/50 partnership)
 
 
 @dataclass
