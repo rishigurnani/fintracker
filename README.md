@@ -6,7 +6,8 @@ A self-hosted Streamlit app and Python library for people who want to understand
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-pytest-green.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-360%20passing-brightgreen.svg)](tests/)
+[![Coverage](https://img.shields.io/badge/coverage-~85%25-brightgreen.svg)](tests/)
 
 ---
 
@@ -21,15 +22,21 @@ Most free financial tools give you a single-number answer. fintracker gives you 
 | FICA + Additional Medicare Tax | ✅ | ❌ |
 | HSA saves FICA *and* income tax (correctly) | ✅ | ❌ |
 | 401k vs Roth vs HSA strategy comparison | ✅ | ❌ |
+| Employer 401k match (tiered, vested, profit sharing) | ✅ | ❌ |
 | 529 state deduction by state | ✅ | ❌ |
-| College costs with 529 drawdown + AOTC credit | ✅ | ❌ |
-| Retirement readiness analysis | ✅ | Rare |
+| College costs with 529 drawdown + AOTC credit | ✅ | Rare |
+| Age-based childcare cost schedule | ✅ | ❌ |
+| Retirement readiness (growing annuity formula) | ✅ | Rare |
 | Dual income with independent salary growth | ✅ | ❌ |
 | Stop/resume work (sabbatical, caregiving) | ✅ | ❌ |
+| Business ownership (SE tax, QBI, solo 401k, equity) | ✅ | ❌ |
+| Car financing with replacement cycles and kids' cars | ✅ | ❌ |
 | Parent care costs with timeline events | ✅ | ❌ |
 | PMI with automatic removal at 80% LTV | ✅ | ❌ |
-| Monte Carlo simulation (1,000 runs) | ✅ | Rare |
-| Timeline events (marriage, children, raise) | ✅ | ❌ |
+| Monte Carlo — 5,000 simulations | ✅ | Rare |
+| Historical bootstrap (100yr S&P + 96yr CPI data) | ✅ | ❌ |
+| Cash buffer modelling (emergency fund) | ✅ | ❌ |
+| Timeline events (marriage, children, raise, home) | ✅ | ❌ |
 | YAML config — reproducible, git-friendly | ✅ | N/A |
 | 100% local — your data never leaves your machine | ✅ | ❌ |
 | Open source, hackable | ✅ | ❌ |
@@ -68,27 +75,40 @@ Your browser will open at `http://localhost:8501`.
 
 All personal data lives in `config/personal.yaml`, which is **gitignored** — it will never be accidentally committed. A fully documented sample with all available options is in [`config/sample.yaml`](config/sample.yaml).
 
+### Dollar amounts in the YAML
+
+There are four types of dollar values — the sidebar labels each one clearly:
+
+| Label | Meaning | Examples |
+|---|---|---|
+| **inflated yearly** | Enter today's value; engine multiplies by CPI each year | Lifestyle costs, college costs, car prices, retirement income goal |
+| **fixed** | Same nominal amount every year regardless of inflation | All contributions: 401k, HSA, 529, Roth; employer match amounts |
+| **current** | Enter the actual amount as it stands today | Balances (liquid cash, retirement, brokerage), home price |
+| **own rate** | Grows at its own configured rate, not CPI | Income (salary growth), rent (rent increase rate), business revenue |
+
 ### Minimal example
 
 ```yaml
 projection_years: 30
 
 income:
-  gross_annual_income: 120000
-  filing_status: single   # single | married_filing_jointly | head_of_household
-  state: GA               # GA | CA | NY | TX | FL | WA | IL | NC | VA | CO | OTHER
+  gross_annual_income: 120000          # current
+  filing_status: single                # single | married_filing_jointly | head_of_household
+  state: GA                            # GA | CA | NY | TX | FL | WA | IL | NC | VA | CO | OTHER
 
 housing:
   is_renting: false
-  home_price: 400000
-  down_payment: 80000
+  home_price: 400000                   # current
+  down_payment: 80000                  # current
   interest_rate: 0.065
 
 investments:
-  current_liquid_cash: 100000
-  annual_401k_contribution: 23000
-  annual_hsa_contribution: 4150
+  current_liquid_cash: 100000          # current
+  annual_401k_contribution: 23000      # fixed — stays $23k/yr
+  annual_hsa_contribution: 4150        # fixed
   annual_market_return: 0.08
+  annual_inflation_rate: 0.03
+  annual_salary_growth_rate: 0.04
 
 strategies:
   maximize_hsa: true
@@ -103,97 +123,140 @@ timeline_events:
     new_child: true
 ```
 
-### Retirement readiness example
+### Employer 401k match
 
-Add a `retirement:` block to get an on-track/off-track analysis in the Projections tab:
+Supports any match structure: simple, tiered, capped, cliff vesting, profit sharing.
+
+```yaml
+investments:
+  annual_401k_contribution: 21000      # fixed
+  employer_match:
+    tiers:
+      - match_pct: 1.00
+        up_to_pct_of_salary: 0.03      # 100% match on first 3% of salary
+      - match_pct: 0.50
+        up_to_pct_of_salary: 0.02      # 50% match on next 2%
+    annual_cap: null                   # no dollar cap
+    vesting_years: 3                   # cliff vesting: no match if you leave before yr 3
+    profit_sharing_annual: 0           # flat annual employer add
+```
+
+Common configurations:
+- **Simple 50% on first 6%:** `tiers: [{match_pct: 0.50, up_to_pct_of_salary: 0.06}]`
+- **Dollar-for-dollar on first 3%:** `tiers: [{match_pct: 1.00, up_to_pct_of_salary: 0.03}]`
+- **Capped at $5k:** add `annual_cap: 5000`
+- **Profit sharing only:** `tiers: []`, `profit_sharing_annual: 3000`
+
+### Age-based childcare costs
+
+Replace the flat `monthly_childcare` with a realistic cost curve per life stage:
+
+```yaml
+lifestyle:
+  childcare_profile:
+    phases:
+      - age_start: 0
+        age_end:   2
+        monthly_cost: 2500    # inflated yearly
+      - age_start: 3
+        age_end:   4
+        monthly_cost: 1500
+      - age_start: 5
+        age_end:   12
+        monthly_cost: 600
+      - age_start: 13
+        age_end:   17
+        monthly_cost: 150
+      # age 18+ handled by CollegeProfile; defaults to $0 here
+```
+
+> **YAML formatting note:** Each phase's three fields (`age_start`, `age_end`, `monthly_cost`) must all be indented under the **same** `- ` list marker. A common mistake is splitting them across separate `- ` items — the loader catches this and names the broken phase.
+
+The flat `monthly_childcare` field is retained for backward compatibility.
+
+### Business ownership
+
+```yaml
+business:
+  annual_revenue: 500000              # own rate — grows at revenue_growth_rate
+  expense_ratio: 0.65                 # costs as fraction of revenue
+  revenue_growth_rate: 0.06
+  initial_investment: 150000          # current — one-time startup cost
+  start_year: 2
+  ownership_pct: 0.60                 # your share (e.g. 0.60 = 60%; partner owns 40%)
+  use_qbi_deduction: true
+  self_employed_health_insurance: 18000   # fixed
+  solo_401k_contribution: 40000           # fixed
+  equity_multiple: 3.0
+  sale_year: 20
+```
+
+### Car financing
+
+```yaml
+car:
+  car_price: 35000                    # inflated yearly
+  down_payment: 7000                  # current
+  loan_rate: 0.065
+  loan_term_years: 5
+  replace_every_years: 12
+  residual_value: 6000                # inflated yearly
+  hand_down_age: 16
+  num_cars: 2
+  first_purchase_years: [3, 5]        # projection years of first purchase for each car
+  kids_car:
+    car_price: 15000                  # inflated yearly
+    down_payment_pct: 0.20
+    loan_rate: 0.07
+    loan_term_years: 5
+    buy_at_age: 16                    # 16 = driving age, 22 (or null) = graduation
+```
+
+### Retirement readiness
 
 ```yaml
 retirement:
   current_age: 32
   retirement_age: 65
-  # Desired spending in TODAY'S dollars — engine inflates to nominal
-  desired_annual_income: 80000
+  desired_annual_income: 80000        # inflated yearly — today's dollars
   years_in_retirement: 30
-  # Post-retirement return (typically more conservative than accumulation phase)
   expected_post_retirement_return: 0.05
-  # Your SSA estimate in today's dollars. Set to 0 to be conservative.
-  estimated_social_security_annual: 24000
+  estimated_social_security_annual: 24000   # inflated yearly
 ```
 
-The engine computes:
-- **Projected balance** at retirement year (retirement + brokerage + HSA)
-- **Required balance** = present value of annuity to fund `desired_annual_income` (inflated) minus Social Security, for `years_in_retirement` years at `expected_post_retirement_return`
-- **Funded %** and **annual surplus or gap** in retirement-year dollars
+The engine uses the **growing annuity formula** — spending inflates throughout retirement, not a flat annuity. Projected balance at retirement includes all accounts: 401k/IRA + HSA + brokerage + cash.
 
-### College costs example
-
-Add a `college:` block to model 529 drawdowns and the AOTC credit:
+### College costs
 
 ```yaml
 college:
-  annual_cost_per_child: 35000  # tuition + room & board in TODAY'S dollars
+  annual_cost_per_child: 35000        # inflated yearly
   years_per_child: 4
   start_age: 18
-  use_aotc_credit: true         # up to $2,500/student/yr, first 4 years
-
-# Track birth years with child_birth_year_override for children already born:
-timeline_events:
-  - year: 1
-    description: "Existing child (born 2 years ago)"
-    new_child: true
-    child_birth_year_override: -2
+  use_aotc_credit: true
+  early_529_return: 0.08
+  late_529_return: 0.04
+  glide_path_years: 10
 ```
 
-529 balances draw down tax-free in college years; any shortfall comes from brokerage. AOTC phases out at $80k–$90k (single) or $160k–$180k (MFJ) and is applied as a direct tax credit.
+### Cash buffer
 
-### Stop/resume work example
+```yaml
+investments:
+  cash_buffer_months: 3    # hold 3 months of expenses in cash at 0% before investing surplus
+```
+
+### Stop/resume work
 
 ```yaml
 timeline_events:
   - year: 4
-    description: "Sabbatical year"
+    description: "Sabbatical"
     stop_working: true
   - year: 5
-    description: "Return to work at new employer"
+    description: "Return to work"
     resume_working: true
-    income_change: 145000       # new salary after returning
-```
-
-While stopped, income is zero and salary growth is paused — no phantom compounding during time off. Growth resumes from the new stated salary.
-
-### Parent care example
-
-```yaml
-lifestyle:
-  annual_parent_care_cost: 18000   # in today's dollars; inflates with inflation
-
-timeline_events:
-  - year: 8
-    description: "Mom needs in-home care"
-    start_parent_care: true
-  - year: 14
-    description: "Mom transitions to assisted living (separate account)"
-    stop_parent_care: true
-```
-
-### Dual income example
-
-```yaml
-income:
-  gross_annual_income: 150000
-  spouse_gross_annual_income: 90000
-  filing_status: married_filing_jointly
-
-investments:
-  annual_salary_growth_rate: 0.04
-  partner_salary_growth_rate: 0.06    # partner on a faster track
-  annual_401k_contribution: 23000
-  partner_annual_401k_contribution: 20000   # each person has their own IRS limit
-
-timeline_events:
-  - year: 3
-    description: "Partner promotion"
-    partner_income_change: 120000
+    income_change: 145000
 ```
 
 ---
@@ -203,65 +266,105 @@ timeline_events:
 ### 🧮 Tax Engine
 
 - **2024/2025 federal brackets** — MFJ, Single, Head of Household
-- **FICA** — Social Security (capped at $168,600 wage base), Medicare (1.45%), Additional Medicare Tax (0.9% above $200k/$250k)
-- **HSA** — reduces Federal + FICA + State (except California)
+- **FICA** — Social Security (capped at $168,600), Medicare, Additional Medicare Tax
+- **HSA** — reduces Federal + FICA + State (except CA)
 - **401k** — reduces Federal + State (not FICA — correct)
-- **AOTC** — American Opportunity Tax Credit applied as a direct reduction to effective tax; correct phase-out by filing status
-- **State taxes** — progressive or flat, state-specific standard deductions, 529 deduction rules per state
+- **AOTC** — direct tax credit; correct phase-out by filing status
+- **SE tax** — 15.3% on 92.35% of net profit × ownership share; employer half deductible
+- **QBI deduction** — 20% pass-through, phased out above $191,950 (single) / $383,900 (MFJ)
 
-### 🏠 Mortgage Calculator
+### 🎲 Monte Carlo Simulation
 
-Exact amortization (not approximations):
-- Month-by-month P&I split
-- PMI charged while LTV > 80%, automatically removed
-- Home value appreciation applied each year
-- Full schedule with cumulative interest, equity, and home value
-- Configurable buyer and seller closing costs on purchase/sale events
+5,000 simulations by default:
 
-### 🎓 College Planning
+| Variable | Historical mode (default) | Normal mode |
+|---|---|---|
+| Market returns | Bootstrap from 100yr S&P 500 (1926–2025) | N(μ, σ) |
+| Inflation | Bootstrap from 96yr US CPI (1929–2024) | N(μ, σ) |
+| Salary growth | N(μ, σ) | N(μ, σ) |
 
-- 529 balance tracked separately, grows at the same market return as other accounts
-- In college years, 529 draws down first (tax-free); remainder hits brokerage
-- AOTC: up to $2,500/student/year for first 4 years; correct income phase-out
-- Multiple children tracked independently with their own birth years and college windows
-- `annual_529_contribution` applies per child × number of children
+Historical bootstrap captures deflation (1930s), stagflation (1970s, peak 13.3%), and post-WWII spikes (18.1%) that normal distributions miss — leading to materially more accurate liquidity risk estimates.
 
-### 🛡️ Retirement Readiness
+**p10 / p50 / p90** = 10th, 50th, 90th percentile outcomes. p10 is a bad-luck scenario; p90 is good luck. **Liquidity risk** = probability of brokerage + cash going negative in a given year.
 
-- Present-value-of-annuity math to determine required lump sum at retirement
-- Desired income inflated from today's dollars to nominal retirement-year dollars
-- Social Security offset reduces the required balance
-- Reports: projected vs required balance, funded %, and annual surplus or gap
+Performance: ~1.2ms/simulation; 5,000 sims in ~6s.
 
-### 🎯 Strategy Analyzer
+---
 
-Quantifies the dollar value of each tax strategy in isolation:
-- HSA: "Contributing $4,150 saves ~$1,537/yr in Federal + FICA + State taxes"
-- 401k: "Contributing $23,000 saves ~$6,397/yr in Federal + State taxes"
-- 529: "Deducting $8,000 for 1 child saves ~$431/yr in Georgia state tax"
-- Roth IRA eligibility and phase-out detection
+## Test Suite
 
-### 📈 Projections
+```
+360 tests · 7 files · ~85% coverage on core engine (excl. Streamlit UI)
+```
 
-Year-by-year simulation over up to 40 years, tracking:
-- Gross income, taxes, net income, breathing room
-- Retirement balance (grows at `annual_market_return`, funded by 401k contributions)
-- Brokerage / liquid assets
-- 529 balance (contributions, growth, college drawdowns)
-- Home equity and mortgage balance
-- HSA balance
-- All expenses: housing, lifestyle, medical, childcare, parent care, college costs
+```bash
+pytest tests/ -v --tb=short
+```
 
-Single source of truth: all tabs (Cash Flow, Projections, Strategy) read from the same year-1 projection snapshot — the waterfall chart, monthly KPIs, and projection table always show consistent numbers.
+| File | Tests | Covers |
+|---|---|---|
+| `test_accounting.py` | 68 | Deficit spending, mortgage, childcare, salary growth, medical scaling, marriage, dual income |
+| `test_new_features.py` | 182 | Retirement readiness, stop/resume, college, parent care, auto-invest, cars, MC liquidity, cash buffer, export fidelity, business, employer match, childcare profile, historical bootstrap, ownership_pct, cumulative inflation fix, MC audit |
+| `test_tax_engine.py` | 31 | Federal brackets, FICA, HSA/401k deductions, state taxes |
+| `test_projections.py` | 33 | Deterministic engine, timeline events, Monte Carlo, home purchase, HSA tiers |
+| `test_mortgage.py` | 24 | Monthly payment, amortization, PMI |
+| `test_config.py` | 11 | YAML round-trip for all profile types |
+| `test_strategies.py` | 11 | Strategy savings quantification |
 
-### 🎲 Monte Carlo
+Every known bug has a regression test. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full list.
 
-1,000 simulations with randomized:
-- **Market returns**: N(μ=your assumption, σ=15%)
-- **Inflation**: N(μ=your assumption, σ=1.5%), clipped to [0%, 15%]
-- **Salary growth**: N(μ=your assumption, σ=2%)
+---
 
-Outputs p10/p25/p50/p75/p90 net worth bands, probability of $1M by year 10, and comparison of deterministic vs median outcome.
+## Project Structure
+
+```
+fintracker/
+├── app.py                  # Streamlit UI
+├── fintracker/
+│   ├── models.py           # All dataclasses
+│   ├── tax_engine.py       # Federal + multi-state + SE tax
+│   ├── mortgage.py         # Exact amortization + PMI
+│   ├── strategies.py       # Strategy analyzer
+│   ├── projections.py      # Deterministic + Monte Carlo engine
+│   └── config.py           # YAML load/save
+├── tests/                  # 360 tests
+├── config/
+│   ├── sample.yaml         # Fully documented example (tracked)
+│   └── personal.yaml       # Your private numbers (gitignored)
+├── CONTRIBUTING.md
+├── pyproject.toml
+└── .gitignore
+```
+
+---
+
+## Supported States
+
+| State | Tax Type | HSA | 529 |
+|---|---|---|---|
+| Georgia (GA) | Flat 5.39% | ✅ | ✅ $8k/beneficiary |
+| California (CA) | Progressive | ❌ | ❌ |
+| New York (NY) | Progressive | ✅ | ✅ $5k/beneficiary |
+| Texas (TX) | None | N/A | N/A |
+| Florida (FL) | None | N/A | N/A |
+| Washington (WA) | None | N/A | N/A |
+| Illinois (IL) | Flat 4.95% | ✅ | ✅ $10k/beneficiary |
+| North Carolina (NC) | Flat 4.5% | ✅ | ❌ |
+| Virginia (VA) | Progressive | ✅ | ❌ |
+| Colorado (CO) | Flat 4.4% | ✅ | ✅ $20k/beneficiary |
+
+> **Disclaimer:** Tax laws change annually. fintracker is for planning and scenario analysis — not tax advice. Consult a CPA for your specific situation.
+
+---
+
+## Roadmap
+
+- [ ] Backdoor Roth IRA modelling
+- [ ] Scenario A vs B side-by-side comparison
+- [ ] Rent vs Buy breakeven analysis
+- [ ] Export to PDF report
+- [ ] More states (NJ, MA, AZ, MN)
+- [ ] Graded 401k vesting schedule
 
 ---
 
@@ -291,52 +394,6 @@ All fields are optional unless noted. Multiple events can fire in the same year.
 | `seller_closing_cost_rate` | float | Default 0.06 (6% of sale price) |
 | `extra_one_time_expense` | float | One-time cash outflow (drains brokerage) |
 | `extra_one_time_income` | float | One-time cash inflow (adds to brokerage) |
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v --tb=short
-```
-
-The test suite covers all financial logic with explicit regression tests for every known bug. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full list of documented regressions and rules for adding new tests.
-
-```
-tests/
-├── test_accounting.py      # Core projection engine regressions
-├── test_new_features.py    # Retirement readiness, stop/resume, college, parent care
-├── test_tax_engine.py      # Federal + state tax math
-├── test_mortgage.py        # Amortization, PMI, payment calculations
-├── test_projections.py     # Projection engine behaviours
-├── test_strategies.py      # Strategy analyzer
-└── test_config.py          # YAML round-trip serialization
-```
-
----
-
-## Project Structure
-
-```
-fintracker/
-├── app.py                  # Streamlit UI (single source of truth for all tabs)
-├── fintracker/
-│   ├── models.py           # Dataclasses: FinancialPlan, RetirementProfile,
-│   │                       #   CollegeProfile, TimelineEvent, etc.
-│   ├── tax_engine.py       # Federal + multi-state tax
-│   ├── mortgage.py         # Exact amortization schedule
-│   ├── strategies.py       # HSA, 401k, 529, Roth strategy analyzer
-│   ├── projections.py      # Deterministic + Monte Carlo engine;
-│   │                       #   RetirementReadiness computation
-│   └── config.py           # YAML load/save
-├── tests/
-├── config/
-│   ├── sample.yaml         # ✅ Tracked — fully documented example
-│   └── personal.yaml       # 🔒 Gitignored — your private numbers
-├── CONTRIBUTING.md         # Rules for contributors and AI assistants
-├── pyproject.toml
-└── .gitignore
-```
 
 ---
 
@@ -395,43 +452,9 @@ print(f"Probability of $1M by year 10: {mc.prob_millionaire_10yr:.1%}")
 
 ---
 
-## Supported States
-
-| State | Tax Type | HSA Deduction | 529 Deduction |
-|---|---|---|---|
-| Georgia (GA) | Flat 5.39% | ✅ | ✅ $8k/beneficiary (MFJ) |
-| California (CA) | Progressive | ❌ | ❌ |
-| New York (NY) | Progressive | ✅ | ✅ $5k/beneficiary |
-| Texas (TX) | None | N/A | N/A |
-| Florida (FL) | None | N/A | N/A |
-| Washington (WA) | None | N/A | N/A |
-| Illinois (IL) | Flat 4.95% | ✅ | ✅ $10k/beneficiary |
-| North Carolina (NC) | Flat 4.5% | ✅ | ❌ |
-| Virginia (VA) | Progressive | ✅ | ❌ |
-| Colorado (CO) | Flat 4.4% | ✅ | ✅ $20k/beneficiary |
-
-> **Disclaimer:** Tax laws change annually. This tool is for planning and scenario analysis — not tax advice. Consult a CPA or financial advisor for your specific situation.
-
----
-
-## Roadmap
-
-- [ ] Retirement readiness section in Projections tab UI (display `RetirementReadiness`)
-- [ ] Backdoor Roth IRA modelling
-- [ ] Scenario A vs B side-by-side comparison
-- [ ] Rent vs Buy breakeven analysis
-- [ ] Export to PDF report
-- [ ] More states
-
----
-
 ## Contributing
 
-PRs welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before making changes — it documents the architectural rules and every known regression with its corresponding test.
-
-```bash
-pytest tests/ -v --tb=short
-```
+PRs welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before making changes.
 
 ---
 
