@@ -18,6 +18,19 @@ LIMIT_401K = 23_000            # elective deferral, under age 50
 LIMIT_401K_CATCHUP = 30_500    # age 50+ (base + catch-up)
 LIMIT_SOLO_401K = 69_000       # solo 401k / SEP combined owner limit
 
+
+def limit_401k(age: int | None) -> float:
+    """401k elective-deferral ceiling for a person of the given age.
+
+    The catch-up ceiling applies at age 50+.  When ``age`` is ``None`` (no age
+    information — e.g. a plan without a RetirementProfile) the catch-up ceiling
+    is used: it is the most permissive legal cap and keeps age-agnostic plans
+    unchanged.
+    """
+    if age is None or age >= 50:
+        return LIMIT_401K_CATCHUP
+    return LIMIT_401K
+
 # --- Roth IRA (2024) ---
 ROTH_IRA_LIMIT = 7_000                     # per person, per year
 ROTH_PHASEOUT_SINGLE = (146_000, 161_000)  # MAGI phase-out (single/HoH)

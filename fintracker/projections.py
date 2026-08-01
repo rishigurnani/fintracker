@@ -30,8 +30,8 @@ from typing import Optional
 import numpy as np
 
 from fintracker.constants import (
-    HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_401K_CATCHUP, LIMIT_SOLO_401K,
-    ROTH_IRA_LIMIT,
+    HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
+    limit_401k,
 )
 from fintracker.finance_math import linear_phaseout, monthly_amortized_payment
 from fintracker.models import (
@@ -950,11 +950,17 @@ class ProjectionEngine:
         hsa_limit = HSA_LIMIT_FAMILY if is_family else HSA_LIMIT_SINGLE
         hsa       = min(inv.annual_hsa_contribution, hsa_limit) if strat.maximize_hsa else 0.0
 
-        # Projections apply the age-50 catch-up ceiling (no age tracked in state),
-        # i.e. the most permissive legal cap on elective deferrals.
-        k401         = min(inv.annual_401k_contribution, LIMIT_401K_CATCHUP)
+        # Age-aware 401k ceiling: catch-up (age 50+) vs base, driven by the
+        # primary's age this projection year.  Without a RetirementProfile the
+        # age is unknown and limit_401k falls back to the catch-up ceiling.
+        # The partner shares the primary's age basis (no separate partner age is
+        # modelled); this only matters when a partner contributes above the base.
+        rp = self._plan.retirement
+        age = rp.current_age + (year - 1) if rp else None
+        k401_cap = limit_401k(age)
+        k401         = min(inv.annual_401k_contribution, k401_cap)
         partner_k401 = (
-            min(inv.partner_annual_401k_contribution, LIMIT_401K_CATCHUP)
+            min(inv.partner_annual_401k_contribution, k401_cap)
             if state.income_partner > 0 else 0.0
         )
 
