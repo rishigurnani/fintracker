@@ -13,6 +13,8 @@ These tests verify:
   9. 529 contributions are after-tax (subtracted from breathing room)
  10. Net worth = retirement + brokerage + home_equity + hsa (no double-counting)
 """
+import dataclasses
+
 import pytest
 from fintracker.models import (
     FilingStatus, State,
@@ -21,27 +23,20 @@ from fintracker.models import (
 )
 from fintracker.projections import ProjectionEngine
 from fintracker.mortgage import MortgageCalculator
+from tests.builders import make_plan, investments, zero_lifestyle, renting_housing
 
 
 # ── Shared fixtures ────────────────────────────────────────────────────────────
 
 def _simple_plan(**overrides) -> FinancialPlan:
     """Zero-inflation, zero-growth baseline for isolating one variable at a time."""
-    defaults = dict(
-        income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
-        housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000),
-        lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0),
-        investments=InvestmentProfile(
-            current_liquid_cash=500_000,
-            annual_market_return=0.0,
-            annual_inflation_rate=0.0,
-            annual_salary_growth_rate=0.0,
-        ),
-        strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
-        projection_years=5,
-    )
-    defaults.update(overrides)
-    return FinancialPlan(**defaults)
+    return make_plan(**{
+        "income": IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
+        "housing": renting_housing(1_000),
+        "lifestyle": LifestyleProfile(annual_vacation=0, monthly_other_recurring=0),
+        "projection_years": 5,
+        **overrides,
+    })
 
 
 # ── 1. Deficit spending ────────────────────────────────────────────────────────
@@ -503,17 +498,13 @@ class TestMedicalScaling:
 class TestMarriageEvent:
 
     def _plan(self, events):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(180_000, FilingStatus.SINGLE, State.GEORGIA),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(annual_medical_oop=3_000, medical_auto_scale=True,
                                        medical_spouse_multiplier=2.0, medical_per_child_annual=1_500,
                                        annual_vacation=0, monthly_other_recurring=0),
-            investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_hsa_contribution=4_150,
-                                          annual_401k_contribution=23_000,
-                                          annual_market_return=0.0, annual_inflation_rate=0.0,
-                                          annual_salary_growth_rate=0.0),
+            investments=investments(current_liquid_cash=200_000, annual_hsa_contribution=4_150,
+                                    annual_401k_contribution=23_000),
             strategies=StrategyToggles(maximize_hsa=True, maximize_401k=True),
             timeline_events=events,
             projection_years=3,
@@ -704,14 +695,9 @@ class TestMaximizeContributions:
 class TestIncomeChangeEvent:
 
     def _plan(self, events, salary_growth=0.0):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(current_liquid_cash=200_000, annual_market_return=0.0,
-                                          annual_inflation_rate=0.0,
-                                          annual_salary_growth_rate=salary_growth),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=200_000, annual_salary_growth_rate=salary_growth),
             timeline_events=events,
             projection_years=4,
         )
@@ -734,13 +720,9 @@ class TestIncomeChangeEvent:
 class TestOneTimeEvents:
 
     def _plan(self, liquid, events):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(current_liquid_cash=liquid, annual_market_return=0.0,
-                                          annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=liquid),
             timeline_events=events,
             projection_years=3,
         )
@@ -802,18 +784,10 @@ class TestMultipleEventsSameYear:
 class TestClosingCosts:
 
     def _plan(self, events, liquid=200_000, brokerage=300_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(
-                current_liquid_cash=liquid,
-                current_brokerage_balance=brokerage,
-                annual_market_return=0.0,
-                annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            housing=renting_housing(1_000),
+            investments=investments(current_liquid_cash=liquid, current_brokerage_balance=brokerage),
             timeline_events=events,
             projection_years=3,
         )
@@ -923,26 +897,13 @@ class TestClosingCosts:
             )],
             projection_years=3,
         )
-        plan_no_costs = FinancialPlan(
-            income=IncomeProfile(180_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(400_000, 100_000, 0.065),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(
-                current_liquid_cash=50_000,
-                annual_market_return=0.0,
-                annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
-            timeline_events=[TimelineEvent(
-                year=2, description="Upsize",
-                buy_home=True, sell_current_home=True,
-                new_home_price=600_000, new_home_down_payment=120_000,
-                new_home_interest_rate=0.065,
-                buyer_closing_cost_rate=0.0,
-                seller_closing_cost_rate=0.0,
+        # Same plan, but with closing costs zeroed out — isolates their effect.
+        plan_no_costs = dataclasses.replace(
+            plan_both,
+            timeline_events=[dataclasses.replace(
+                plan_both.timeline_events[0],
+                buyer_closing_cost_rate=0.0, seller_closing_cost_rate=0.0,
             )],
-            projection_years=3,
         )
         s_both = ProjectionEngine(plan_both).run_deterministic()
         s_none = ProjectionEngine(plan_no_costs).run_deterministic()

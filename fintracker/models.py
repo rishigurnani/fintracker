@@ -32,6 +32,45 @@ class State(str, Enum):
     OTHER         = "OTHER"
 
 
+def by_filing_status(status, single, mfj, hoh=None):
+    """Pick a value by filing status.
+
+    ``status`` may be a :class:`FilingStatus` or a plain bool where ``True`` means
+    married-filing-jointly (convenient at call sites that only track ``is_married``).
+    ``hoh`` falls back to the ``single`` value when omitted, matching the common
+    case where head-of-household shares the single figure.
+    """
+    if status is True or status == FilingStatus.MARRIED_FILING_JOINTLY:
+        return mfj
+    if hoh is not None and status == FilingStatus.HEAD_OF_HOUSEHOLD:
+        return hoh
+    return single
+
+
+class RangePhase:
+    """Mixin for a value that applies over an inclusive ``[start, end]`` range.
+
+    Subclasses expose ``start``, ``end``, and ``value`` (typically as properties
+    over their own domain-specific field names) so a single lookup routine works
+    for every phased schedule — childcare costs, Roth contributions, etc.
+    """
+
+    def covers(self, x) -> bool:
+        return self.start <= x <= self.end
+
+
+def value_over_phases(phases, x, default: float = 0.0) -> float:
+    """Return the ``value`` of the first phase covering ``x``; ``default`` if none.
+
+    Works with any iterable of :class:`RangePhase` (or anything exposing
+    ``start``/``end``/``value``).  ``phases`` may be ``None``.
+    """
+    for phase in phases or ():
+        if phase.start <= x <= phase.end:
+            return phase.value
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Income
 # ---------------------------------------------------------------------------
@@ -87,7 +126,7 @@ class HousingProfile:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ChildcarePhase:
+class ChildcarePhase(RangePhase):
     """
     Cost of childcare for a child in a given age range.
 
@@ -98,6 +137,14 @@ class ChildcarePhase:
     age_start: int          # first age this phase applies to (inclusive)
     age_end:   int          # last age this phase applies to (inclusive)
     monthly_cost: float     # today's dollars per month per child at this age
+
+    # RangePhase interface — see value_over_phases()
+    @property
+    def start(self) -> int: return self.age_start
+    @property
+    def end(self) -> int: return self.age_end
+    @property
+    def value(self) -> float: return self.monthly_cost
 
 
 @dataclass
@@ -136,10 +183,7 @@ class ChildcareProfile:
 
     def monthly_cost_at_age(self, age: int) -> float:
         """Return the monthly cost for a child of the given age. 0 if not covered."""
-        for phase in self.phases:
-            if phase.age_start <= age <= phase.age_end:
-                return phase.monthly_cost
-        return 0.0
+        return value_over_phases(self.phases, age)
 
 
 @dataclass
@@ -200,7 +244,7 @@ class LifestyleProfile:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RothContributionPhase:
+class RothContributionPhase(RangePhase):
     """
     A projection-year range during which a specific Roth IRA contribution is made.
 
@@ -218,6 +262,14 @@ class RothContributionPhase:
     year_start: int
     year_end: int
     annual_amount: float
+
+    # RangePhase interface — see value_over_phases()
+    @property
+    def start(self) -> int: return self.year_start
+    @property
+    def end(self) -> int: return self.year_end
+    @property
+    def value(self) -> float: return self.annual_amount
 
 
 @dataclass
@@ -359,10 +411,7 @@ class InvestmentProfile:
         Uses the phase schedule if set, otherwise the flat annual amount.
         Returns 0.0 for years not covered by any phase."""
         if self.roth_contribution_schedule:
-            for phase in self.roth_contribution_schedule:
-                if phase.year_start <= year <= phase.year_end:
-                    return phase.annual_amount
-            return 0.0
+            return value_over_phases(self.roth_contribution_schedule, year)
         return self.annual_roth_ira_contribution
 
     @property

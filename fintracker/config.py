@@ -8,11 +8,21 @@ Usage::
 
     plan = load_plan("config/personal.yaml")
     save_plan(plan, "config/personal.yaml")
+
+Design
+------
+Each profile is described once by a *field spec* — a list of
+``(name, load_cast, default[, dump_transform])`` tuples — and the generic
+:func:`_build` / :func:`_dump` helpers drive both directions.  This replaces the
+old hand-written mirror where every field was spelled out twice (once to parse,
+once to serialise) and the two lists could silently drift apart.
+
+Only genuinely special fields (enums, nested objects, phase lists, and a couple
+of back-compat aliases) need bespoke handling on top of the specs.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -21,6 +31,212 @@ from fintracker.models import (
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Spec-driven build / dump
+# ---------------------------------------------------------------------------
+
+def _raw(v):
+    """Pass a value through untouched (optional fields with no coercion)."""
+    return v
+
+
+def _opt(cast):
+    """Optional cast: ``None`` stays ``None``, otherwise apply ``cast``."""
+    return lambda v: None if v is None else cast(v)
+
+
+def _opt_falsy(cast):
+    """Optional cast treating falsy input (0/None/'') as ``None``.
+
+    Matches the historical ``float(d[k]) if d.get(k) else None`` idiom used for
+    optional home-purchase amounts.
+    """
+    return lambda v: cast(v) if v else None
+
+
+def _build(cls, d, spec, **extra):
+    """Instantiate ``cls`` from dict ``d`` using ``spec`` (+ any ``extra`` kwargs)."""
+    kwargs = {name: cast(d.get(name, default)) for name, cast, default, *_ in spec}
+    kwargs.update(extra)
+    return cls(**kwargs)
+
+
+def _dump(obj, spec):
+    """Serialise ``obj`` to a dict of ``{field: value}`` per ``spec``.
+
+    A 4th spec element, if present, is a transform applied to non-None values on
+    the way out (e.g. ``FilingStatus`` → its string value).
+    """
+    out = {}
+    for name, _cast, _default, *rest in spec:
+        val = getattr(obj, name)
+        dump_fn = rest[0] if rest else None
+        out[name] = dump_fn(val) if (dump_fn and val is not None) else val
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Field specs — each field declared once, drives both load and save.
+# Tuple: (name, load_cast, default[, dump_transform])
+# ---------------------------------------------------------------------------
+
+_INCOME_SPEC = [
+    ("gross_annual_income", float, 100_000),
+    ("filing_status", FilingStatus, "single", lambda e: e.value),
+    ("state", State, "GA", lambda e: e.value),
+    ("other_state_flat_rate", float, 0.05),
+    ("spouse_gross_annual_income", float, 0),
+]
+
+_HOUSING_SPEC = [
+    ("home_price", float, 400_000),
+    ("down_payment", float, 80_000),
+    ("interest_rate", float, 0.065),
+    ("loan_term_years", int, 30),
+    ("annual_property_tax_rate", float, 0.012),
+    ("annual_insurance", float, 2_000),
+    ("annual_maintenance_rate", float, 0.01),
+    ("pmi_annual_rate", float, 0.005),
+    ("is_renting", bool, False),
+    ("monthly_rent", float, 0),
+    ("annual_rent_increase_rate", float, 0.03),
+]
+
+# Flat lifestyle fields; childcare_profile is nested (handled separately).
+_LIFESTYLE_SPEC = [
+    ("monthly_childcare", float, 0),
+    ("num_children", int, 0),
+    ("num_pets", int, 0),
+    ("annual_pet_cost", float, 0),
+    ("annual_medical_oop", float, 3_000),
+    ("medical_auto_scale", bool, True),
+    ("medical_spouse_multiplier", float, 1.8),
+    ("medical_per_child_annual", float, 1_500),
+    ("annual_vacation", float, 5_000),
+    ("monthly_other_recurring", float, 500),
+    ("annual_parent_care_cost", float, 0),
+    ("annual_wedding_fund_per_child", float, 0),
+]
+
+# Flat investment fields; auto_invest_surplus, employer_match and the roth
+# schedule need bespoke handling (see _dict_to_plan / _plan_to_dict).
+_INVESTMENTS_SPEC = [
+    ("current_liquid_cash", float, 50_000),
+    ("current_retirement_balance", float, 0),
+    ("current_brokerage_balance", float, 0),
+    ("one_time_upcoming_expenses", float, 0),
+    ("annual_401k_contribution", float, 23_000),
+    ("partner_annual_401k_contribution", float, 0),
+    ("annual_roth_ira_contribution", float, 0),
+    ("annual_hsa_contribution", float, 4_150),
+    ("annual_529_contribution", float, 0),
+    ("annual_brokerage_contribution", float, 0),
+    ("annual_market_return", float, 0.08),
+    ("annual_inflation_rate", float, 0.03),
+    ("annual_salary_growth_rate", float, 0.04),
+    ("partner_salary_growth_rate", float, 0.04),
+    ("annual_home_appreciation_rate", float, 0.035),
+    ("cash_buffer_months", float, 0.0),
+    ("current_roth_ira_balance", float, 0.0),
+]
+
+_STRATEGIES_SPEC = [
+    ("maximize_hsa", bool, True),
+    ("use_529_state_deduction", bool, False),
+    ("maximize_401k", bool, True),
+    ("use_roth_ladder", bool, False),
+    ("use_backdoor_roth", bool, False),
+    ("roth_conversion_annual_amount", float, 0),
+]
+
+_RETIREMENT_SPEC = [
+    ("current_age", int, 35),
+    ("retirement_age", int, 65),
+    ("desired_annual_income", float, 80_000),
+    ("years_in_retirement", int, 30),
+    ("expected_post_retirement_return", float, 0.05),
+    ("estimated_social_security_annual", float, 0),
+    ("retirement_withdrawal_tax_rate", float, 0.0),
+    ("capital_gains_tax_rate", float, 0.0),
+]
+
+_COLLEGE_SPEC = [
+    ("annual_cost_per_child", float, 35_000),
+    ("years_per_child", int, 4),
+    ("start_age", int, 18),
+    ("use_aotc_credit", bool, True),
+    ("early_529_return", float, 0.08),
+    ("late_529_return", float, 0.04),
+    ("glide_path_years", int, 10),
+]
+
+_BUSINESS_SPEC = [
+    ("annual_revenue", float, 0.0),
+    ("expense_ratio", float, 0.60),
+    ("revenue_growth_rate", float, 0.05),
+    ("initial_investment", float, 0.0),
+    ("start_year", int, 1),
+    ("use_qbi_deduction", bool, True),
+    ("self_employed_health_insurance", float, 0.0),
+    ("solo_401k_contribution", float, 0.0),
+    ("sep_ira_contribution", float, 0.0),
+    ("equity_multiple", float, 3.0),
+    ("sale_year", _opt(int), None),
+    ("ownership_pct", float, 1.0),
+]
+
+# Flat car fields; kids_car (nested) and first_purchase_years (list) are extra.
+_CAR_SPEC = [
+    ("car_price", float, 25_000),
+    ("down_payment", float, 5_000),
+    ("loan_rate", float, 0.065),
+    ("loan_term_years", int, 5),
+    ("replace_every_years", int, 10),
+    ("residual_value", float, 5_000),
+    ("hand_down_age", int, 16),
+    ("num_cars", int, 1),
+]
+
+_KID_CAR_SPEC = [
+    ("car_price", float, 15_000),
+    ("down_payment_pct", float, 0.20),
+    ("loan_rate", float, 0.07),
+    ("loan_term_years", int, 5),
+    ("buy_at_age", _raw, None),
+]
+
+# home_price_override is a load-only back-compat alias (not serialised).
+_EVENT_SPEC = [
+    ("year", int, 0),
+    ("description", str, ""),
+    ("income_change", _raw, None),
+    ("partner_income_change", _raw, None),
+    ("stop_working", bool, False),
+    ("resume_working", bool, False),
+    ("partner_stop_working", bool, False),
+    ("partner_resume_working", bool, False),
+    ("start_parent_care", bool, False),
+    ("stop_parent_care", bool, False),
+    ("child_birth_year_override", _raw, None),
+    ("new_child", bool, False),
+    ("new_pet", bool, False),
+    ("marriage", bool, False),
+    ("buy_home", bool, False),
+    ("new_home_price", _opt_falsy(float), None),
+    ("new_home_down_payment", _opt_falsy(float), None),
+    ("new_home_interest_rate", _opt_falsy(float), None),
+    ("sell_current_home", bool, True),
+    ("buyer_closing_cost_rate", float, 0.02),
+    ("seller_closing_cost_rate", float, 0.06),
+    ("extra_one_time_expense", float, 0),
+    ("extra_one_time_income", float, 0),
+]
+
+_CHILDCARE_PHASE_SPEC = [("age_start", int, 0), ("age_end", int, 0), ("monthly_cost", float, 0.0)]
+_ROTH_PHASE_SPEC = [("year_start", int, 0), ("year_end", int, 0), ("annual_amount", float, 0.0)]
+_MATCH_TIER_SPEC = [("match_pct", float, 0.0), ("up_to_pct_of_salary", float, 0.0)]
 
 
 # ---------------------------------------------------------------------------
@@ -58,98 +274,34 @@ def load_plan_or_sample(path: str | Path = "config/personal.yaml") -> FinancialP
 # ---------------------------------------------------------------------------
 
 def _dict_to_plan(d: dict) -> FinancialPlan:
-    inc_d = d.get("income", {})
-    income = IncomeProfile(
-        gross_annual_income=float(inc_d.get("gross_annual_income", 100_000)),
-        filing_status=FilingStatus(inc_d.get("filing_status", "single")),
-        state=State(inc_d.get("state", "GA")),
-        other_state_flat_rate=float(inc_d.get("other_state_flat_rate", 0.05)),
-        spouse_gross_annual_income=float(inc_d.get("spouse_gross_annual_income", 0)),
-    )
-
-    h_d = d.get("housing", {})
-    housing = HousingProfile(
-        home_price=float(h_d.get("home_price", 400_000)),
-        down_payment=float(h_d.get("down_payment", 80_000)),
-        interest_rate=float(h_d.get("interest_rate", 0.065)),
-        loan_term_years=int(h_d.get("loan_term_years", 30)),
-        annual_property_tax_rate=float(h_d.get("annual_property_tax_rate", 0.012)),
-        annual_insurance=float(h_d.get("annual_insurance", 2_000)),
-        annual_maintenance_rate=float(h_d.get("annual_maintenance_rate", 0.01)),
-        pmi_annual_rate=float(h_d.get("pmi_annual_rate", 0.005)),
-        is_renting=bool(h_d.get("is_renting", False)),
-        monthly_rent=float(h_d.get("monthly_rent", 0)),
-        annual_rent_increase_rate=float(h_d.get("annual_rent_increase_rate", 0.03)),
-    )
+    income   = _build(IncomeProfile, d.get("income", {}), _INCOME_SPEC)
+    housing  = _build(HousingProfile, d.get("housing", {}), _HOUSING_SPEC)
 
     l_d = d.get("lifestyle", {})
-    lifestyle = LifestyleProfile(
-        monthly_childcare=float(l_d.get("monthly_childcare", 0)),
-        num_children=int(l_d.get("num_children", 0)),
-        num_pets=int(l_d.get("num_pets", 0)),
-        annual_pet_cost=float(l_d.get("annual_pet_cost", 0)),
-        annual_medical_oop=float(l_d.get("annual_medical_oop", 3_000)),
-        medical_auto_scale=bool(l_d.get("medical_auto_scale", True)),
-        medical_spouse_multiplier=float(l_d.get("medical_spouse_multiplier", 1.8)),
-        medical_per_child_annual=float(l_d.get("medical_per_child_annual", 1_500)),
-        annual_vacation=float(l_d.get("annual_vacation", 5_000)),
-        monthly_other_recurring=float(l_d.get("monthly_other_recurring", 500)),
-        annual_parent_care_cost=float(l_d.get("annual_parent_care_cost", 0)),
-        annual_wedding_fund_per_child=float(l_d.get("annual_wedding_fund_per_child", 0)),
-        childcare_profile=_dict_to_childcare_profile(l_d["childcare_profile"])
-            if "childcare_profile" in l_d else None,
+    lifestyle = _build(
+        LifestyleProfile, l_d, _LIFESTYLE_SPEC,
+        childcare_profile=(_dict_to_childcare_profile(l_d["childcare_profile"])
+                           if "childcare_profile" in l_d else None),
     )
 
     inv_d = d.get("investments", {})
     s_d   = d.get("strategies", {})
     # auto_invest_surplus lives in investments:; read from strategies: for back-compat
     auto_invest = inv_d.get("auto_invest_surplus", s_d.get("auto_invest_surplus", True))
-    investments = InvestmentProfile(
-        current_liquid_cash=float(inv_d.get("current_liquid_cash", 50_000)),
-        current_retirement_balance=float(inv_d.get("current_retirement_balance", 0)),
-        current_brokerage_balance=float(inv_d.get("current_brokerage_balance", 0)),
-        one_time_upcoming_expenses=float(inv_d.get("one_time_upcoming_expenses", 0)),
-        annual_401k_contribution=float(inv_d.get("annual_401k_contribution", 23_000)),
-        partner_annual_401k_contribution=float(inv_d.get("partner_annual_401k_contribution", 0)),
-        annual_roth_ira_contribution=float(inv_d.get("annual_roth_ira_contribution", 0)),
-        annual_hsa_contribution=float(inv_d.get("annual_hsa_contribution", 4_150)),
-        annual_529_contribution=float(inv_d.get("annual_529_contribution", 0)),
-        annual_brokerage_contribution=float(inv_d.get("annual_brokerage_contribution", 0)),
-        annual_market_return=float(inv_d.get("annual_market_return", 0.08)),
-        annual_inflation_rate=float(inv_d.get("annual_inflation_rate", 0.03)),
-        annual_salary_growth_rate=float(inv_d.get("annual_salary_growth_rate", 0.04)),
-        partner_salary_growth_rate=float(inv_d.get("partner_salary_growth_rate", 0.04)),
-        annual_home_appreciation_rate=float(inv_d.get("annual_home_appreciation_rate", 0.035)),
+    investments = _build(
+        InvestmentProfile, inv_d, _INVESTMENTS_SPEC,
         auto_invest_surplus=bool(auto_invest),
-        cash_buffer_months=float(inv_d.get("cash_buffer_months", 0.0)),
         employer_match=(_dict_to_employer_match(inv_d["employer_match"])
                         if "employer_match" in inv_d else None),
-        current_roth_ira_balance=float(inv_d.get("current_roth_ira_balance", 0.0)),
         roth_contribution_schedule=(
-            [RothContributionPhase(
-                year_start=int(p["year_start"]),
-                year_end=int(p["year_end"]),
-                annual_amount=float(p["annual_amount"]),
-             ) for p in inv_d["roth_contribution_schedule"]]
+            [_build(RothContributionPhase, p, _ROTH_PHASE_SPEC)
+             for p in inv_d["roth_contribution_schedule"]]
             if "roth_contribution_schedule" in inv_d else None
         ),
     )
 
-    strategies = StrategyToggles(
-        maximize_hsa=bool(s_d.get("maximize_hsa", True)),
-        use_529_state_deduction=bool(s_d.get("use_529_state_deduction", False)),
-        maximize_401k=bool(s_d.get("maximize_401k", True)),
-        use_roth_ladder=bool(s_d.get("use_roth_ladder", False)),
-        use_backdoor_roth=bool(s_d.get("use_backdoor_roth", False)),
-        roth_conversion_annual_amount=float(s_d.get("roth_conversion_annual_amount", 0)),
-    )
-
+    strategies = _build(StrategyToggles, s_d, _STRATEGIES_SPEC)
     events = [_dict_to_event(e) for e in d.get("timeline_events", [])]
-
-    retirement = _dict_to_retirement(d["retirement"]) if "retirement" in d else None
-    college    = _dict_to_college(d["college"])    if "college"    in d else None
-    car        = _dict_to_car(d["car"])            if "car"        in d else None
-    business   = _dict_to_business(d["business"]) if "business"   in d else None
 
     return FinancialPlan(
         income=income,
@@ -159,65 +311,17 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         strategies=strategies,
         timeline_events=events,
         projection_years=int(d.get("projection_years", 30)),
-        retirement=retirement,
-        college=college,
-        car=car,
-        business=business,
+        retirement=_build(RetirementProfile, d["retirement"], _RETIREMENT_SPEC) if "retirement" in d else None,
+        college=_build(CollegeProfile, d["college"], _COLLEGE_SPEC) if "college" in d else None,
+        car=_dict_to_car(d["car"]) if "car" in d else None,
+        business=_build(BusinessProfile, d["business"], _BUSINESS_SPEC) if "business" in d else None,
     )
 
 
 def _dict_to_event(e: dict) -> TimelineEvent:
-    return TimelineEvent(
-        year=int(e["year"]),
-        description=str(e.get("description", "")),
-        income_change=e.get("income_change"),
-        partner_income_change=e.get("partner_income_change"),
-        stop_working=bool(e.get("stop_working", False)),
-        resume_working=bool(e.get("resume_working", False)),
-        partner_stop_working=bool(e.get("partner_stop_working", False)),
-        partner_resume_working=bool(e.get("partner_resume_working", False)),
-        start_parent_care=bool(e.get("start_parent_care", False)),
-        stop_parent_care=bool(e.get("stop_parent_care", False)),
-        child_birth_year_override=e.get("child_birth_year_override"),
-        new_child=bool(e.get("new_child", False)),
-        new_pet=bool(e.get("new_pet", False)),
-        marriage=bool(e.get("marriage", False)),
-        buy_home=bool(e.get("buy_home", False)),
-        new_home_price=float(e["new_home_price"]) if e.get("new_home_price") else None,
-        new_home_down_payment=float(e["new_home_down_payment"]) if e.get("new_home_down_payment") else None,
-        new_home_interest_rate=float(e["new_home_interest_rate"]) if e.get("new_home_interest_rate") else None,
-        sell_current_home=bool(e.get("sell_current_home", True)),
-        buyer_closing_cost_rate=float(e.get("buyer_closing_cost_rate", 0.02)),
-        seller_closing_cost_rate=float(e.get("seller_closing_cost_rate", 0.06)),
-        home_price_override=e.get("home_price_override"),
-        extra_one_time_expense=float(e.get("extra_one_time_expense", 0)),
-        extra_one_time_income=float(e.get("extra_one_time_income", 0)),
-    )
-
-
-def _dict_to_retirement(r: dict) -> RetirementProfile:
-    return RetirementProfile(
-        current_age=int(r.get("current_age", 35)),
-        retirement_age=int(r.get("retirement_age", 65)),
-        desired_annual_income=float(r.get("desired_annual_income", 80_000)),
-        years_in_retirement=int(r.get("years_in_retirement", 30)),
-        expected_post_retirement_return=float(r.get("expected_post_retirement_return", 0.05)),
-        estimated_social_security_annual=float(r.get("estimated_social_security_annual", 0)),
-        retirement_withdrawal_tax_rate=float(r.get("retirement_withdrawal_tax_rate", 0.0)),
-        capital_gains_tax_rate=float(r.get("capital_gains_tax_rate", 0.0)),
-    )
-
-
-def _dict_to_college(c: dict) -> CollegeProfile:
-    return CollegeProfile(
-        annual_cost_per_child=float(c.get("annual_cost_per_child", 35_000)),
-        years_per_child=int(c.get("years_per_child", 4)),
-        start_age=int(c.get("start_age", 18)),
-        use_aotc_credit=bool(c.get("use_aotc_credit", True)),
-        early_529_return=float(c.get("early_529_return", 0.08)),
-        late_529_return=float(c.get("late_529_return", 0.04)),
-        glide_path_years=int(c.get("glide_path_years", 10)),
-    )
+    # home_price_override is a load-only back-compat alias, so it lives outside the spec.
+    return _build(TimelineEvent, e, _EVENT_SPEC,
+                  home_price_override=e.get("home_price_override"))
 
 
 def _dict_to_childcare_profile(cp: dict) -> ChildcareProfile:
@@ -246,67 +350,25 @@ def _dict_to_childcare_profile(cp: dict) -> ChildcareProfile:
                 f"Common fix: ensure age_start, age_end, and monthly_cost are all "
                 f"indented under the same '- ' list marker (not separate list items)."
             )
-        phases.append(ChildcarePhase(
-            age_start=int(p["age_start"]),
-            age_end=int(p["age_end"]),
-            monthly_cost=float(p["monthly_cost"]),
-        ))
+        phases.append(_build(ChildcarePhase, p, _CHILDCARE_PHASE_SPEC))
     return ChildcareProfile(phases=phases)
 
 
 def _dict_to_employer_match(em: dict) -> EmployerMatch:
-    tiers = [
-        MatchTier(
-            match_pct=float(t["match_pct"]),
-            up_to_pct_of_salary=float(t["up_to_pct_of_salary"]),
-        )
-        for t in em.get("tiers", [])
-    ]
     return EmployerMatch(
-        tiers=tiers,
+        tiers=[_build(MatchTier, t, _MATCH_TIER_SPEC) for t in em.get("tiers", [])],
         annual_cap=em.get("annual_cap"),          # None = no cap
         vesting_years=int(em.get("vesting_years", 0)),
         profit_sharing_annual=float(em.get("profit_sharing_annual", 0.0)),
     )
 
 
-def _dict_to_business(b: dict) -> BusinessProfile:
-    return BusinessProfile(
-        annual_revenue=float(b.get("annual_revenue", 0.0)),
-        expense_ratio=float(b.get("expense_ratio", 0.60)),
-        revenue_growth_rate=float(b.get("revenue_growth_rate", 0.05)),
-        initial_investment=float(b.get("initial_investment", 0.0)),
-        start_year=int(b.get("start_year", 1)),
-        use_qbi_deduction=bool(b.get("use_qbi_deduction", True)),
-        self_employed_health_insurance=float(b.get("self_employed_health_insurance", 0.0)),
-        solo_401k_contribution=float(b.get("solo_401k_contribution", 0.0)),
-        sep_ira_contribution=float(b.get("sep_ira_contribution", 0.0)),
-        equity_multiple=float(b.get("equity_multiple", 3.0)),
-        sale_year=b.get("sale_year"),
-        ownership_pct=float(b.get("ownership_pct", 1.0)),
-    )
-
-
 def _dict_to_car(c: dict) -> CarProfile:
     kc_d = c.get("kids_car")
-    kids_car = KidCarProfile(
-        car_price=float(kc_d.get("car_price", 15_000)),
-        down_payment_pct=float(kc_d.get("down_payment_pct", 0.20)),
-        loan_rate=float(kc_d.get("loan_rate", 0.07)),
-        loan_term_years=int(kc_d.get("loan_term_years", 5)),
-        buy_at_age=kc_d.get("buy_at_age"),  # None = graduation age
-    ) if kc_d else None
     fpy = c.get("first_purchase_years")
-    return CarProfile(
-        car_price=float(c.get("car_price", 25_000)),
-        down_payment=float(c.get("down_payment", 5_000)),
-        loan_rate=float(c.get("loan_rate", 0.065)),
-        loan_term_years=int(c.get("loan_term_years", 5)),
-        replace_every_years=int(c.get("replace_every_years", 10)),
-        residual_value=float(c.get("residual_value", 5_000)),
-        hand_down_age=int(c.get("hand_down_age", 16)),
-        num_cars=int(c.get("num_cars", 1)),
-        kids_car=kids_car,
+    return _build(
+        CarProfile, c, _CAR_SPEC,
+        kids_car=_build(KidCarProfile, kc_d, _KID_CAR_SPEC) if kc_d else None,
         first_purchase_years=[int(y) for y in fpy] if fpy else None,
     )
 
@@ -316,185 +378,51 @@ def _dict_to_car(c: dict) -> CarProfile:
 # ---------------------------------------------------------------------------
 
 def _plan_to_dict(plan: FinancialPlan) -> dict:
+    investments = _dump(plan.investments, _INVESTMENTS_SPEC)
+    investments["auto_invest_surplus"] = plan.investments.auto_invest_surplus
+    if plan.investments.roth_contribution_schedule:
+        investments["roth_contribution_schedule"] = [
+            _dump(p, _ROTH_PHASE_SPEC) for p in plan.investments.roth_contribution_schedule
+        ]
+    if plan.investments.employer_match:
+        em = plan.investments.employer_match
+        investments["employer_match"] = {
+            "tiers": [_dump(t, _MATCH_TIER_SPEC) for t in em.tiers],
+            "annual_cap": em.annual_cap,
+            "vesting_years": em.vesting_years,
+            "profit_sharing_annual": em.profit_sharing_annual,
+        }
+
+    lifestyle = _dump(plan.lifestyle, _LIFESTYLE_SPEC)
+    if plan.lifestyle.childcare_profile:
+        lifestyle["childcare_profile"] = {
+            "phases": [_dump(p, _CHILDCARE_PHASE_SPEC) for p in plan.lifestyle.childcare_profile.phases]
+        }
+
     d: dict = {
         "projection_years": plan.projection_years,
-        "income": {
-            "gross_annual_income": plan.income.gross_annual_income,
-            "filing_status": plan.income.filing_status.value,
-            "state": plan.income.state.value,
-            "other_state_flat_rate": plan.income.other_state_flat_rate,
-            "spouse_gross_annual_income": plan.income.spouse_gross_annual_income,
-        },
-        "housing": {
-            "home_price": plan.housing.home_price,
-            "down_payment": plan.housing.down_payment,
-            "interest_rate": plan.housing.interest_rate,
-            "loan_term_years": plan.housing.loan_term_years,
-            "annual_property_tax_rate": plan.housing.annual_property_tax_rate,
-            "annual_insurance": plan.housing.annual_insurance,
-            "annual_maintenance_rate": plan.housing.annual_maintenance_rate,
-            "pmi_annual_rate": plan.housing.pmi_annual_rate,
-            "is_renting": plan.housing.is_renting,
-            "monthly_rent": plan.housing.monthly_rent,
-            "annual_rent_increase_rate": plan.housing.annual_rent_increase_rate,
-        },
-        "lifestyle": {
-            "monthly_childcare": plan.lifestyle.monthly_childcare,
-            "num_children": plan.lifestyle.num_children,
-            "num_pets": plan.lifestyle.num_pets,
-            "annual_pet_cost": plan.lifestyle.annual_pet_cost,
-            "annual_medical_oop": plan.lifestyle.annual_medical_oop,
-            "medical_auto_scale": plan.lifestyle.medical_auto_scale,
-            "medical_spouse_multiplier": plan.lifestyle.medical_spouse_multiplier,
-            "medical_per_child_annual": plan.lifestyle.medical_per_child_annual,
-            "annual_vacation": plan.lifestyle.annual_vacation,
-            "monthly_other_recurring": plan.lifestyle.monthly_other_recurring,
-            "annual_parent_care_cost": plan.lifestyle.annual_parent_care_cost,
-            "annual_wedding_fund_per_child": plan.lifestyle.annual_wedding_fund_per_child,
-            **( {"childcare_profile": {"phases": [
-                    {"age_start": p.age_start, "age_end": p.age_end, "monthly_cost": p.monthly_cost}
-                    for p in plan.lifestyle.childcare_profile.phases
-                ]}}
-                if plan.lifestyle.childcare_profile else {} ),
-        },
-        "investments": {
-            "current_liquid_cash": plan.investments.current_liquid_cash,
-            "current_retirement_balance": plan.investments.current_retirement_balance,
-            "current_brokerage_balance": plan.investments.current_brokerage_balance,
-            "one_time_upcoming_expenses": plan.investments.one_time_upcoming_expenses,
-            "annual_401k_contribution": plan.investments.annual_401k_contribution,
-            "partner_annual_401k_contribution": plan.investments.partner_annual_401k_contribution,
-            "annual_roth_ira_contribution": plan.investments.annual_roth_ira_contribution,
-            "annual_hsa_contribution": plan.investments.annual_hsa_contribution,
-            "annual_529_contribution": plan.investments.annual_529_contribution,
-            "annual_brokerage_contribution": plan.investments.annual_brokerage_contribution,
-            "annual_market_return": plan.investments.annual_market_return,
-            "annual_inflation_rate": plan.investments.annual_inflation_rate,
-            "annual_salary_growth_rate": plan.investments.annual_salary_growth_rate,
-            "partner_salary_growth_rate": plan.investments.partner_salary_growth_rate,
-            "annual_home_appreciation_rate": plan.investments.annual_home_appreciation_rate,
-            "auto_invest_surplus": plan.investments.auto_invest_surplus,
-            "cash_buffer_months": plan.investments.cash_buffer_months,
-            "current_roth_ira_balance": plan.investments.current_roth_ira_balance,
-            **( {"roth_contribution_schedule": [
-                    {"year_start": p.year_start, "year_end": p.year_end, "annual_amount": p.annual_amount}
-                    for p in plan.investments.roth_contribution_schedule
-                ]} if plan.investments.roth_contribution_schedule else {} ),
-            **( {
-                "employer_match": {
-                    "tiers": [
-                        {"match_pct": t.match_pct, "up_to_pct_of_salary": t.up_to_pct_of_salary}
-                        for t in plan.investments.employer_match.tiers
-                    ],
-                    "annual_cap":            plan.investments.employer_match.annual_cap,
-                    "vesting_years":         plan.investments.employer_match.vesting_years,
-                    "profit_sharing_annual": plan.investments.employer_match.profit_sharing_annual,
-                }
-            } if plan.investments.employer_match else {} ),
-        },
-        "strategies": {
-            "maximize_hsa": plan.strategies.maximize_hsa,
-            "use_529_state_deduction": plan.strategies.use_529_state_deduction,
-            "maximize_401k": plan.strategies.maximize_401k,
-            "use_roth_ladder": plan.strategies.use_roth_ladder,
-            "use_backdoor_roth": plan.strategies.use_backdoor_roth,
-            "roth_conversion_annual_amount": plan.strategies.roth_conversion_annual_amount,
-        },
-        "timeline_events": [_event_to_dict(e) for e in plan.timeline_events],
+        "income": _dump(plan.income, _INCOME_SPEC),
+        "housing": _dump(plan.housing, _HOUSING_SPEC),
+        "lifestyle": lifestyle,
+        "investments": investments,
+        "strategies": _dump(plan.strategies, _STRATEGIES_SPEC),
+        "timeline_events": [_dump(e, _EVENT_SPEC) for e in plan.timeline_events],
     }
 
     if plan.retirement:
-        d["retirement"] = {
-            "current_age": plan.retirement.current_age,
-            "retirement_age": plan.retirement.retirement_age,
-            "desired_annual_income": plan.retirement.desired_annual_income,
-            "years_in_retirement": plan.retirement.years_in_retirement,
-            "expected_post_retirement_return": plan.retirement.expected_post_retirement_return,
-            "estimated_social_security_annual": plan.retirement.estimated_social_security_annual,
-                "retirement_withdrawal_tax_rate": plan.retirement.retirement_withdrawal_tax_rate,
-                "capital_gains_tax_rate": plan.retirement.capital_gains_tax_rate,
-        }
-
+        d["retirement"] = _dump(plan.retirement, _RETIREMENT_SPEC)
     if plan.college:
-        d["college"] = {
-            "annual_cost_per_child": plan.college.annual_cost_per_child,
-            "years_per_child": plan.college.years_per_child,
-            "start_age": plan.college.start_age,
-            "use_aotc_credit": plan.college.use_aotc_credit,
-            "early_529_return": plan.college.early_529_return,
-            "late_529_return": plan.college.late_529_return,
-            "glide_path_years": plan.college.glide_path_years,
-        }
-
+        d["college"] = _dump(plan.college, _COLLEGE_SPEC)
     if plan.business:
-        b = plan.business
-        d["business"] = {
-            "annual_revenue":                 b.annual_revenue,
-            "expense_ratio":                  b.expense_ratio,
-            "revenue_growth_rate":            b.revenue_growth_rate,
-            "initial_investment":             b.initial_investment,
-            "start_year":                     b.start_year,
-            "use_qbi_deduction":              b.use_qbi_deduction,
-            "self_employed_health_insurance": b.self_employed_health_insurance,
-            "solo_401k_contribution":         b.solo_401k_contribution,
-            "sep_ira_contribution":           b.sep_ira_contribution,
-            "equity_multiple":                b.equity_multiple,
-            "sale_year":                      b.sale_year,
-            "ownership_pct":                  b.ownership_pct,
-        }
-
+        d["business"] = _dump(plan.business, _BUSINESS_SPEC)
     if plan.car:
-        car_d: dict = {
-            "car_price": plan.car.car_price,
-            "down_payment": plan.car.down_payment,
-            "loan_rate": plan.car.loan_rate,
-            "loan_term_years": plan.car.loan_term_years,
-            "replace_every_years": plan.car.replace_every_years,
-            "residual_value": plan.car.residual_value,
-            "hand_down_age": plan.car.hand_down_age,
-            "num_cars": plan.car.num_cars,
-            "first_purchase_years": plan.car.first_purchase_years,
-        }
+        car_d = _dump(plan.car, _CAR_SPEC)
+        car_d["first_purchase_years"] = plan.car.first_purchase_years
         if plan.car.kids_car:
-            kc = plan.car.kids_car
-            car_d["kids_car"] = {
-                "car_price": kc.car_price,
-                "down_payment_pct": kc.down_payment_pct,
-                "loan_rate": kc.loan_rate,
-                "loan_term_years": kc.loan_term_years,
-                "buy_at_age": kc.buy_at_age,
-            }
+            car_d["kids_car"] = _dump(plan.car.kids_car, _KID_CAR_SPEC)
         d["car"] = car_d
 
     return d
-
-
-def _event_to_dict(e: TimelineEvent) -> dict:
-    return {
-        "year": e.year,
-        "description": e.description,
-        "income_change": e.income_change,
-        "partner_income_change": e.partner_income_change,
-        "stop_working": e.stop_working,
-        "resume_working": e.resume_working,
-        "partner_stop_working": e.partner_stop_working,
-        "partner_resume_working": e.partner_resume_working,
-        "start_parent_care": e.start_parent_care,
-        "stop_parent_care": e.stop_parent_care,
-        "child_birth_year_override": e.child_birth_year_override,
-        "new_child": e.new_child,
-        "new_pet": e.new_pet,
-        "marriage": e.marriage,
-        "buy_home": e.buy_home,
-        "new_home_price": e.new_home_price,
-        "new_home_down_payment": e.new_home_down_payment,
-        "new_home_interest_rate": e.new_home_interest_rate,
-        "sell_current_home": e.sell_current_home,
-        "buyer_closing_cost_rate": e.buyer_closing_cost_rate,
-        "seller_closing_cost_rate": e.seller_closing_cost_rate,
-        "extra_one_time_expense": e.extra_one_time_expense,
-        "extra_one_time_income": e.extra_one_time_income,
-    }
 
 
 # ---------------------------------------------------------------------------

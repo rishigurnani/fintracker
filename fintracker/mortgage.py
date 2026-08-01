@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from fintracker.finance_math import monthly_amortized_payment
 from fintracker.models import HousingProfile
 
 
@@ -155,15 +156,7 @@ class MortgageCalculator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _compute_monthly_pi(loan_amount: float, annual_rate: float, term_years: int) -> float:
-        if loan_amount <= 0:
-            return 0.0
-        if annual_rate == 0:
-            return loan_amount / (term_years * 12)
-        r = annual_rate / 12
-        n = term_years * 12
-        return loan_amount * r / (1 - (1 + r) ** -n)
+    _compute_monthly_pi = staticmethod(monthly_amortized_payment)
 
     def _pmi_payment(self, current_balance: float) -> float:
         if not self._p.requires_pmi:

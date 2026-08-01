@@ -8,8 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from fintracker.constants import (
+    HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_401K, LIMIT_401K_CATCHUP,
+    ROTH_IRA_LIMIT, ROTH_PHASEOUT_SINGLE, ROTH_PHASEOUT_MFJ,
+)
+from fintracker.finance_math import linear_phaseout
 from fintracker.models import (
-    FilingStatus, IncomeProfile, InvestmentProfile, StrategyToggles, State
+    IncomeProfile, InvestmentProfile, StrategyToggles, State,
+    by_filing_status,
 )
 from fintracker.tax_engine import TaxEngine, _STATE_TAX_CONFIGS
 
@@ -31,28 +37,16 @@ class StrategyResult:
     notes: list[str]
 
 
-# 2024 IRS contribution limits
-_HSA_LIMITS_2024 = {
-    FilingStatus.SINGLE: 4_150,
-    FilingStatus.MARRIED_FILING_JOINTLY: 8_300,
-    FilingStatus.HEAD_OF_HOUSEHOLD: 4_150,
-}
-_401K_LIMIT_2024 = 23_000
-_401K_CATCHUP_LIMIT_2024 = 30_500  # Age 50+
-_ROTH_IRA_LIMIT_2024 = {
-    FilingStatus.SINGLE: 7_000,
-    FilingStatus.MARRIED_FILING_JOINTLY: 14_000,
-    FilingStatus.HEAD_OF_HOUSEHOLD: 7_000,
-}
-_ROTH_PHASEOUT_SINGLE = (146_000, 161_000)
-_ROTH_PHASEOUT_MFJ = (230_000, 240_000)
-
-
 class StrategyEngine:
     """Calculates value of each financial strategy."""
 
     def __init__(self):
         self._tax_engine = TaxEngine()
+
+    def _savings_from(self, income, num_children, baseline, inv, strat) -> float:
+        """Annual tax reduction of a maximized-contribution scenario vs the baseline."""
+        result = self._tax_engine.calculate(income, inv, strat, num_children)
+        return baseline.total_annual_tax - result.total_annual_tax
 
     def analyze(
         self,
@@ -80,11 +74,13 @@ class StrategyEngine:
         baseline = self._tax_engine.calculate(income, baseline_inv, baseline_strat, num_children)
 
         # --- HSA savings ---
-        hsa_limit = _HSA_LIMITS_2024.get(income.filing_status, 4_150)
-        hsa_inv = InvestmentProfile(annual_hsa_contribution=hsa_limit)
-        hsa_strat = StrategyToggles(maximize_hsa=True, maximize_401k=False, use_529_state_deduction=False)
-        hsa_result = self._tax_engine.calculate(income, hsa_inv, hsa_strat, num_children)
-        hsa_savings = baseline.total_annual_tax - hsa_result.total_annual_tax
+        hsa_limit = by_filing_status(
+            income.filing_status, HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, hoh=HSA_LIMIT_SINGLE)
+        hsa_savings = self._savings_from(
+            income, num_children, baseline,
+            InvestmentProfile(annual_hsa_contribution=hsa_limit),
+            StrategyToggles(maximize_hsa=True, maximize_401k=False, use_529_state_deduction=False),
+        )
 
         if strategies.maximize_hsa:
             notes.append(
@@ -97,11 +93,12 @@ class StrategyEngine:
             )
 
         # --- 401k savings ---
-        k401_limit = _401K_CATCHUP_LIMIT_2024 if age >= 50 else _401K_LIMIT_2024
-        k401_inv = InvestmentProfile(annual_401k_contribution=k401_limit)
-        k401_strat = StrategyToggles(maximize_401k=True, maximize_hsa=False, use_529_state_deduction=False)
-        k401_result = self._tax_engine.calculate(income, k401_inv, k401_strat, num_children)
-        k401_savings = baseline.total_annual_tax - k401_result.total_annual_tax
+        k401_limit = LIMIT_401K_CATCHUP if age >= 50 else LIMIT_401K
+        k401_savings = self._savings_from(
+            income, num_children, baseline,
+            InvestmentProfile(annual_401k_contribution=k401_limit),
+            StrategyToggles(maximize_401k=True, maximize_hsa=False, use_529_state_deduction=False),
+        )
 
         if strategies.maximize_401k:
             notes.append(
@@ -149,20 +146,17 @@ class StrategyEngine:
 
         # --- Roth IRA eligibility check ---
         gross = income.total_gross_income
-        roth_limit = _ROTH_IRA_LIMIT_2024.get(income.filing_status, 7_000)
-        phaseout = (
-            _ROTH_PHASEOUT_MFJ
-            if income.filing_status == FilingStatus.MARRIED_FILING_JOINTLY
-            else _ROTH_PHASEOUT_SINGLE
-        )
+        roth_limit = by_filing_status(
+            income.filing_status, ROTH_IRA_LIMIT, ROTH_IRA_LIMIT * 2, hoh=ROTH_IRA_LIMIT)
+        phaseout = by_filing_status(
+            income.filing_status, ROTH_PHASEOUT_SINGLE, ROTH_PHASEOUT_MFJ)
         if gross > phaseout[1]:
             notes.append(
                 "⚠️  Your income exceeds the Roth IRA limit. Consider a Backdoor Roth IRA."
             )
             recommended_roth = 0.0
         elif gross > phaseout[0]:
-            reduced_pct = 1 - (gross - phaseout[0]) / (phaseout[1] - phaseout[0])
-            recommended_roth = roth_limit * reduced_pct
+            recommended_roth = roth_limit * linear_phaseout(gross, phaseout[0], phaseout[1])
             notes.append(
                 f"Your Roth IRA contribution is phased out. Reduced limit: ~${recommended_roth:,.0f}."
             )

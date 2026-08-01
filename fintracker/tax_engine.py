@@ -13,7 +13,11 @@ Brackets should be updated annually; the year is noted in each table name.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fintracker.models import FilingStatus, IncomeProfile, InvestmentProfile, StrategyToggles, State
+from fintracker.finance_math import progressive_tax, marginal_rate_at
+from fintracker.models import (
+    FilingStatus, IncomeProfile, InvestmentProfile, StrategyToggles, State,
+    by_filing_status,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +208,70 @@ class TaxResult:
         return 0.0  # Calculated in TaxEngine; placeholder here
 
 
-def _apply_brackets(taxable_income: float, brackets: list[tuple[float, float]]) -> float:
-    """Apply progressive brackets to taxable income.  Returns total tax."""
-    tax = 0.0
-    prev_bound = 0.0
-    for upper_bound, rate in brackets:
-        if taxable_income <= prev_bound:
-            break
-        taxable_slice = min(taxable_income, upper_bound) - prev_bound
-        tax += taxable_slice * rate
-        prev_bound = upper_bound
-    return tax
+# Progressive-bracket math lives in finance_math; kept under the historical
+# module-private name so existing importers (and tests) are unaffected.
+_apply_brackets = progressive_tax
+
+
+def _federal_income_tax(gross: float, filing_status: FilingStatus,
+                        k401_deduction: float, hsa_deduction: float) -> float:
+    """Federal income tax after pre-tax 401k/HSA and the standard deduction."""
+    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600)
+    fed_taxable = max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
+    brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
+    return _apply_brackets(fed_taxable, brackets)
+
+
+def _fica_taxes(gross: float, hsa_deduction: float,
+                filing_status: FilingStatus) -> tuple[float, float, float]:
+    """FICA: (social security, medicare, additional medicare). HSA is FICA-exempt."""
+    ss_base = min(gross - hsa_deduction, _SS_WAGE_BASE_2024)
+    ss_tax = max(0.0, ss_base) * _SS_RATE
+
+    medicare_base = max(0.0, gross - hsa_deduction)
+    medicare_tax = medicare_base * _MEDICARE_RATE
+
+    add_medicare_threshold = by_filing_status(
+        filing_status,
+        _ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
+        _ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+    )
+    add_medicare_tax = max(0.0, medicare_base - add_medicare_threshold) * _ADDITIONAL_MEDICARE_RATE
+    return ss_tax, medicare_tax, add_medicare_tax
+
+
+def _state_income_tax(income: IncomeProfile, filing_status: FilingStatus, gross: float,
+                      k401_deduction: float, hsa_deduction: float,
+                      strategies: StrategyToggles, investments: InvestmentProfile,
+                      num_children: int) -> tuple[float, float]:
+    """State income tax and the state 529 deduction applied: (state_tax, state_529_deduction)."""
+    state = income.state
+    if state == State.OTHER:
+        state_tax = max(0.0, gross - k401_deduction - hsa_deduction) * income.other_state_flat_rate
+        return state_tax, 0.0
+
+    config = _STATE_TAX_CONFIGS.get(state)
+    if config is None or not config.brackets:
+        return 0.0, 0.0  # no state income tax
+
+    state_std = by_filing_status(
+        filing_status,
+        config.standard_deduction_single,
+        config.standard_deduction_mfj,
+    )
+    state_hsa = hsa_deduction if config.allows_hsa_deduction else 0.0
+    state_401k = k401_deduction if config.allows_401k_deduction else 0.0
+
+    if config.allows_529_deduction and strategies.use_529_state_deduction:
+        state_529_deduction = min(
+            investments.annual_529_contribution * num_children,
+            config.per_beneficiary_529_deduction * num_children,
+        )
+    else:
+        state_529_deduction = 0.0
+
+    state_taxable = max(0.0, gross - state_401k - state_hsa - state_529_deduction - state_std)
+    return _apply_brackets(state_taxable, config.brackets), state_529_deduction
 
 
 class TaxEngine:
@@ -248,65 +305,16 @@ class TaxEngine:
         filing_status = filing_status_override or income.filing_status
         gross = gross_income_override if gross_income_override is not None else income.total_gross_income
 
-        # --- Pre-tax deductions ---
+        # --- Pre-tax deductions (used by federal and, where allowed, state) ---
         hsa_deduction = investments.annual_hsa_contribution if strategies.maximize_hsa else 0.0
         k401_deduction = investments.annual_401k_contribution if strategies.maximize_401k else 0.0
 
-        # Federal standard deduction
-        std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600)
-
-        # Federal taxable income: gross - 401k - HSA - standard deduction
-        fed_taxable = max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
-
-        brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
-        federal_tax = _apply_brackets(fed_taxable, brackets)
-
-        # --- FICA ---
-        ss_base = min(gross - hsa_deduction, _SS_WAGE_BASE_2024)
-        ss_tax = max(0.0, ss_base) * _SS_RATE
-
-        medicare_base = max(0.0, gross - hsa_deduction)
-        medicare_tax = medicare_base * _MEDICARE_RATE
-
-        add_medicare_threshold = (
-            _ADDITIONAL_MEDICARE_THRESHOLD_MFJ
-            if filing_status == FilingStatus.MARRIED_FILING_JOINTLY
-            else _ADDITIONAL_MEDICARE_THRESHOLD_SINGLE
+        federal_tax = _federal_income_tax(gross, filing_status, k401_deduction, hsa_deduction)
+        ss_tax, medicare_tax, add_medicare_tax = _fica_taxes(gross, hsa_deduction, filing_status)
+        state_tax, state_529_deduction = _state_income_tax(
+            income, filing_status, gross, k401_deduction, hsa_deduction,
+            strategies, investments, num_children,
         )
-        add_medicare_tax = max(0.0, medicare_base - add_medicare_threshold) * _ADDITIONAL_MEDICARE_RATE
-
-        # --- State tax ---
-        state = income.state
-        if state == State.OTHER:
-            state_tax = max(0.0, gross - k401_deduction - hsa_deduction) * income.other_state_flat_rate
-            state_529_deduction = 0.0
-        else:
-            config = _STATE_TAX_CONFIGS.get(state)
-            if config is None or not config.brackets:
-                state_tax = 0.0
-                state_529_deduction = 0.0
-            else:
-                state_std = (
-                    config.standard_deduction_mfj
-                    if filing_status == FilingStatus.MARRIED_FILING_JOINTLY
-                    else config.standard_deduction_single
-                )
-                state_hsa = hsa_deduction if config.allows_hsa_deduction else 0.0
-                state_401k = k401_deduction if config.allows_401k_deduction else 0.0
-
-                if config.allows_529_deduction and strategies.use_529_state_deduction:
-                    state_529_deduction = min(
-                        investments.annual_529_contribution * num_children,
-                        config.per_beneficiary_529_deduction * num_children,
-                    )
-                else:
-                    state_529_deduction = 0.0
-
-                state_taxable = max(
-                    0.0,
-                    gross - state_401k - state_hsa - state_529_deduction - state_std,
-                )
-                state_tax = _apply_brackets(state_taxable, config.brackets)
 
         return TaxResult(
             federal_income_tax=federal_tax,
@@ -336,24 +344,11 @@ class TaxEngine:
         fed_taxable = max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
 
         brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
-        # Find applicable bracket
-        fed_marginal = brackets[-1][1]
-        prev = 0.0
-        for upper, rate in brackets:
-            if fed_taxable <= upper:
-                fed_marginal = rate
-                break
-            prev = upper
+        fed_marginal = marginal_rate_at(fed_taxable, brackets)
 
         state = income.state
         state_marginal = 0.0
         if state != State.OTHER and state in _STATE_TAX_CONFIGS:
-            config = _STATE_TAX_CONFIGS[state]
-            if config.brackets:
-                state_marginal = config.brackets[-1][1]
-                for upper, rate in config.brackets:
-                    if fed_taxable <= upper:
-                        state_marginal = rate
-                        break
+            state_marginal = marginal_rate_at(fed_taxable, _STATE_TAX_CONFIGS[state].brackets)
 
         return fed_marginal + state_marginal

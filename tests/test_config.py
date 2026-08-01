@@ -3,7 +3,9 @@ import os
 import tempfile
 import pytest
 
-from fintracker.models import FilingStatus, State, StrategyToggles, TimelineEvent
+from fintracker.models import (
+    FilingStatus, State, StrategyToggles, TimelineEvent, CarProfile, KidCarProfile,
+)
 from fintracker.config import save_plan, load_plan, load_plan_or_sample, _default_plan
 
 
@@ -85,6 +87,18 @@ class TestConfigRoundTrip:
         loaded = self._round_trip(plan)
         assert loaded.housing.is_renting is True
         assert loaded.housing.monthly_rent == 2_500.0
+
+    def test_kids_car_profile_round_trips(self):
+        plan = _default_plan()
+        plan.car = CarProfile(
+            car_price=30_000, num_cars=2,
+            kids_car=KidCarProfile(car_price=15_000, down_payment_pct=0.15, buy_at_age=22),
+        )
+        loaded = self._round_trip(plan)
+        assert loaded.car.kids_car is not None
+        assert loaded.car.kids_car.car_price == 15_000
+        assert loaded.car.kids_car.down_payment_pct == 0.15
+        assert loaded.car.kids_car.buy_at_age == 22
 
 
 class TestLoadOrSample:

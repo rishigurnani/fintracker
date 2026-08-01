@@ -15,30 +15,14 @@ from fintracker.models import (
     State, StrategyToggles, TimelineEvent, RothContributionPhase
 )
 from fintracker.projections import ProjectionEngine
+from tests.builders import make_plan, investments, zero_lifestyle, renting_housing
 
 
 # ── Shared plan builder ────────────────────────────────────────────────────────
 
 def _base_plan(**overrides) -> FinancialPlan:
     """Zero-inflation, zero-growth, zero-market-return base for isolated tests."""
-    defaults = dict(
-        income=IncomeProfile(120_000, FilingStatus.SINGLE, State.TEXAS),
-        housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-        lifestyle=LifestyleProfile(
-            annual_vacation=0, monthly_other_recurring=0,
-            annual_medical_oop=0, medical_auto_scale=False,
-        ),
-        investments=InvestmentProfile(
-            current_liquid_cash=500_000,
-            annual_market_return=0.0,
-            annual_inflation_rate=0.0,
-            annual_salary_growth_rate=0.0,
-        ),
-        strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
-        projection_years=10,
-    )
-    defaults.update(overrides)
-    return FinancialPlan(**defaults)
+    return make_plan(**{"lifestyle": zero_lifestyle(), **overrides})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,19 +34,13 @@ class TestRetirementReadiness:
     def _plan_with_retirement(self, current_age, retirement_age, desired_income,
                                k401=20_000, ss=0, years=None):
         yrs = years or (retirement_age - current_age + 5)
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
+            lifestyle=zero_lifestyle(),
+            investments=investments(
                 current_liquid_cash=50_000, current_retirement_balance=200_000,
-                annual_401k_contribution=k401,
-                annual_market_return=0.07,
-                annual_inflation_rate=0.03,
-                annual_salary_growth_rate=0.0,
+                annual_401k_contribution=k401, annual_market_return=0.07, annual_inflation_rate=0.03,
             ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             projection_years=yrs,
             retirement=RetirementProfile(
                 current_age=current_age,
@@ -269,17 +247,11 @@ class TestRetirementReadiness:
 class TestStartStopWork:
 
     def _work_plan(self, events, partner=0):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS,
                                  spouse_gross_annual_income=partner),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=500_000, annual_market_return=0.0,
-                annual_inflation_rate=0.0, annual_salary_growth_rate=0.05,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=500_000, annual_salary_growth_rate=0.05),
             timeline_events=events,
             projection_years=8,
         )
@@ -360,18 +332,11 @@ class TestStartStopWork:
 class TestBrokerageContribution:
 
     def _brok_plan(self, brokerage_contribution, income=150_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=200_000,
-                annual_brokerage_contribution=brokerage_contribution,
-                annual_market_return=0.0, annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=200_000,
+                                    annual_brokerage_contribution=brokerage_contribution),
             projection_years=5,
         )
 
@@ -474,22 +439,17 @@ class TestBrokerageContribution:
 
 class TestCollegeCosts:
 
+    def _project(self, plan):
+        return ProjectionEngine(plan).run_deterministic()
+
     def _college_plan(self, income=70_000, k529=5_000, cost=35_000,
                       child_birth_year_offset=-17, filing=FilingStatus.SINGLE,
                       use_aotc=True, events=None):
         """child_birth_year_offset: negative = already born. -17 = age 17 in yr0, 18 in yr1."""
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(income, filing, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=300_000,
-                annual_529_contribution=k529,
-                annual_market_return=0.0, annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=300_000, annual_529_contribution=k529),
             timeline_events=events or [
                 TimelineEvent(year=1, description="Child in college", new_child=True,
                               child_birth_year_override=child_birth_year_offset)
@@ -500,7 +460,7 @@ class TestCollegeCosts:
         )
 
     def test_college_cost_appears_in_college_years(self):
-        snaps = ProjectionEngine(self._college_plan()).run_deterministic()
+        snaps = self._project(self._college_plan())
         # yr1: child is 18 (birth_year=0 adjusted to -17 from year 0)
         # birth_year_override=-17 means born at projection "year -17"
         # yr1: age = 1 - (-17) = 18. In college years 1-4.
@@ -524,7 +484,7 @@ class TestCollegeCosts:
             college=CollegeProfile(annual_cost_per_child=35_000, start_age=18),
             projection_years=10,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         for s in snaps:
             assert s.annual_college_cost == 0.0, f"Yr{s.year}: unexpected college cost"
 
@@ -569,7 +529,7 @@ class TestCollegeCosts:
             college=CollegeProfile(annual_cost_per_child=10_000, start_age=18),
             projection_years=6,
         )
-        snaps2 = ProjectionEngine(plan2).run_deterministic()
+        snaps2 = self._project(plan2)
         # 529 grows yrs 1-4 (savings 10k/yr, cost 10k/yr → net 0 change pre-drawdown)
         # Actually: 529 savings = 1 child * 10k, drawdown = 10k per year in college
         # Net: stays flat if savings == cost. Check it doesn't grow beyond.
@@ -578,14 +538,14 @@ class TestCollegeCosts:
                 f"Yr{s.year}: 529 drawdown should be 10000"
 
     def test_529_drawdown_recorded_separately(self):
-        snaps = ProjectionEngine(self._college_plan(k529=0, cost=35_000)).run_deterministic()
+        snaps = self._project(self._college_plan(k529=0, cost=35_000))
         # No 529 balance → drawdown = 0, full cost hits brokerage
         assert snaps[0].annual_529_drawdown == 0.0
         assert snaps[0].annual_college_cost == pytest.approx(35_000, abs=1)
 
     def test_aotc_full_credit_below_phaseout(self):
         """Income below $80k (single) → full $2,500 AOTC per eligible student."""
-        snaps = ProjectionEngine(self._college_plan(income=70_000, use_aotc=True)).run_deterministic()
+        snaps = self._project(self._college_plan(income=70_000, use_aotc=True))
         for yr in [1, 2, 3, 4]:
             assert snaps[yr-1].annual_aotc_credit == pytest.approx(2_500, abs=1), \
                 f"Yr{yr}: expected full AOTC"
@@ -593,24 +553,24 @@ class TestCollegeCosts:
 
     def test_aotc_zero_above_phaseout(self):
         """Income above $90k (single) → no AOTC."""
-        snaps = ProjectionEngine(self._college_plan(income=95_000, use_aotc=True)).run_deterministic()
+        snaps = self._project(self._college_plan(income=95_000, use_aotc=True))
         for s in snaps:
             assert s.annual_aotc_credit == 0.0
 
     def test_aotc_partial_in_phaseout_range(self):
         """Income at 85k (midpoint 80-90k) → 50% credit = $1,250."""
-        snaps = ProjectionEngine(self._college_plan(income=85_000, use_aotc=True)).run_deterministic()
+        snaps = self._project(self._college_plan(income=85_000, use_aotc=True))
         assert snaps[0].annual_aotc_credit == pytest.approx(1_250, abs=1)
 
     def test_aotc_higher_threshold_mfj(self):
         """MFJ phase-out is $160k-$180k; at $170k MFJ → 50% credit."""
-        snaps = ProjectionEngine(
+        snaps = self._project(
             self._college_plan(income=170_000, filing=FilingStatus.MARRIED_FILING_JOINTLY, use_aotc=True)
-        ).run_deterministic()
+        )
         assert snaps[0].annual_aotc_credit == pytest.approx(1_250, abs=1)
 
     def test_aotc_disabled_gives_zero(self):
-        snaps = ProjectionEngine(self._college_plan(income=70_000, use_aotc=False)).run_deterministic()
+        snaps = self._project(self._college_plan(income=70_000, use_aotc=False))
         for s in snaps:
             assert s.annual_aotc_credit == 0.0
 
@@ -618,8 +578,8 @@ class TestCollegeCosts:
         """AOTC credit must lower effective tax (annual_tax_total) compared to no credit."""
         p_aotc    = self._college_plan(income=70_000, use_aotc=True)
         p_no_aotc = self._college_plan(income=70_000, use_aotc=False)
-        s_aotc    = ProjectionEngine(p_aotc).run_deterministic()[0]
-        s_no_aotc = ProjectionEngine(p_no_aotc).run_deterministic()[0]
+        s_aotc    = self._project(p_aotc)[0]
+        s_no_aotc = self._project(p_no_aotc)[0]
         assert s_aotc.annual_tax_total < s_no_aotc.annual_tax_total
 
     def test_two_children_in_college_doubles_cost(self):
@@ -641,7 +601,7 @@ class TestCollegeCosts:
             college=CollegeProfile(annual_cost_per_child=35_000, start_age=18, use_aotc_credit=True),
             projection_years=4,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         assert snaps[0].annual_college_cost == pytest.approx(70_000, abs=1)  # 2 * 35k
         assert snaps[0].annual_aotc_credit == pytest.approx(5_000, abs=1)   # 2 * 2500
 
@@ -676,7 +636,7 @@ class TestCollegeCosts:
                                     start_age=18, use_aotc_credit=False),
             projection_years=8,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # Yrs 1-4: college + contributions; yr5+: college done, contributions stop
         # With zero return and cost=10k, contribution=5k:
         #   balance = 5k - 10k = -5k per yr (draws from brokerage for shortfall)
@@ -715,8 +675,8 @@ class TestCollegeCosts:
                 projection_years=15,
             )
         # Before switch yr5: glide(8%→4%) should equal flat 8%
-        s_glide = ProjectionEngine(make(0.08, 0.04)).run_deterministic()
-        s_flat8 = ProjectionEngine(make(0.08, 0.08)).run_deterministic()
+        s_glide = self._project(make(0.08, 0.04))
+        s_flat8 = self._project(make(0.08, 0.08))
         assert abs(s_glide[4].college_529_balance - s_flat8[4].college_529_balance) < 1.0,             f"Yr5 pre-switch: glide {s_glide[4].college_529_balance:.0f} != flat8 {s_flat8[4].college_529_balance:.0f}"
 
     def test_529_uses_late_rate_after_switch(self):
@@ -740,7 +700,7 @@ class TestCollegeCosts:
                                     glide_path_years=10),
             projection_years=15,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # After switch (yr11 onwards), implied growth rate should be 0.04
         for yr in [11, 12, 13]:
             prev = snaps[yr-2].college_529_balance
@@ -772,21 +732,14 @@ class TestCollegeCosts:
                 projection_years=5,
             )
         # Different market returns should produce identical 529 balances
-        snaps_8 = ProjectionEngine(make(0.08)).run_deterministic()
-        snaps_5 = ProjectionEngine(make(0.05)).run_deterministic()
-        snaps_0 = ProjectionEngine(make(0.00)).run_deterministic()
+        snaps_8 = self._project(make(0.08))
+        snaps_5 = self._project(make(0.05))
+        snaps_0 = self._project(make(0.00))
         for s8, s5, s0 in zip(snaps_8, snaps_5, snaps_0):
             assert abs(s8.college_529_balance - s5.college_529_balance) < 1.0, \
                 f"Yr{s8.year}: 529 differs with different market_return"
             assert abs(s8.college_529_balance - s0.college_529_balance) < 1.0, \
                 f"Yr{s8.year}: 529 differs with different market_return"
-
-    def test_529_default_glide_path_values(self):
-        """CollegeProfile defaults to 8% early, 4% late, 10yr switch."""
-        cp = CollegeProfile()
-        assert cp.early_529_return == pytest.approx(0.08)
-        assert cp.late_529_return  == pytest.approx(0.04)
-        assert cp.glide_path_years == 10
 
     def test_nw_integrity_with_glide_path(self):
         """Net worth components sum correctly when 529 uses glide path rates."""
@@ -809,7 +762,7 @@ class TestCollegeCosts:
                                     glide_path_years=10),
             projection_years=8,
         )
-        for s in ProjectionEngine(plan).run_deterministic():
+        for s in self._project(plan):
             components = (s.retirement_balance + s.brokerage_balance
                           + s.college_529_balance + s.home_equity
                           + s.hsa_balance + s.uninvested_cash)
@@ -1007,19 +960,11 @@ class TestAutoInvestSurplus:
     """
 
     def _plan(self, auto_invest: bool, income: float = 150_000, years: int = 10):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=100_000,
-                annual_market_return=0.08,
-                annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-                auto_invest_surplus=auto_invest,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=100_000, annual_market_return=0.08,
+                                    auto_invest_surplus=auto_invest),
             projection_years=years,
         )
 
@@ -1099,21 +1044,16 @@ class TestAutoInvestSurplus:
 
 class TestCarPurchases:
 
+    def _project(self, plan):
+        return ProjectionEngine(plan).run_deterministic()
+
     def _plan(self, events=None, children=None, years=22, num_cars=1,
               replace_every=10, loan_term=5, residual=5_000, hand_down_age=16,
               car_price=25_000, down=5_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=300_000,
-                annual_market_return=0.0,
-                annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=300_000),
             timeline_events=events or (children or []),
             car=CarProfile(
                 car_price=car_price, down_payment=down,
@@ -1128,13 +1068,13 @@ class TestCarPurchases:
 
     def test_loan_payment_fires_during_loan_term(self):
         """Car loan P&I payments must be non-zero during the loan term."""
-        snaps = ProjectionEngine(self._plan(loan_term=5)).run_deterministic()
+        snaps = self._project(self._plan(loan_term=5))
         for s in snaps[:5]:
             assert s.annual_car_payment > 0, f"Yr{s.year}: expected payment during loan term"
 
     def test_no_payment_after_loan_paid_off(self):
         """No car payments after loan term expires."""
-        snaps = ProjectionEngine(self._plan(loan_term=5)).run_deterministic()
+        snaps = self._project(self._plan(loan_term=5))
         for s in snaps[5:10]:  # yrs 6-10: loan paid off, next car not yet bought
             assert s.annual_car_payment == pytest.approx(0.0, abs=1),                 f"Yr{s.year}: loan should be paid off"
 
@@ -1149,8 +1089,8 @@ class TestCarPurchases:
             strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
             projection_years=5,
         )
-        s_car  = ProjectionEngine(plan_car).run_deterministic()[0]
-        s_none = ProjectionEngine(plan_none).run_deterministic()[0]
+        s_car  = self._project(plan_car)[0]
+        s_none = self._project(plan_none)[0]
         assert s_car.annual_breathing_room < s_none.annual_breathing_room,             "Car payment should reduce breathing room"
 
     # --- Down payment ---
@@ -1166,8 +1106,8 @@ class TestCarPurchases:
             strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
             projection_years=1,
         )
-        s_car  = ProjectionEngine(plan_car).run_deterministic()[0]
-        s_none = ProjectionEngine(plan_none).run_deterministic()[0]
+        s_car  = self._project(plan_car)[0]
+        s_none = self._project(plan_none)[0]
         # At yr1: brokerage_car = brokerage_none - 5k_down (same net income, same market return)
         # Total reduction = down_payment + annual_car_payment (both reduce brokerage)
         expected_diff = 5_000 + s_car.annual_car_payment
@@ -1177,7 +1117,7 @@ class TestCarPurchases:
 
     def test_replacement_down_payment_hits_brokerage(self):
         """At replacement year, new down payment is deducted from brokerage."""
-        snaps = ProjectionEngine(self._plan(replace_every=10)).run_deterministic()
+        snaps = self._project(self._plan(replace_every=10))
         yr11 = snaps[10]
         assert yr11.car_purchase_cost == pytest.approx(5_000, abs=1),             f"Yr11 replacement should show 5k down payment, got {yr11.car_purchase_cost:.0f}"
 
@@ -1185,14 +1125,14 @@ class TestCarPurchases:
 
     def test_replacement_fires_every_n_years(self):
         """Car replacement must fire at yr11 and yr21 for replace_every=10."""
-        snaps = ProjectionEngine(self._plan(replace_every=10, years=25)).run_deterministic()
+        snaps = self._project(self._plan(replace_every=10, years=25))
         replacement_yrs = [s.year for s in snaps if s.car_purchase_cost > 0]
         assert 11 in replacement_yrs, f"Expected replacement at yr11, got {replacement_yrs}"
         assert 21 in replacement_yrs, f"Expected replacement at yr21, got {replacement_yrs}"
 
     def test_new_loan_starts_after_replacement(self):
         """After replacing the car, a new 5-year loan starts."""
-        snaps = ProjectionEngine(self._plan(replace_every=10, loan_term=5)).run_deterministic()
+        snaps = self._project(self._plan(replace_every=10, loan_term=5))
         # Yr11-15: new loan payments (5 years)
         for yr in [11, 12, 13, 14, 15]:
             assert snaps[yr-1].annual_car_payment > 0, f"Yr{yr}: expected payment on new loan"
@@ -1204,7 +1144,7 @@ class TestCarPurchases:
 
     def test_sells_old_car_when_no_children(self):
         """With no children, old car is always sold for residual_value."""
-        snaps = ProjectionEngine(self._plan(residual=5_000)).run_deterministic()
+        snaps = self._project(self._plan(residual=5_000))
         yr11 = snaps[10]
         assert yr11.car_sale_proceeds == pytest.approx(5_000, abs=1),             f"Expected 5k sale proceeds, got {yr11.car_sale_proceeds:.0f}"
 
@@ -1212,7 +1152,7 @@ class TestCarPurchases:
         """If all children are below hand_down_age, sell the car."""
         # Child born yr1 → age 10 at yr11 → too young (hand_down_age=16)
         events = [TimelineEvent(year=1, description="Child", new_child=True)]
-        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16)).run_deterministic()
+        snaps = self._project(self._plan(events=events, hand_down_age=16))
         yr11 = snaps[10]
         child_age = 11 - 1  # born yr1
         assert child_age < 16
@@ -1222,7 +1162,7 @@ class TestCarPurchases:
         """If a child is at or above hand_down_age at replacement, hand down (0 proceeds)."""
         # Child born yr1 → age 20 at yr21 → old enough (hand_down_age=16)
         events = [TimelineEvent(year=1, description="Child", new_child=True)]
-        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16, years=25)).run_deterministic()
+        snaps = self._project(self._plan(events=events, hand_down_age=16, years=25))
         yr21 = snaps[20]
         child_age = 21 - 1
         assert child_age >= 16
@@ -1235,7 +1175,7 @@ class TestCarPurchases:
         # Actually same cash flow. Key difference: handing down vs selling is neutral for parent.
         # The real benefit is to the child. Test that proceeds=0 when handing down.
         events = [TimelineEvent(year=1, description="Child", new_child=True)]
-        snaps = ProjectionEngine(self._plan(events=events, hand_down_age=16, years=22)).run_deterministic()
+        snaps = self._project(self._plan(events=events, hand_down_age=16, years=22))
         yr21 = snaps[20]
         assert yr21.car_sale_proceeds == 0.0  # handed down, not sold
 
@@ -1243,8 +1183,8 @@ class TestCarPurchases:
 
     def test_two_cars_double_payments(self):
         """Two cars should produce roughly double the annual payment of one."""
-        s1 = ProjectionEngine(self._plan(num_cars=1)).run_deterministic()[0]
-        s2 = ProjectionEngine(self._plan(num_cars=2)).run_deterministic()[0]
+        s1 = self._project(self._plan(num_cars=1))[0]
+        s2 = self._project(self._plan(num_cars=2))[0]
         assert abs(s2.annual_car_payment - 2 * s1.annual_car_payment) < 50,             f"2-car payment {s2.annual_car_payment:.0f} should be ~2x {s1.annual_car_payment:.0f}"
 
     def test_two_cars_double_initial_down(self):
@@ -1258,9 +1198,9 @@ class TestCarPurchases:
             investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
             strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
             projection_years=1)
-        s0 = ProjectionEngine(plan0).run_deterministic()[0]
-        s1 = ProjectionEngine(plan1).run_deterministic()[0]
-        s2 = ProjectionEngine(plan2).run_deterministic()[0]
+        s0 = self._project(plan0)[0]
+        s1 = self._project(plan1)[0]
+        s2 = self._project(plan2)[0]
         # Down payments are deducted in _initial_state(), before year 1 runs.
         # With market_return=0: initial_brokerage = yr1_brokerage - yr1_breathing_room
         # This strips out loan payments and isolates only the initial down payment.
@@ -1283,7 +1223,7 @@ class TestCarPurchases:
             investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
             strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
             projection_years=5)
-        for s in ProjectionEngine(plan).run_deterministic():
+        for s in self._project(plan):
             assert s.annual_car_payment == 0.0
             assert s.car_purchase_cost == 0.0
             assert s.car_sale_proceeds == 0.0
@@ -1294,7 +1234,7 @@ class TestCarPurchases:
         """Net worth components must sum correctly with car costs active."""
         events = [TimelineEvent(year=1, description="Child", new_child=True)]
         plan = self._plan(events=events, years=25)
-        for s in ProjectionEngine(plan).run_deterministic():
+        for s in self._project(plan):
             components = (s.retirement_balance + s.brokerage_balance
                           + s.college_529_balance + s.home_equity
                           + s.hsa_balance + s.uninvested_cash)
@@ -1327,7 +1267,7 @@ class TestCarPurchases:
                                                    loan_rate=0.07,loan_term_years=5)),
             projection_years=10,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # No adult car (num_cars=0), so any car payment must come from the kid's car
         # Kid graduates yr5 (age=22): loan payments start yr5 and run through yr9
         assert snaps[4].annual_car_payment > 0, "Kid car loan should start in yr5"
@@ -1358,7 +1298,7 @@ class TestCarPurchases:
                                                    loan_rate=0.07,loan_term_years=5)),
             projection_years=12,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # yr5: kid1 loan starts (yr1 of loan)
         # yr6: kid1 only (yr2 of loan)
         # yr7: both loans active (kid1 yr3, kid2 yr1) → payments should be > yr6
@@ -1369,25 +1309,6 @@ class TestCarPurchases:
             c = (s.retirement_balance + s.brokerage_balance + s.college_529_balance
                  + s.home_equity + s.hsa_balance + s.uninvested_cash + s.cash_buffer)
             assert abs(c - s.net_worth) < 1.0, f"Yr{s.year}: NW mismatch"
-
-    def test_kids_car_config_roundtrip(self):
-        """KidCarProfile survives YAML serialisation round-trip."""
-        from fintracker.config import _plan_to_dict, _dict_to_plan
-        plan = FinancialPlan(
-            income=IncomeProfile(150_000,FilingStatus.SINGLE,State.TEXAS),
-            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(current_liquid_cash=100_000),
-            strategies=StrategyToggles(),
-            car=CarProfile(car_price=30_000,num_cars=2,
-                           kids_car=KidCarProfile(car_price=15_000,down_payment_pct=0.15,
-                                                   buy_at_age=22)),
-            projection_years=10)
-        plan2 = _dict_to_plan(_plan_to_dict(plan))
-        assert plan2.car.kids_car is not None
-        assert plan2.car.kids_car.car_price == 15_000
-        assert plan2.car.kids_car.down_payment_pct == 0.15
-        assert plan2.car.kids_car.buy_at_age == 22
 
     def test_no_kids_car_no_graduation_purchases(self):
         """Without kids_car configured, no graduation-linked car purchases occur."""
@@ -1408,7 +1329,7 @@ class TestCarPurchases:
             car=CarProfile(num_cars=0, kids_car=None),
             projection_years=10,
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         assert all(s.annual_car_payment == 0 for s in snaps),             "No car payments when num_cars=0 and kids_car=None"
 
 
@@ -1481,15 +1402,13 @@ class TestMonteCarloLiquidity:
     """Tests for the new liquidity risk tracking and configurable std params."""
 
     def _plan(self, income=120_000, liquid_cash=50_000, rent=1_500, years=15):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=rent),
-            lifestyle=LifestyleProfile(annual_vacation=5_000,monthly_other_recurring=500,
-                                       annual_medical_oop=3_000,medical_auto_scale=False),
-            investments=InvestmentProfile(current_liquid_cash=liquid_cash,
-                                          annual_market_return=0.07,annual_inflation_rate=0.03,
-                                          annual_salary_growth_rate=0.0),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            housing=renting_housing(rent),
+            lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=investments(current_liquid_cash=liquid_cash,
+                                    annual_market_return=0.07, annual_inflation_rate=0.03),
             projection_years=years,
         )
 
@@ -1591,18 +1510,14 @@ class TestCashBuffer:
     """
 
     def _plan(self, buffer_months=0.0, income=120_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_500),
+            housing=renting_housing(1_500),
             lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=500,
                                        annual_medical_oop=3_000, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=50_000,
-                annual_market_return=0.07, annual_inflation_rate=0.03,
-                annual_salary_growth_rate=0.04,
-                cash_buffer_months=buffer_months,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=50_000, annual_market_return=0.07,
+                                    annual_inflation_rate=0.03, annual_salary_growth_rate=0.04,
+                                    cash_buffer_months=buffer_months),
             projection_years=10,
         )
 
@@ -2050,16 +1965,10 @@ class TestBusinessProfile:
     """Tests for BusinessProfile — franchise / LLC / sole-prop business ownership."""
 
     def _base(self, biz=None):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=200_000, annual_market_return=0.0,
-                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=200_000),
             business=biz, projection_years=10,
         )
 
@@ -2235,19 +2144,11 @@ class TestEmployerMatch:
     """
 
     def _base(self, em=None, k401=15_000, salary=100_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(salary, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=0, current_retirement_balance=0,
-                annual_401k_contribution=k401,
-                annual_market_return=0.0, annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
-                employer_match=em,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=0, current_retirement_balance=0,
+                                    annual_401k_contribution=k401, employer_match=em),
             projection_years=10,
         )
 
@@ -2410,20 +2311,10 @@ class TestChildcareProfile:
     ])
 
     def _base(self, cp=None, flat=0, events=None):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(
-                monthly_childcare=flat, num_children=0,
-                annual_vacation=0, monthly_other_recurring=0,
-                annual_medical_oop=0, medical_auto_scale=False,
-                childcare_profile=cp,
-            ),
-            investments=InvestmentProfile(
-                current_liquid_cash=500_000, annual_market_return=0.0,
-                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            lifestyle=zero_lifestyle(monthly_childcare=flat, num_children=0, childcare_profile=cp),
+            investments=investments(current_liquid_cash=500_000),
             timeline_events=events or [],
             projection_years=20,
         )
@@ -2536,15 +2427,10 @@ class TestHistoricalBootstrap:
     """
 
     def _plan(self):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(
-                current_liquid_cash=100_000, annual_market_return=0.08,
-                annual_inflation_rate=0.03, annual_salary_growth_rate=0.04,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=100_000, annual_market_return=0.08,
+                                    annual_inflation_rate=0.03, annual_salary_growth_rate=0.04),
             projection_years=20,
         )
 
@@ -2614,15 +2500,9 @@ class TestOwnershipPct:
             revenue_growth_rate=0.0, start_year=1,
             equity_multiple=3.0, ownership_pct=ownership_pct,
         )
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_market_return=0.0,
-                                          annual_inflation_rate=0.0,
-                                          annual_salary_growth_rate=0.0),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=200_000),
             business=biz, projection_years=5,
         )
 
@@ -2746,16 +2626,13 @@ class TestCumulativeInflationFix:
     """
 
     def _plan(self, inflation=0.03):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=1_000),
+            housing=renting_housing(1_000),
             lifestyle=LifestyleProfile(annual_vacation=5_000, monthly_other_recurring=500,
                                        annual_medical_oop=3_000, medical_auto_scale=False),
-            investments=InvestmentProfile(current_liquid_cash=200_000,
-                                          annual_market_return=0.08,
-                                          annual_inflation_rate=inflation,
-                                          annual_salary_growth_rate=0.04),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            investments=investments(current_liquid_cash=200_000, annual_market_return=0.08,
+                                    annual_inflation_rate=inflation, annual_salary_growth_rate=0.04),
             projection_years=20,
         )
 
@@ -2822,18 +2699,14 @@ class TestMCCalculationAudit:
 
     def _plan(self, **kw):
         defaults = dict(
-            income=IncomeProfile(100_000,FilingStatus.SINGLE,State.TEXAS),
-            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=1_000,
-                                   annual_rent_increase_rate=0.03),
-            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
-                                       annual_medical_oop=0,medical_auto_scale=False),
-            investments=InvestmentProfile(current_liquid_cash=0,annual_market_return=0.0,
-                                          annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
-            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
+            income=IncomeProfile(100_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=renting_housing(1_000, annual_rent_increase_rate=0.03),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=0),
             projection_years=5,
         )
         defaults.update(kw)
-        return FinancialPlan(**defaults)
+        return make_plan(**defaults)
 
     # ── Salary growth ────────────────────────────────────────────────────
 
@@ -2977,24 +2850,21 @@ class TestBackdoorRoth:
     - Roth balance is included in net worth and in compute_retirement_readiness().
     """
 
+    def _project(self, plan):
+        return ProjectionEngine(plan).run_deterministic()
+
     def _base(self, roth_contrib=7_000, backdoor=True, roth_balance=0,
                brokerage=200_000, filing=FilingStatus.SINGLE):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(200_000, filing, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(
+            investments=investments(
                 current_liquid_cash=50_000,
                 current_brokerage_balance=float(brokerage),
                 current_roth_ira_balance=float(roth_balance),
                 annual_roth_ira_contribution=float(roth_contrib),
-                annual_market_return=0.0,
-                annual_inflation_rate=0.0,
-                annual_salary_growth_rate=0.0,
             ),
             strategies=StrategyToggles(
-                maximize_hsa=False, maximize_401k=False,
-                use_backdoor_roth=backdoor,
+                maximize_hsa=False, maximize_401k=False, use_backdoor_roth=backdoor,
             ),
             projection_years=10,
         )
@@ -3003,24 +2873,21 @@ class TestBackdoorRoth:
 
     def test_toggle_off_roth_balance_zero(self):
         """When use_backdoor_roth=False, no Roth contributions are made."""
-        s1 = ProjectionEngine(self._base(backdoor=False)).run_deterministic()[0]
+        s1 = self._project(self._base(backdoor=False))[0]
         assert s1.roth_ira_balance == 0.0
         assert s1.annual_roth_contribution == 0.0
-
-    def test_toggle_default_is_false(self):
-        assert StrategyToggles().use_backdoor_roth is False
 
     # ── Balance accumulation ─────────────────────────────────────────────────
 
     def test_roth_builds_at_7k_per_year(self):
         """At 0% return, Roth balance = $7k × years."""
-        snaps = ProjectionEngine(self._base()).run_deterministic()
+        snaps = self._project(self._base())
         assert abs(snaps[0].roth_ira_balance - 7_000) < 1
         assert abs(snaps[2].roth_ira_balance - 21_000) < 1
 
     def test_roth_basis_tracks_contributions_only(self):
         """Basis = cumulative contributions. At 0% return, equals balance."""
-        snaps = ProjectionEngine(self._base()).run_deterministic()
+        snaps = self._project(self._base())
         assert abs(snaps[4].roth_contribution_basis - 35_000) < 1
 
     def test_roth_grows_at_market_rate(self):
@@ -3031,7 +2898,7 @@ class TestBackdoorRoth:
             plan,
             investments=dataclasses.replace(plan.investments, annual_market_return=0.10),
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # yr1: 0 * 1.1 + 7000 = 7000
         # yr2: 7000 * 1.1 + 7000 = 14700
         assert abs(snaps[0].roth_ira_balance - 7_000) < 1
@@ -3045,7 +2912,7 @@ class TestBackdoorRoth:
             investments=dataclasses.replace(
                 self._base().investments, annual_market_return=0.10),
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         # After yr2: balance=14700, basis=14000
         assert snaps[1].roth_ira_balance > snaps[1].roth_contribution_basis
 
@@ -3053,8 +2920,8 @@ class TestBackdoorRoth:
 
     def test_roth_reduces_brokerage_by_contribution_amount(self):
         """Post-tax Roth contribution diverts $7k/yr away from brokerage."""
-        s_on  = ProjectionEngine(self._base(backdoor=True)).run_deterministic()[0]
-        s_off = ProjectionEngine(self._base(backdoor=False)).run_deterministic()[0]
+        s_on  = self._project(self._base(backdoor=True))[0]
+        s_off = self._project(self._base(backdoor=False))[0]
         diff = s_off.brokerage_balance - s_on.brokerage_balance
         assert abs(diff - 7_000) < 5
 
@@ -3062,19 +2929,19 @@ class TestBackdoorRoth:
 
     def test_single_capped_at_7k(self):
         """Single filer: contribution capped at $7,000 even if stated higher."""
-        snaps = ProjectionEngine(self._base(roth_contrib=20_000)).run_deterministic()
+        snaps = self._project(self._base(roth_contrib=20_000))
         assert snaps[0].annual_roth_contribution <= 7_000 + 1
 
     def test_married_limit_is_14k(self):
         """Married filing jointly: each spouse can contribute → $14,000 limit."""
         plan = self._base(roth_contrib=14_000, filing=FilingStatus.MARRIED_FILING_JOINTLY)
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         assert abs(snaps[0].roth_ira_balance - 14_000) < 1
 
     def test_married_overcap_capped_at_14k(self):
         """Married: contribution above $14k is capped."""
         plan = self._base(roth_contrib=30_000, filing=FilingStatus.MARRIED_FILING_JOINTLY)
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         assert snaps[0].annual_roth_contribution <= 14_000 + 1
 
     # ── Deficit waterfall ────────────────────────────────────────────────────
@@ -3111,8 +2978,8 @@ class TestBackdoorRoth:
                                        use_backdoor_roth=False),
             projection_years=3,
         )
-        s_on  = ProjectionEngine(tight).run_deterministic()[0]
-        s_off = ProjectionEngine(no_roth).run_deterministic()[0]
+        s_on  = self._project(tight)[0]
+        s_off = self._project(no_roth)[0]
         assert s_on.brokerage_balance > s_off.brokerage_balance, \
             "Roth basis should protect brokerage"
 
@@ -3132,13 +2999,13 @@ class TestBackdoorRoth:
                                        use_backdoor_roth=True),
             projection_years=5,
         )
-        for s in ProjectionEngine(tight).run_deterministic():
+        for s in self._project(tight):
             assert s.roth_contribution_basis >= 0.0
             assert s.roth_ira_balance >= 0.0
 
     def test_no_vesting_years_1_to_4(self):
         """Years 1-4: roth_vested_basis = 0, contributions are locked."""
-        snaps = ProjectionEngine(FinancialPlan(
+        snaps = self._project(FinancialPlan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
@@ -3148,13 +3015,13 @@ class TestBackdoorRoth:
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                        use_backdoor_roth=True),
             projection_years=10,
-        )).run_deterministic()
+        ))
         for s in snaps[:4]:
             assert s.roth_vested_basis == 0.0, f"yr{s.year} should be unvested"
 
     def test_vesting_starts_at_year_6(self):
         """Year 6: year-1 contribution ($7k) becomes penalty-free (5-year clock elapsed)."""
-        snaps = ProjectionEngine(FinancialPlan(
+        snaps = self._project(FinancialPlan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
@@ -3164,12 +3031,12 @@ class TestBackdoorRoth:
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                        use_backdoor_roth=True),
             projection_years=10,
-        )).run_deterministic()
+        ))
         assert abs(snaps[5].roth_vested_basis - 7_000) < 1   # yr6: first vintage vests
 
     def test_vesting_accumulates_to_35k_by_year_10(self):
         """Year 10: 5 annual vintages ($7k each) have vested → $35k total."""
-        snaps = ProjectionEngine(FinancialPlan(
+        snaps = self._project(FinancialPlan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
@@ -3179,12 +3046,12 @@ class TestBackdoorRoth:
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                        use_backdoor_roth=True),
             projection_years=12,
-        )).run_deterministic()
+        ))
         assert abs(snaps[9].roth_vested_basis - 35_000) < 1  # yr10: 5 vintages = 35k
 
     def test_existing_roth_balance_immediately_vested(self):
         """Pre-existing Roth balance is assumed ≥5 years old and fully penalty-free."""
-        snaps = ProjectionEngine(FinancialPlan(
+        snaps = self._project(FinancialPlan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
             lifestyle=LifestyleProfile(),
@@ -3194,7 +3061,7 @@ class TestBackdoorRoth:
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                        use_backdoor_roth=True),
             projection_years=3,
-        )).run_deterministic()
+        ))
         assert snaps[0].roth_vested_basis == 30_000
 
     def test_vested_basis_absorbs_deficit_before_brokerage(self):
@@ -3216,8 +3083,8 @@ class TestBackdoorRoth:
                 strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                            use_backdoor_roth=(roth_balance > 0)),
                 projection_years=3)
-        s_r = ProjectionEngine(_tight(30_000, 70_000)).run_deterministic()[0]
-        s_b = ProjectionEngine(_tight(0, 100_000)).run_deterministic()[0]
+        s_r = self._project(_tight(30_000, 70_000))[0]
+        s_b = self._project(_tight(0, 100_000))[0]
         brok_drop_A = 70_000 - s_r.brokerage_balance
         brok_drop_B = 100_000 - s_b.brokerage_balance
         assert brok_drop_A < brok_drop_B,             f"Vested Roth should reduce brokerage draw: A drew {brok_drop_A:.0f}, B drew {brok_drop_B:.0f}"
@@ -3235,7 +3102,7 @@ class TestBackdoorRoth:
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
                                        use_backdoor_roth=True),
             projection_years=4)
-        snaps = ProjectionEngine(tight).run_deterministic()
+        snaps = self._project(tight)
         assert snaps[0].roth_ira_balance > 0    # contribution was made
         assert snaps[0].roth_vested_basis == 0  # but locked for 5 years
 
@@ -3243,7 +3110,7 @@ class TestBackdoorRoth:
 
     def test_roth_included_in_net_worth(self):
         """Roth IRA balance must be in net worth calculation."""
-        for s in ProjectionEngine(self._base(roth_balance=10_000)).run_deterministic():
+        for s in self._project(self._base(roth_balance=10_000)):
             c = (s.retirement_balance + s.hsa_balance + s.roth_ira_balance
                  + s.brokerage_balance + s.home_equity + s.uninvested_cash
                  + s.cash_buffer + s.business_equity)
@@ -3257,7 +3124,7 @@ class TestBackdoorRoth:
             retirement=RetirementProfile(current_age=35, retirement_age=65,
                                          desired_annual_income=80_000),
         )
-        snaps = ProjectionEngine(plan).run_deterministic()
+        snaps = self._project(plan)
         rr = ProjectionEngine(plan).compute_retirement_readiness(snaps)
         assert rr is not None
         # Projected balance should be >= Roth balance (it includes other accounts too)
@@ -3295,14 +3162,11 @@ class TestRothContributionSchedule:
     """
 
     def _base(self, schedule=None, flat=7_000):
-        return FinancialPlan(
+        return make_plan(
             income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(),
-            investments=InvestmentProfile(
+            investments=investments(
                 current_liquid_cash=200_000,
                 annual_roth_ira_contribution=float(flat),
-                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
                 roth_contribution_schedule=schedule,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,

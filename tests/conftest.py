@@ -1,4 +1,6 @@
 """Shared pytest fixtures for fintracker tests."""
+import dataclasses
+
 import pytest
 from fintracker.models import (
     FilingStatus, State,
@@ -37,14 +39,9 @@ def standard_housing() -> HousingProfile:
 
 
 @pytest.fixture
-def low_down_housing() -> HousingProfile:
-    """Under 20% down — triggers PMI."""
-    return HousingProfile(
-        home_price=400_000,
-        down_payment=40_000,   # 10%
-        interest_rate=0.065,
-        loan_term_years=30,
-    )
+def low_down_housing(standard_housing) -> HousingProfile:
+    """standard_housing but under 20% down (10%) — triggers PMI."""
+    return dataclasses.replace(standard_housing, down_payment=40_000)
 
 
 @pytest.fixture
@@ -83,12 +80,9 @@ def all_strategies_on() -> StrategyToggles:
 
 
 @pytest.fixture
-def all_strategies_off() -> StrategyToggles:
-    return StrategyToggles(
-        maximize_hsa=False,
-        use_529_state_deduction=False,
-        maximize_401k=False,
-        use_roth_ladder=False,
+def all_strategies_off(all_strategies_on) -> StrategyToggles:
+    return dataclasses.replace(
+        all_strategies_on, maximize_hsa=False, use_529_state_deduction=False, maximize_401k=False,
     )
 
 

@@ -29,10 +29,15 @@ from typing import Optional
 
 import numpy as np
 
+from fintracker.constants import (
+    HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_401K_CATCHUP, LIMIT_SOLO_401K,
+    ROTH_IRA_LIMIT,
+)
+from fintracker.finance_math import linear_phaseout, monthly_amortized_payment
 from fintracker.models import (
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, RothContributionPhase, EmployerMatch, KidCarProfile, MatchTier, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
-    RetirementProfile, StrategyToggles,
+    RetirementProfile, StrategyToggles, by_filing_status,
 )
 from fintracker.tax_engine import TaxEngine
 from fintracker.mortgage import MortgageCalculator
@@ -42,10 +47,6 @@ from fintracker.mortgage import MortgageCalculator
 # IRS / tax constants
 # ---------------------------------------------------------------------------
 
-_HSA_LIMIT_SINGLE         = 4_150
-_HSA_LIMIT_FAMILY         = 8_300
-_401K_LIMIT               = 30_500
-_SOLO_401K_LIMIT          = 69_000
 _SE_TAX_RATE              = 0.1530
 _SE_TAX_DEDUCTIBLE_SHARE  = 0.9235
 _QBI_PHASEOUT_SINGLE      = 191_950
@@ -100,8 +101,6 @@ _US_HISTORICAL_INFLATION: tuple[float, ...] = (
      0.0270,  0.0150,  0.0300,  0.0170,  0.0150,  0.0080,  0.0070,  0.0210,
      0.0210,  0.0190,  0.0230,  0.0140,  0.0700,  0.0650,  0.0340,  0.0290,
 )
-
-_ROTH_IRA_LIMIT = 7_000   # per person per year (2024); doubles for married couples
 
 from typing import NamedTuple
 
@@ -336,6 +335,31 @@ def _legacy_car_down(car) -> float:
         # All cars have explicit purchase years — no upfront deduction
         return 0.0
     return car.down_payment * car.num_cars
+
+
+def _pay_loan_year(loan: dict, annual_rate: float, term_years: int) -> float:
+    """Advance one amortising loan by a single year.
+
+    Mutates ``loan['loan_balance']`` and ``loan['loan_year']`` in place and
+    returns the annual payment made this year (0 if the loan is paid off or past
+    its term).  Shared by household cars and kids' cars — previously two verbatim
+    copies of this block lived in ``_cars``.
+
+    ``loan`` must carry ``loan_balance``, ``loan_year`` and ``monthly_payment``.
+    """
+    if loan["loan_balance"] <= 0 or loan["loan_year"] > term_years:
+        return 0.0
+    monthly = loan["monthly_payment"]
+    # Never pay more than what remains plus this year's accrued interest.
+    annual_pmt = min(monthly * 12, loan["loan_balance"] * (1 + annual_rate / 12) * 12)
+    r = annual_rate / 12
+    if r > 0:
+        n_remaining = (term_years - (loan["loan_year"] - 1)) * 12
+        loan["loan_balance"] = max(0.0, monthly * (1 - (1 + r) ** -n_remaining) / r)
+    else:
+        loan["loan_balance"] = max(0.0, loan["loan_balance"] - monthly * 12)
+    loan["loan_year"] += 1
+    return annual_pmt
 
 
 class ProjectionEngine:
@@ -830,7 +854,7 @@ class ProjectionEngine:
         # Backdoor Roth IRA contribution (post-tax — no deduction, reduces net income).
         # Limit: $7,000/person × (2 if married), always fixed nominal dollars.
         if self._plan.strategies.use_backdoor_roth:
-            roth_limit   = _ROTH_IRA_LIMIT * (2 if state.is_married else 1)
+            roth_limit   = ROTH_IRA_LIMIT * (2 if state.is_married else 1)
             roth_contrib = min(inv.roth_contribution_for_year(year), roth_limit)
         else:
             roth_contrib = 0.0
@@ -923,12 +947,14 @@ class ProjectionEngine:
         strat = self._plan.strategies
 
         is_family = state.is_married or state.num_children > 0
-        hsa_limit = _HSA_LIMIT_FAMILY if is_family else _HSA_LIMIT_SINGLE
+        hsa_limit = HSA_LIMIT_FAMILY if is_family else HSA_LIMIT_SINGLE
         hsa       = min(inv.annual_hsa_contribution, hsa_limit) if strat.maximize_hsa else 0.0
 
-        k401         = min(inv.annual_401k_contribution, _401K_LIMIT)
+        # Projections apply the age-50 catch-up ceiling (no age tracked in state),
+        # i.e. the most permissive legal cap on elective deferrals.
+        k401         = min(inv.annual_401k_contribution, LIMIT_401K_CATCHUP)
         partner_k401 = (
-            min(inv.partner_annual_401k_contribution, _401K_LIMIT)
+            min(inv.partner_annual_401k_contribution, LIMIT_401K_CATCHUP)
             if state.income_partner > 0 else 0.0
         )
 
@@ -1086,12 +1112,9 @@ class ProjectionEngine:
         if not col or not col.use_aotc_credit:
             return 0.0
 
-        low  = _AOTC_PHASEOUT_MFJ_LOW  if is_married else _AOTC_PHASEOUT_SINGLE_LOW
-        high = _AOTC_PHASEOUT_MFJ_HIGH if is_married else _AOTC_PHASEOUT_SINGLE_HIGH
-        if gross_income >= high:
-            return 0.0
-
-        phase = max(0.0, 1.0 - (gross_income - low) / (high - low)) if gross_income > low else 1.0
+        low  = by_filing_status(is_married, _AOTC_PHASEOUT_SINGLE_LOW, _AOTC_PHASEOUT_MFJ_LOW)
+        high = by_filing_status(is_married, _AOTC_PHASEOUT_SINGLE_HIGH, _AOTC_PHASEOUT_MFJ_HIGH)
+        phase = linear_phaseout(gross_income, low, high)
 
         eligible = sum(
             1 for by in state.child_birth_years
@@ -1159,26 +1182,20 @@ class ProjectionEngine:
         # Simplified: apply phase-out linearly over a $50k window above the limit.
         qbi_deduction = 0.0
         if biz.use_qbi_deduction:
-            limit = (_QBI_PHASEOUT_MFJ if state.is_married else _QBI_PHASEOUT_SINGLE)
-            total_income = state.gross_income + net_profit
-            if total_income <= limit:
-                phase = 1.0
-            elif total_income >= limit + 50_000:
-                phase = 0.0
-            else:
-                phase = 1.0 - (total_income - limit) / 50_000
+            limit = by_filing_status(state.is_married, _QBI_PHASEOUT_SINGLE, _QBI_PHASEOUT_MFJ)
+            phase = linear_phaseout(state.gross_income + net_profit, limit, limit + 50_000)
             qbi_deduction = net_profit * 0.20 * phase
 
         # --- Solo 401k ---
         # Capped at IRS limit and net profit (can't contribute more than earned)
-        solo_k = min(biz.solo_401k_contribution, _SOLO_401K_LIMIT, max(0.0, net_profit))
+        solo_k = min(biz.solo_401k_contribution, LIMIT_SOLO_401K, max(0.0, net_profit))
 
         # --- SEP-IRA ---
         # Up to 25% of net self-employment income (after SE tax deduction)
         sep_base = max(0.0, net_profit - employer_half_deduction)
         sep = min(biz.sep_ira_contribution, 0.25 * sep_base)
         # SEP flows into retirement alongside solo 401k
-        solo_k_total = min(solo_k + sep, _SOLO_401K_LIMIT)
+        solo_k_total = min(solo_k + sep, LIMIT_SOLO_401K)
 
         # --- Net income to owner ---
         # Gross profit minus all deductions; the actual tax impact on W-2 income
@@ -1191,6 +1208,19 @@ class ProjectionEngine:
         biz_equity = net_profit * biz.equity_multiple
 
         return net_income, se_tax, biz_equity, solo_k_total
+
+    def _finance_purchase(
+        self, state: EngineState, nominal_price: float, nominal_down: float,
+        rate: float, term_years: int,
+    ) -> tuple[float, float]:
+        """Deduct ``nominal_down`` from brokerage; return (principal, monthly_payment).
+
+        Single home for the "put money down, open a loan" step shared by first
+        purchases, replacements, and kids' cars.
+        """
+        state.brokerage_balance -= nominal_down
+        principal = max(0.0, nominal_price - nominal_down)
+        return principal, self._car_monthly_pi(principal, rate, term_years)
 
     def _cars(
         self, state: EngineState, year: int, inf_f: float
@@ -1207,16 +1237,13 @@ class ProjectionEngine:
             if c["purchase_year"] is None:
                 # Car hasn't been bought yet; wait for its first_buy_year
                 if c.get("first_buy_year") == year:
-                    nominal_price = car.car_price * inf_f
-                    nominal_down  = car.down_payment * inf_f
-                    state.brokerage_balance -= nominal_down
+                    nominal_down = car.down_payment * inf_f
+                    principal, monthly = self._finance_purchase(
+                        state, car.car_price * inf_f, nominal_down,
+                        car.loan_rate, car.loan_term_years)
                     total_purchase += nominal_down
-                    principal = max(0.0, nominal_price - nominal_down)
-                    monthly   = self._car_monthly_pi(principal, car.loan_rate, car.loan_term_years)
-                    c["loan_balance"]    = principal
-                    c["loan_year"]       = 1
-                    c["purchase_year"]   = year
-                    c["monthly_payment"] = monthly
+                    c.update(loan_balance=principal, loan_year=1,
+                             purchase_year=year, monthly_payment=monthly)
                 # Nothing to do before first_buy_year — skip to next car
                 if c["purchase_year"] is None:
                     continue
@@ -1228,34 +1255,16 @@ class ProjectionEngine:
                 state.brokerage_balance += proceeds
                 total_sale += proceeds
 
-                nominal_price = car.car_price * inf_f
-                nominal_down  = car.down_payment * inf_f
-                state.brokerage_balance -= nominal_down
+                nominal_down = car.down_payment * inf_f
+                principal, monthly = self._finance_purchase(
+                    state, car.car_price * inf_f, nominal_down,
+                    car.loan_rate, car.loan_term_years)
                 total_purchase += nominal_down
-
-                principal = max(0.0, nominal_price - nominal_down)
-                monthly   = self._car_monthly_pi(principal, car.loan_rate, car.loan_term_years)
-                c["loan_balance"]    = principal
-                c["loan_year"]       = 1
-                c["purchase_year"]   = year
-                c["monthly_payment"] = monthly
+                c.update(loan_balance=principal, loan_year=1,
+                         purchase_year=year, monthly_payment=monthly)
 
             # --- Annual loan payment ---
-            if c["loan_balance"] > 0 and c["loan_year"] <= car.loan_term_years:
-                annual_pmt = c["monthly_payment"] * 12
-                annual_pmt = min(annual_pmt, c["loan_balance"] * (1 + car.loan_rate / 12) * 12)
-                total_pmt += annual_pmt
-
-                r = car.loan_rate / 12
-                n_paid  = (c["loan_year"] - 1) * 12
-                n_total = car.loan_term_years * 12
-                remaining = (
-                    c["monthly_payment"] * (1 - (1 + r) ** -(n_total - n_paid)) / r
-                    if r > 0
-                    else c["loan_balance"] - c["monthly_payment"] * 12
-                )
-                c["loan_balance"] = max(0.0, remaining)
-                c["loan_year"]   += 1
+            total_pmt += _pay_loan_year(c, car.loan_rate, car.loan_term_years)
 
         # --- Kids' first cars ---
         if car and car.kids_car:
@@ -1278,9 +1287,8 @@ class ProjectionEngine:
                     if not already:
                         nominal_price = kc.car_price * inf_f
                         down          = nominal_price * kc.down_payment_pct
-                        principal     = nominal_price - down
-                        monthly_pmt   = self._car_monthly_pi(principal, kc.loan_rate, kc.loan_term_years)
-                        state.brokerage_balance -= down
+                        principal, monthly_pmt = self._finance_purchase(
+                            state, nominal_price, down, kc.loan_rate, kc.loan_term_years)
                         total_purchase += down
                         state.kid_car_loans.append({
                             "child_idx":     child_idx,
@@ -1291,20 +1299,7 @@ class ProjectionEngine:
 
             # Annual payments on active kid car loans
             for loan in state.kid_car_loans:
-                if loan["loan_balance"] > 0 and loan["loan_year"] <= kc.loan_term_years:
-                    annual_pmt = loan["monthly_payment"] * 12
-                    annual_pmt = min(annual_pmt, loan["loan_balance"] * (1 + kc.loan_rate / 12) * 12)
-                    total_pmt += annual_pmt
-                    r = kc.loan_rate / 12
-                    n_paid  = (loan["loan_year"] - 1) * 12
-                    n_total = kc.loan_term_years * 12
-                    remaining = (
-                        loan["monthly_payment"] * (1 - (1 + r) ** -(n_total - n_paid)) / r
-                        if r > 0
-                        else loan["loan_balance"] - loan["monthly_payment"] * 12
-                    )
-                    loan["loan_balance"] = max(0.0, remaining)
-                    loan["loan_year"] += 1
+                total_pmt += _pay_loan_year(loan, kc.loan_rate, kc.loan_term_years)
 
         return total_pmt, total_purchase, total_sale
 
@@ -1479,13 +1474,5 @@ class ProjectionEngine:
     # Car helpers                                                          #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _car_monthly_pi(principal: float, annual_rate: float, term_years: int) -> float:
-        """Standard amortising loan monthly P&I payment."""
-        if principal <= 0:
-            return 0.0
-        if annual_rate == 0:
-            return principal / (term_years * 12)
-        r = annual_rate / 12
-        n = term_years * 12
-        return principal * r * (1 + r) ** n / ((1 + r) ** n - 1)
+    # Amortising-loan payment — shared with the mortgage engine.
+    _car_monthly_pi = staticmethod(monthly_amortized_payment)
