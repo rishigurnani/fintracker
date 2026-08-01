@@ -1,5 +1,5 @@
 config/personal.yaml
-config/personal_*.yaml
+config/personal*.yaml
 __pycache__/
 *.py[cod]
 .venv/
@@ -7,3 +7,4 @@ venv/
 fintracker.egg-info/
 .DS_Store
 .repowise
+.coverage
