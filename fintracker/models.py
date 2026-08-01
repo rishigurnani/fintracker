@@ -200,6 +200,27 @@ class LifestyleProfile:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class RothContributionPhase:
+    """
+    A projection-year range during which a specific Roth IRA contribution is made.
+
+    year_start and year_end are inclusive projection years (1-based).
+    annual_amount is the contribution in that phase (today's dollars, fixed nominal).
+    Years not covered by any phase default to $0.
+
+    Example — contribute only in years 6-9::
+
+        roth_contribution_schedule:
+          - year_start: 6
+            year_end:   9
+            annual_amount: 7000
+    """
+    year_start: int
+    year_end: int
+    annual_amount: float
+
+
+@dataclass
 class MatchTier:
     """One tier of an employer 401k match formula.
 
@@ -325,6 +346,25 @@ class InvestmentProfile:
     # the buffer is intentional and maintained even when auto_invest_surplus=True.
     cash_buffer_months: float = 0.0
 
+    # Starting Roth IRA balance (if you already have one)
+    current_roth_ira_balance: float = 0.0
+
+    # Optional phase schedule for Roth contributions.
+    # When set, overrides annual_roth_ira_contribution for each projection year.
+    # Years not covered by any phase contribute $0.
+    roth_contribution_schedule: Optional[list] = None  # list[RothContributionPhase]
+
+    def roth_contribution_for_year(self, year: int) -> float:
+        """Return the Roth IRA contribution amount for a given projection year.
+        Uses the phase schedule if set, otherwise the flat annual amount.
+        Returns 0.0 for years not covered by any phase."""
+        if self.roth_contribution_schedule:
+            for phase in self.roth_contribution_schedule:
+                if phase.year_start <= year <= phase.year_end:
+                    return phase.annual_amount
+            return 0.0
+        return self.annual_roth_ira_contribution
+
     @property
     def investable_cash(self) -> float:
         return max(0.0, self.current_liquid_cash - self.one_time_upcoming_expenses)
@@ -342,6 +382,14 @@ class StrategyToggles:
     maximize_401k: bool = True
     use_roth_ladder: bool = False
     roth_conversion_annual_amount: float = 0.0
+
+    # Backdoor Roth IRA strategy.
+    # When True: contributes annual_roth_ira_contribution post-tax each year
+    # (up to the IRS limit: $7,000/person, $14,000 if married).
+    # The contribution basis (what you put in) is withdrawn tax-free before
+    # touching brokerage when a deficit occurs.
+    # Withdrawal waterfall: income → cash → Roth basis → brokerage.
+    use_backdoor_roth: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +412,13 @@ class RetirementProfile:
     years_in_retirement: int = 30
     expected_post_retirement_return: float = 0.05
     estimated_social_security_annual: float = 0.0  # today's dollars
+
+    # Post-retirement withdrawal tax rates.
+    # Set these to see Roth's genuine advantage over 401k/brokerage.
+    # Defaults to 0% (no tax adjustment) for backward compatibility.
+    # Typical values: 401k ~22-32% (ordinary income); brokerage ~15-20% (cap gains).
+    retirement_withdrawal_tax_rate: float = 0.0   # applied to 401k/IRA balance
+    capital_gains_tax_rate: float = 0.0           # applied to brokerage balance
 
     @property
     def years_to_retirement(self) -> int:

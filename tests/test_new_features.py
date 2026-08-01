@@ -12,7 +12,7 @@ from fintracker.models import (
     EmployerMatch, KidCarProfile, MatchTier, CollegeProfile,
     FilingStatus, FinancialPlan, HousingProfile,
     IncomeProfile, InvestmentProfile, LifestyleProfile, RetirementProfile,
-    State, StrategyToggles, TimelineEvent,
+    State, StrategyToggles, TimelineEvent, RothContributionPhase
 )
 from fintracker.projections import ProjectionEngine
 
@@ -2955,3 +2955,435 @@ class TestMCCalculationAudit:
                                                      use_historical_inflation=False)
         # After 10 years, even p10 should be well above zero (rolling returns, not fixed)
         assert mc.p10_net_worth[-1] > 50_000
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Backdoor Roth IRA strategy
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBackdoorRoth:
+    """
+    Tests for the backdoor Roth IRA strategy toggle (use_backdoor_roth).
+
+    When enabled:
+    - annual_roth_ira_contribution is contributed post-tax each year (no deduction),
+      capped at $7,000/person ($14,000 if married filing jointly).
+    - roth_ira_balance tracks the full account value (grows at market rate).
+    - roth_contribution_basis tracks only cumulative contributions — this is the
+      amount withdrawable tax-free at any time under IRS ordering rules.
+    - Deficit waterfall: income → cash buffer → Roth contribution basis → brokerage.
+      Roth earnings (balance − basis) are not touched (penalty/tax implications ignored
+      for simplicity; the user can model this by holding Roth to retirement).
+    - Roth balance is included in net worth and in compute_retirement_readiness().
+    """
+
+    def _base(self, roth_contrib=7_000, backdoor=True, roth_balance=0,
+               brokerage=200_000, filing=FilingStatus.SINGLE):
+        return FinancialPlan(
+            income=IncomeProfile(200_000, filing, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=50_000,
+                current_brokerage_balance=float(brokerage),
+                current_roth_ira_balance=float(roth_balance),
+                annual_roth_ira_contribution=float(roth_contrib),
+                annual_market_return=0.0,
+                annual_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(
+                maximize_hsa=False, maximize_401k=False,
+                use_backdoor_roth=backdoor,
+            ),
+            projection_years=10,
+        )
+
+    # ── Toggle off ───────────────────────────────────────────────────────────
+
+    def test_toggle_off_roth_balance_zero(self):
+        """When use_backdoor_roth=False, no Roth contributions are made."""
+        s1 = ProjectionEngine(self._base(backdoor=False)).run_deterministic()[0]
+        assert s1.roth_ira_balance == 0.0
+        assert s1.annual_roth_contribution == 0.0
+
+    def test_toggle_default_is_false(self):
+        assert StrategyToggles().use_backdoor_roth is False
+
+    # ── Balance accumulation ─────────────────────────────────────────────────
+
+    def test_roth_builds_at_7k_per_year(self):
+        """At 0% return, Roth balance = $7k × years."""
+        snaps = ProjectionEngine(self._base()).run_deterministic()
+        assert abs(snaps[0].roth_ira_balance - 7_000) < 1
+        assert abs(snaps[2].roth_ira_balance - 21_000) < 1
+
+    def test_roth_basis_tracks_contributions_only(self):
+        """Basis = cumulative contributions. At 0% return, equals balance."""
+        snaps = ProjectionEngine(self._base()).run_deterministic()
+        assert abs(snaps[4].roth_contribution_basis - 35_000) < 1
+
+    def test_roth_grows_at_market_rate(self):
+        """With 10% return, Roth balance compounds correctly."""
+        plan = self._base()
+        import dataclasses
+        plan = dataclasses.replace(
+            plan,
+            investments=dataclasses.replace(plan.investments, annual_market_return=0.10),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # yr1: 0 * 1.1 + 7000 = 7000
+        # yr2: 7000 * 1.1 + 7000 = 14700
+        assert abs(snaps[0].roth_ira_balance - 7_000) < 1
+        assert abs(snaps[1].roth_ira_balance - 14_700) < 1
+
+    def test_basis_does_not_include_earnings(self):
+        """Basis = contributions only; earnings push balance above basis."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._base(),
+            investments=dataclasses.replace(
+                self._base().investments, annual_market_return=0.10),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        # After yr2: balance=14700, basis=14000
+        assert snaps[1].roth_ira_balance > snaps[1].roth_contribution_basis
+
+    # ── Post-tax cost and effect on cash flow ────────────────────────────────
+
+    def test_roth_reduces_brokerage_by_contribution_amount(self):
+        """Post-tax Roth contribution diverts $7k/yr away from brokerage."""
+        s_on  = ProjectionEngine(self._base(backdoor=True)).run_deterministic()[0]
+        s_off = ProjectionEngine(self._base(backdoor=False)).run_deterministic()[0]
+        diff = s_off.brokerage_balance - s_on.brokerage_balance
+        assert abs(diff - 7_000) < 5
+
+    # ── IRS contribution limits ──────────────────────────────────────────────
+
+    def test_single_capped_at_7k(self):
+        """Single filer: contribution capped at $7,000 even if stated higher."""
+        snaps = ProjectionEngine(self._base(roth_contrib=20_000)).run_deterministic()
+        assert snaps[0].annual_roth_contribution <= 7_000 + 1
+
+    def test_married_limit_is_14k(self):
+        """Married filing jointly: each spouse can contribute → $14,000 limit."""
+        plan = self._base(roth_contrib=14_000, filing=FilingStatus.MARRIED_FILING_JOINTLY)
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert abs(snaps[0].roth_ira_balance - 14_000) < 1
+
+    def test_married_overcap_capped_at_14k(self):
+        """Married: contribution above $14k is capped."""
+        plan = self._base(roth_contrib=30_000, filing=FilingStatus.MARRIED_FILING_JOINTLY)
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert snaps[0].annual_roth_contribution <= 14_000 + 1
+
+    # ── Deficit waterfall ────────────────────────────────────────────────────
+
+    def test_deficit_draws_roth_basis_before_brokerage(self):
+        """When expenses exceed income, Roth basis is drawn before brokerage."""
+        tight = FinancialPlan(
+            income=IncomeProfile(55_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=4_500),
+            lifestyle=LifestyleProfile(annual_vacation=8_000, monthly_other_recurring=1_500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=0,
+                current_brokerage_balance=100_000,
+                current_roth_ira_balance=30_000,
+                annual_roth_ira_contribution=7_000,
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=3,
+        )
+        no_roth = FinancialPlan(
+            income=IncomeProfile(55_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=4_500),
+            lifestyle=LifestyleProfile(annual_vacation=8_000, monthly_other_recurring=1_500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=0, current_brokerage_balance=100_000,
+                current_roth_ira_balance=0, annual_roth_ira_contribution=0,
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=False),
+            projection_years=3,
+        )
+        s_on  = ProjectionEngine(tight).run_deterministic()[0]
+        s_off = ProjectionEngine(no_roth).run_deterministic()[0]
+        assert s_on.brokerage_balance > s_off.brokerage_balance, \
+            "Roth basis should protect brokerage"
+
+    def test_roth_basis_depletes_not_earnings(self):
+        """When drawn against, basis and balance decrease but never below 0."""
+        tight = FinancialPlan(
+            income=IncomeProfile(55_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=4_500),
+            lifestyle=LifestyleProfile(annual_vacation=8_000, monthly_other_recurring=1_500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(
+                current_liquid_cash=0, current_brokerage_balance=100_000,
+                current_roth_ira_balance=30_000, annual_roth_ira_contribution=7_000,
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=5,
+        )
+        for s in ProjectionEngine(tight).run_deterministic():
+            assert s.roth_contribution_basis >= 0.0
+            assert s.roth_ira_balance >= 0.0
+
+    def test_no_vesting_years_1_to_4(self):
+        """Years 1-4: roth_vested_basis = 0, contributions are locked."""
+        snaps = ProjectionEngine(FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=50_000,
+                annual_roth_ira_contribution=7_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=10,
+        )).run_deterministic()
+        for s in snaps[:4]:
+            assert s.roth_vested_basis == 0.0, f"yr{s.year} should be unvested"
+
+    def test_vesting_starts_at_year_6(self):
+        """Year 6: year-1 contribution ($7k) becomes penalty-free (5-year clock elapsed)."""
+        snaps = ProjectionEngine(FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=50_000,
+                annual_roth_ira_contribution=7_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=10,
+        )).run_deterministic()
+        assert abs(snaps[5].roth_vested_basis - 7_000) < 1   # yr6: first vintage vests
+
+    def test_vesting_accumulates_to_35k_by_year_10(self):
+        """Year 10: 5 annual vintages ($7k each) have vested → $35k total."""
+        snaps = ProjectionEngine(FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=50_000,
+                annual_roth_ira_contribution=7_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=12,
+        )).run_deterministic()
+        assert abs(snaps[9].roth_vested_basis - 35_000) < 1  # yr10: 5 vintages = 35k
+
+    def test_existing_roth_balance_immediately_vested(self):
+        """Pre-existing Roth balance is assumed ≥5 years old and fully penalty-free."""
+        snaps = ProjectionEngine(FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(current_liquid_cash=50_000,
+                current_roth_ira_balance=30_000, annual_roth_ira_contribution=0,
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=3,
+        )).run_deterministic()
+        assert snaps[0].roth_vested_basis == 30_000
+
+    def test_vested_basis_absorbs_deficit_before_brokerage(self):
+        """With pre-existing vested Roth, a deficit draws from Roth before brokerage.
+        Both plans start with identical total liquid wealth ($100k). Plan A holds
+        $30k in vested Roth + $70k in brokerage; Plan B holds $100k in brokerage.
+        In a deficit year, Plan A's brokerage is fully protected while Plan B's drains."""
+        def _tight(roth_balance, brokerage):
+            return FinancialPlan(
+                income=IncomeProfile(50_000, FilingStatus.SINGLE, State.TEXAS),
+                housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=4_000),
+                lifestyle=LifestyleProfile(annual_vacation=6_000, monthly_other_recurring=1_000,
+                                           annual_medical_oop=3_000, medical_auto_scale=False),
+                investments=InvestmentProfile(current_liquid_cash=0,
+                    current_brokerage_balance=float(brokerage),
+                    current_roth_ira_balance=float(roth_balance),
+                    annual_roth_ira_contribution=0,  # no new contributions — isolate withdrawal
+                    annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                           use_backdoor_roth=(roth_balance > 0)),
+                projection_years=3)
+        s_r = ProjectionEngine(_tight(30_000, 70_000)).run_deterministic()[0]
+        s_b = ProjectionEngine(_tight(0, 100_000)).run_deterministic()[0]
+        brok_drop_A = 70_000 - s_r.brokerage_balance
+        brok_drop_B = 100_000 - s_b.brokerage_balance
+        assert brok_drop_A < brok_drop_B,             f"Vested Roth should reduce brokerage draw: A drew {brok_drop_A:.0f}, B drew {brok_drop_B:.0f}"
+
+    def test_deficit_in_years_1_to_5_cannot_use_new_contributions(self):
+        """Years 1-5: new contributions are locked; deficit goes to brokerage instead."""
+        tight = FinancialPlan(
+            income=IncomeProfile(55_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=4_500),
+            lifestyle=LifestyleProfile(annual_vacation=8_000, monthly_other_recurring=1_500,
+                                       annual_medical_oop=3_000, medical_auto_scale=False),
+            investments=InvestmentProfile(current_liquid_cash=0, current_brokerage_balance=100_000,
+                current_roth_ira_balance=0, annual_roth_ira_contribution=7_000,
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=4)
+        snaps = ProjectionEngine(tight).run_deterministic()
+        assert snaps[0].roth_ira_balance > 0    # contribution was made
+        assert snaps[0].roth_vested_basis == 0  # but locked for 5 years
+
+    # ── Net worth & retirement readiness ─────────────────────────────────────
+
+    def test_roth_included_in_net_worth(self):
+        """Roth IRA balance must be in net worth calculation."""
+        for s in ProjectionEngine(self._base(roth_balance=10_000)).run_deterministic():
+            c = (s.retirement_balance + s.hsa_balance + s.roth_ira_balance
+                 + s.brokerage_balance + s.home_equity + s.uninvested_cash
+                 + s.cash_buffer + s.business_equity)
+            assert abs(c - s.net_worth) < 1.0, f"NW integrity failed yr{s.year}"
+
+    def test_roth_included_in_retirement_readiness(self):
+        """compute_retirement_readiness() must include Roth balance."""
+        import dataclasses
+        plan = dataclasses.replace(
+            self._base(roth_balance=100_000),
+            retirement=RetirementProfile(current_age=35, retirement_age=65,
+                                         desired_annual_income=80_000),
+        )
+        snaps = ProjectionEngine(plan).run_deterministic()
+        rr = ProjectionEngine(plan).compute_retirement_readiness(snaps)
+        assert rr is not None
+        # Projected balance should be >= Roth balance (it includes other accounts too)
+        assert rr.projected_balance_at_retirement >= 0
+
+    # ── Config round-trip ────────────────────────────────────────────────────
+
+    def test_config_roundtrip_preserves_roth_fields(self):
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan = self._base(roth_balance=25_000, roth_contrib=7_000)
+        plan2 = _dict_to_plan(_plan_to_dict(plan))
+        assert plan2.investments.current_roth_ira_balance == 25_000
+        assert plan2.strategies.use_backdoor_roth is True
+        assert plan2.investments.annual_roth_ira_contribution == 7_000
+
+    def test_config_roundtrip_none_roth(self):
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan = self._base(backdoor=False, roth_balance=0)
+        plan2 = _dict_to_plan(_plan_to_dict(plan))
+        assert plan2.strategies.use_backdoor_roth is False
+        assert plan2.investments.current_roth_ira_balance == 0.0
+
+
+class TestRothContributionSchedule:
+    """
+    Tests for RothContributionPhase / roth_contribution_schedule.
+
+    When roth_contribution_schedule is set on InvestmentProfile, it overrides
+    annual_roth_ira_contribution year-by-year. Years not covered by any phase
+    contribute $0. Flat annual_roth_ira_contribution is the fallback when no
+    schedule is provided (backward compatible).
+
+    The 5-year vesting queue interacts correctly with gaps — a year with $0
+    contribution pushes a zero onto the queue, so gaps don't cause early vesting.
+    """
+
+    def _base(self, schedule=None, flat=7_000):
+        return FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=200_000,
+                annual_roth_ira_contribution=float(flat),
+                annual_market_return=0.0, annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                roth_contribution_schedule=schedule,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False,
+                                       use_backdoor_roth=True),
+            projection_years=12,
+        )
+
+    def test_flat_fallback_works(self):
+        """Without a schedule, flat annual_roth_ira_contribution applies every year."""
+        snaps = ProjectionEngine(self._base()).run_deterministic()
+        for s in snaps:
+            assert abs(s.annual_roth_contribution - 7_000) < 1
+
+    def test_schedule_overrides_flat(self):
+        """When a schedule is set, flat amount is ignored."""
+        sched = [RothContributionPhase(year_start=1, year_end=12, annual_amount=5_000)]
+        snaps = ProjectionEngine(self._base(schedule=sched, flat=7_000)).run_deterministic()
+        assert abs(snaps[0].annual_roth_contribution - 5_000) < 1
+
+    def test_zero_outside_phase(self):
+        """Years outside all phases contribute $0."""
+        sched = [RothContributionPhase(year_start=6, year_end=9, annual_amount=7_000)]
+        snaps = ProjectionEngine(self._base(sched)).run_deterministic()
+        for s in snaps[:5]:   # yrs 1-5
+            assert s.annual_roth_contribution == 0.0
+        for s in snaps[9:]:   # yrs 10-12
+            assert s.annual_roth_contribution == 0.0
+
+    def test_amount_within_phase(self):
+        """Years inside the phase contribute the specified amount."""
+        sched = [RothContributionPhase(year_start=6, year_end=9, annual_amount=7_000)]
+        snaps = ProjectionEngine(self._base(sched)).run_deterministic()
+        for s in snaps[5:9]:   # yrs 6-9
+            assert abs(s.annual_roth_contribution - 7_000) < 1
+
+    def test_multi_phase_different_amounts(self):
+        """Multiple phases with different amounts and a gap between them."""
+        sched = [
+            RothContributionPhase(year_start=1, year_end=3, annual_amount=7_000),
+            RothContributionPhase(year_start=6, year_end=9, annual_amount=5_000),
+        ]
+        snaps = ProjectionEngine(self._base(sched)).run_deterministic()
+        assert abs(snaps[0].annual_roth_contribution - 7_000) < 1   # yr1
+        assert snaps[3].annual_roth_contribution == 0.0              # yr4 (gap)
+        assert snaps[4].annual_roth_contribution == 0.0              # yr5 (gap)
+        assert abs(snaps[5].annual_roth_contribution - 5_000) < 1   # yr6
+        assert snaps[9].annual_roth_contribution == 0.0              # yr10
+
+    def test_vesting_gap_means_no_vesting(self):
+        """With contributions only in yrs 6-9, nothing vests in yrs 1-10
+        (no contribution was made 5 years prior to yrs 6-10)."""
+        sched = [RothContributionPhase(year_start=6, year_end=9, annual_amount=7_000)]
+        snaps = ProjectionEngine(self._base(sched)).run_deterministic()
+        for s in snaps[:10]:
+            assert s.roth_vested_basis == 0.0
+
+    def test_irs_limit_still_enforced_in_phases(self):
+        """Phase amount above IRS limit is capped."""
+        sched = [RothContributionPhase(year_start=1, year_end=12, annual_amount=20_000)]
+        snaps = ProjectionEngine(self._base(sched)).run_deterministic()
+        assert snaps[0].annual_roth_contribution <= 7_000 + 1
+
+    def test_nw_integrity_with_phase_schedule(self):
+        """Net worth integrity holds every year with a phase schedule."""
+        sched = [RothContributionPhase(year_start=6, year_end=9, annual_amount=7_000)]
+        for s in ProjectionEngine(self._base(sched)).run_deterministic():
+            c = (s.retirement_balance + s.hsa_balance + s.roth_ira_balance
+                 + s.brokerage_balance + s.home_equity + s.uninvested_cash
+                 + s.cash_buffer + s.business_equity)
+            assert abs(c - s.net_worth) < 1.0, f"Yr{s.year}"
+
+    def test_config_roundtrip_preserves_phases(self):
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        sched = [RothContributionPhase(year_start=6, year_end=9, annual_amount=7_000)]
+        plan2 = _dict_to_plan(_plan_to_dict(self._base(sched)))
+        s2 = plan2.investments.roth_contribution_schedule
+        assert s2 is not None and len(s2) == 1
+        assert s2[0].year_start == 6 and s2[0].year_end == 9
+        assert s2[0].annual_amount == 7_000
+
+    def test_config_roundtrip_none_stays_none(self):
+        from fintracker.config import _plan_to_dict, _dict_to_plan
+        plan2 = _dict_to_plan(_plan_to_dict(self._base()))
+        assert plan2.investments.roth_contribution_schedule is None

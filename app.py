@@ -17,7 +17,7 @@ from fintracker.models import (
     FilingStatus, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier,
-    InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
+    RothContributionPhase, InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
 )
 from fintracker.tax_engine import TaxEngine
 from fintracker.mortgage import MortgageCalculator
@@ -166,7 +166,7 @@ def build_sidebar() -> FinancialPlan:
     st.sidebar.divider()
 
     # --- Load from file ---
-    with st.sidebar.expander("📂 Load Config", expanded=False):
+    with st.sidebar.expander("📂 Load / Save Config", expanded=False):
         uploaded = st.file_uploader("Load YAML config", type=["yaml", "yml"], label_visibility="collapsed")
         if uploaded:
             import yaml, tempfile, os
@@ -205,7 +205,11 @@ def build_sidebar() -> FinancialPlan:
     # Cross-section scalar values — defined here so every section can reference them
     gross  = int(defaults.income.gross_annual_income)             if defaults else 120_000
     spouse = int(defaults.income.spouse_gross_annual_income)      if defaults else 0
-    employer_match = defaults.investments.employer_match          if defaults else None
+    employer_match    = defaults.investments.employer_match           if defaults else None
+    roth_bal_current  = int(defaults.investments.current_roth_ira_balance) if defaults else 0
+    roth_annual       = float(defaults.investments.annual_roth_ira_contribution) if defaults else 7_000.0
+    roth_schedule     = (defaults.investments.roth_contribution_schedule
+                         if defaults else None)
 
     if section == "💵 Income":
         # ── Income ───────────────────────────────────────────────
@@ -386,6 +390,11 @@ def build_sidebar() -> FinancialPlan:
             value=int(d_inv.current_brokerage_balance) if d_inv else 0, step=5_000,
             help="Existing taxable investment accounts (separate from 401k/IRA/HSA).",
         )
+        roth_bal_current = st.sidebar.number_input(
+            "Current Roth IRA Balance  (current)", min_value=0, max_value=10_000_000,
+            value=int(d_inv.current_roth_ira_balance) if d_inv else 0, step=5_000,
+            help="Existing Roth IRA balance. The full amount is treated as contribution basis (withdrawable tax-free before brokerage when the Backdoor Roth strategy is on).",
+        )
         one_time = st.sidebar.number_input(
             "Upcoming One-Time Expenses  (current)", min_value=0, max_value=1_000_000,
             value=int(d_inv.one_time_upcoming_expenses) if d_inv else 0, step=5_000,
@@ -533,13 +542,15 @@ def build_sidebar() -> FinancialPlan:
                      "Set to 0 to invest all surplus (default).",
             ),
             employer_match=employer_match,
+            current_roth_ira_balance=float(roth_bal_current),
         )
         # Preserve fields not exposed in sidebar (partner_salary_growth_rate when solo,
         # annual_roth_ira_contribution, annual_brokerage_contribution)
         _inv_base = d_inv if d_inv else InvestmentProfile()
         investments = dataclasses.replace(
             investments,
-            annual_roth_ira_contribution=_inv_base.annual_roth_ira_contribution,
+            annual_roth_ira_contribution=roth_annual,
+            roth_contribution_schedule=roth_schedule,
             annual_brokerage_contribution=_inv_base.annual_brokerage_contribution,
             # partner_salary_growth_rate: sidebar only shows it when spouse > 0;
             # preserve the loaded value when spouse income is 0 at sidebar time
@@ -560,7 +571,64 @@ def build_sidebar() -> FinancialPlan:
             maximize_401k=st.sidebar.toggle("Maximize 401k", value=d_str.maximize_401k if d_str else True),
             use_529_state_deduction=st.sidebar.toggle("Use 529 State Deduction", value=d_str.use_529_state_deduction if d_str else False),
             use_roth_ladder=st.sidebar.toggle("Roth Conversion Ladder", value=d_str.use_roth_ladder if d_str else False),
+            use_backdoor_roth=st.sidebar.toggle(
+                "Backdoor Roth IRA",
+                value=d_str.use_backdoor_roth if d_str else False,
+                help="Contributes post-tax dollars to a Roth IRA each year (backdoor method — "
+                     "no income limit). Contributions vest after 5 years and can then be "
+                     "withdrawn tax-free before touching your brokerage account in a deficit.",
+            ),
         )
+        # Contribution schedule — shown only when toggle is ON
+        if strategies.use_backdoor_roth:
+            _roth_limit = 14_000 if (d_inc and d_inc.filing_status == FilingStatus.MARRIED_FILING_JOINTLY) else 7_000
+            _roth_mode = st.sidebar.radio(
+                "Contribution mode",
+                ["Flat (same every year)", "Phase schedule (varies by year)"],
+                index=1 if roth_schedule else 0,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            if _roth_mode == "Flat (same every year)":
+                roth_annual = st.sidebar.number_input(
+                    "Annual Roth IRA Contribution  (fixed)",
+                    min_value=0, max_value=_roth_limit,
+                    value=int(roth_annual) if roth_annual else _roth_limit,
+                    step=500,
+                    help=f"IRS limit: ${_roth_limit:,}/yr. Post-tax — no deduction. "
+                         "Locks for 5 years then penalty-free to withdraw.",
+                )
+                roth_schedule = None
+                investments = dataclasses.replace(investments,
+                    annual_roth_ira_contribution=float(roth_annual),
+                    roth_contribution_schedule=None)
+            else:
+                st.sidebar.caption(
+                    f"Define phases by projection year. Years not in any phase contribute $0. "
+                    f"IRS max: ${_roth_limit:,}/yr."
+                )
+                _existing = roth_schedule or []
+                _n_phases = st.sidebar.number_input(
+                    "Number of phases", min_value=1, max_value=10,
+                    value=max(1, len(_existing)), step=1,
+                )
+                _new_phases = []
+                for _pi in range(int(_n_phases)):
+                    _prev = _existing[_pi] if _pi < len(_existing) else None
+                    _pc1, _pc2, _pc3 = st.sidebar.columns(3)
+                    _ys = _pc1.number_input("Start yr", 1, 40,
+                        _prev.year_start if _prev else 1, key=f"rp_ys_{_pi}")
+                    _ye = _pc2.number_input("End yr", 1, 40,
+                        _prev.year_end if _prev else 5, key=f"rp_ye_{_pi}")
+                    _am = _pc3.number_input("$/yr", 0, _roth_limit,
+                        int(_prev.annual_amount if _prev else _roth_limit),
+                        step=500, key=f"rp_am_{_pi}")
+                    _new_phases.append(RothContributionPhase(
+                        year_start=int(_ys), year_end=int(_ye), annual_amount=float(_am)))
+                roth_schedule = _new_phases
+                investments = dataclasses.replace(investments,
+                    annual_roth_ira_contribution=0.0,
+                    roth_contribution_schedule=roth_schedule)
 
 
     if section == "🚗 Car":
@@ -907,6 +975,10 @@ def build_sidebar() -> FinancialPlan:
         car=car,
         business=business,
     )
+
+    # Persist edits so sections not currently shown retain their values
+    # across reruns (they feed `defaults` above on the next render).
+    st.session_state["loaded_plan"] = plan
 
     # Save config button
     with st.sidebar.expander("💾 Export Config", expanded=False):
@@ -1305,13 +1377,13 @@ def render_dashboard(plan: FinancialPlan) -> None:
             # ── Total investable assets + retirement target ─────────────
             # Total investable = retirement + HSA + brokerage + cash (all accessible funds).
             total_investable = [
-                s.retirement_balance + s.hsa_balance + s.brokerage_balance
-                + s.uninvested_cash + s.cash_buffer
+                s.retirement_balance + s.hsa_balance + s.roth_ira_balance
+                + s.brokerage_balance + s.uninvested_cash + s.cash_buffer
                 for s in snapshots
             ]
             fig_cf.add_trace(go.Scatter(
                 x=df["Year"], y=total_investable,
-                name="Total Investable Assets (401k + HSA + brokerage + cash)",
+                name="Total Investable Assets (401k + HSA + Roth + brokerage + cash)",
                 line=dict(color="#818cf8", width=2, dash="dashdot"),
                 yaxis="y2",
             ))
@@ -1327,6 +1399,16 @@ def render_dashboard(plan: FinancialPlan) -> None:
                         annotation_font=dict(color="#818cf8", size=10),
                         yref="y2",
                     )
+
+            # ── Roth IRA balance line ─────────────────────────────────
+            if any(s.roth_ira_balance > 0 for s in snapshots):
+                fig_cf.add_trace(go.Scatter(
+                    x=df["Year"],
+                    y=[s.roth_ira_balance for s in snapshots],
+                    name="Roth IRA Balance",
+                    line=dict(color="#a78bfa", width=2, dash="dot"),
+                    yaxis="y2",
+                ))
 
             # ── 529 college fund line + target ──────────────────────────
             if plan.college and any(s.college_529_balance > 0 for s in snapshots):
@@ -1428,22 +1510,59 @@ def render_dashboard(plan: FinancialPlan) -> None:
         # Key milestones — deduplicated, dynamically laid out
         # ── Retirement Readiness Panel ────────────────────────────────
         if plan.retirement:
-            rr_panel = projection_engine.compute_retirement_readiness(snapshots)
+            # ── Withdrawal tax rates (inline controls, not sidebar) ──────
+            # These let the user model the real tax advantage of Roth vs 401k/brokerage.
+            with st.expander("⚙️ Withdrawal Tax Assumptions (affects Retirement Readiness)", expanded=False):
+                st.caption(
+                    "Set estimated tax rates to see your **after-tax** projected balance — "
+                    "which makes Roth dollars worth more than 401k or brokerage dollars. "
+                    "Leave at 0% to see the raw balance (no tax adjustment, same as before)."
+                )
+                _tc1, _tc2 = st.columns(2)
+                _401k_tax = _tc1.slider(
+                    "401k / IRA withdrawal tax rate (%)",
+                    0, 45,
+                    int(plan.retirement.retirement_withdrawal_tax_rate * 100),
+                    1,
+                    help="Tax on 401k/IRA withdrawals in retirement (ordinary income rate). "
+                         "Typical: 22–32% for most retirees.",
+                ) / 100
+                _cg_tax = _tc2.slider(
+                    "Brokerage capital gains rate (%)",
+                    0, 25,
+                    int(plan.retirement.capital_gains_tax_rate * 100),
+                    1,
+                    help="Tax on brokerage gains in retirement (long-term capital gains rate). "
+                         "Typical: 15–20% for most retirees. Roth IRA is always 0%."
+                ) / 100
+                if _401k_tax > 0 or _cg_tax > 0:
+                    st.caption(
+                        f"After-tax value: 401k/IRA discounted {_401k_tax:.0%}, "
+                        f"brokerage discounted {_cg_tax:.0%}, Roth IRA untouched (tax-free)."
+                    )
+            rr_panel = projection_engine.compute_retirement_readiness(
+                snapshots,
+                withdrawal_tax_rate=_401k_tax,
+                capital_gains_rate=_cg_tax,
+            )
             if rr_panel:
                 st.markdown("#### 🎯 Retirement Readiness")
+                _tax_adjusted = (_401k_tax > 0 or _cg_tax > 0)
                 color   = "#4ade80" if rr_panel.on_track else "#ef4444"
                 status  = "✅ On Track" if rr_panel.on_track else "⚠️ Off Track"
                 funded  = f"{rr_panel.funded_pct:.0%}"
                 gap_lbl = "Annual Surplus" if rr_panel.annual_surplus_or_gap >= 0 else "Annual Gap"
                 gap_val = fmt_dollar(abs(rr_panel.annual_surplus_or_gap))
                 gap_sign = "+" if rr_panel.annual_surplus_or_gap >= 0 else "-"
+                proj_label = "Projected at Retirement (after-tax)" if _tax_adjusted else "Projected at Retirement"
 
                 rc1, rc2, rc3, rc4 = st.columns(4)
                 rc1.metric("Status", status)
                 rc2.metric("Funded", funded,
                            delta=f"target {fmt_dollar(rr_panel.required_balance)}",
                            delta_color="normal" if rr_panel.on_track else "inverse")
-                rc3.metric("Projected at Retirement", fmt_dollar(rr_panel.projected_balance_at_retirement))
+                rc3.metric(proj_label, fmt_dollar(rr_panel.projected_balance_at_retirement),
+                           delta=f"pre-tax {fmt_dollar(rr_panel.projected_balance_pretax)}" if _tax_adjusted else None)
                 rc4.metric(gap_lbl, f"{gap_sign}{gap_val} /yr",
                            delta=f"over {plan.retirement.years_in_retirement}yr @ {plan.retirement.expected_post_retirement_return:.0%}")
 
@@ -1452,6 +1571,7 @@ def render_dashboard(plan: FinancialPlan) -> None:
                     f"Desired income: {fmt_dollar(rr_panel.desired_income_nominal)}/yr (nominal) · "
                     + (f"SS offset: {fmt_dollar(rr_panel.social_security_offset)}/yr · " if rr_panel.social_security_offset > 0 else "")
                     + f"Post-retirement return: {plan.retirement.expected_post_retirement_return:.0%}"
+                    + (f" · 401k tax {_401k_tax:.0%} · cap gains {_cg_tax:.0%}" if _tax_adjusted else "")
                 )
                 st.divider()
 

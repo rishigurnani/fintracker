@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from fintracker.models import (
-    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier, KidCarProfile, CollegeProfile, FilingStatus, RetirementProfile, State,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier, KidCarProfile, CollegeProfile, RothContributionPhase, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
 )
@@ -124,6 +124,15 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         cash_buffer_months=float(inv_d.get("cash_buffer_months", 0.0)),
         employer_match=(_dict_to_employer_match(inv_d["employer_match"])
                         if "employer_match" in inv_d else None),
+        current_roth_ira_balance=float(inv_d.get("current_roth_ira_balance", 0.0)),
+        roth_contribution_schedule=(
+            [RothContributionPhase(
+                year_start=int(p["year_start"]),
+                year_end=int(p["year_end"]),
+                annual_amount=float(p["annual_amount"]),
+             ) for p in inv_d["roth_contribution_schedule"]]
+            if "roth_contribution_schedule" in inv_d else None
+        ),
     )
 
     strategies = StrategyToggles(
@@ -131,6 +140,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         use_529_state_deduction=bool(s_d.get("use_529_state_deduction", False)),
         maximize_401k=bool(s_d.get("maximize_401k", True)),
         use_roth_ladder=bool(s_d.get("use_roth_ladder", False)),
+        use_backdoor_roth=bool(s_d.get("use_backdoor_roth", False)),
         roth_conversion_annual_amount=float(s_d.get("roth_conversion_annual_amount", 0)),
     )
 
@@ -193,6 +203,8 @@ def _dict_to_retirement(r: dict) -> RetirementProfile:
         years_in_retirement=int(r.get("years_in_retirement", 30)),
         expected_post_retirement_return=float(r.get("expected_post_retirement_return", 0.05)),
         estimated_social_security_annual=float(r.get("estimated_social_security_annual", 0)),
+        retirement_withdrawal_tax_rate=float(r.get("retirement_withdrawal_tax_rate", 0.0)),
+        capital_gains_tax_rate=float(r.get("capital_gains_tax_rate", 0.0)),
     )
 
 
@@ -363,6 +375,11 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "annual_home_appreciation_rate": plan.investments.annual_home_appreciation_rate,
             "auto_invest_surplus": plan.investments.auto_invest_surplus,
             "cash_buffer_months": plan.investments.cash_buffer_months,
+            "current_roth_ira_balance": plan.investments.current_roth_ira_balance,
+            **( {"roth_contribution_schedule": [
+                    {"year_start": p.year_start, "year_end": p.year_end, "annual_amount": p.annual_amount}
+                    for p in plan.investments.roth_contribution_schedule
+                ]} if plan.investments.roth_contribution_schedule else {} ),
             **( {
                 "employer_match": {
                     "tiers": [
@@ -380,6 +397,7 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "use_529_state_deduction": plan.strategies.use_529_state_deduction,
             "maximize_401k": plan.strategies.maximize_401k,
             "use_roth_ladder": plan.strategies.use_roth_ladder,
+            "use_backdoor_roth": plan.strategies.use_backdoor_roth,
             "roth_conversion_annual_amount": plan.strategies.roth_conversion_annual_amount,
         },
         "timeline_events": [_event_to_dict(e) for e in plan.timeline_events],
@@ -393,6 +411,8 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
             "years_in_retirement": plan.retirement.years_in_retirement,
             "expected_post_retirement_return": plan.retirement.expected_post_retirement_return,
             "estimated_social_security_annual": plan.retirement.estimated_social_security_annual,
+                "retirement_withdrawal_tax_rate": plan.retirement.retirement_withdrawal_tax_rate,
+                "capital_gains_tax_rate": plan.retirement.capital_gains_tax_rate,
         }
 
     if plan.college:

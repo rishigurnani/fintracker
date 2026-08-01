@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from fintracker.models import (
-    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, KidCarProfile, MatchTier, CollegeProfile, FilingStatus, FinancialPlan,
+    BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, RothContributionPhase, EmployerMatch, KidCarProfile, MatchTier, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles,
 )
@@ -101,6 +101,21 @@ _US_HISTORICAL_INFLATION: tuple[float, ...] = (
      0.0210,  0.0190,  0.0230,  0.0140,  0.0700,  0.0650,  0.0340,  0.0290,
 )
 
+_ROTH_IRA_LIMIT = 7_000   # per person per year (2024); doubles for married couples
+
+from typing import NamedTuple
+
+class _Growth(NamedTuple):
+    """Return value of _asset_growth — named fields beat an 8-tuple."""
+    retirement:   float
+    hsa:          float
+    col529:       float
+    brokerage:    float
+    uninvested:   float
+    cash_buffer:  float
+    roth_balance: float
+    roth_basis:   float
+
 # ---------------------------------------------------------------------------
 # Engine state — typed, explicit, no loose dicts
 # ---------------------------------------------------------------------------
@@ -150,6 +165,19 @@ class EngineState:
 
     # Flags
     parent_care_active: bool
+
+    # Roth IRA — tracked separately because withdrawal rules differ from 401k.
+    # roth_contribution_basis = cumulative post-tax contributions (total basis).
+    # roth_vested_basis = portion of basis that is penalty-free to withdraw:
+    #   under the 5-year rule for conversions, only contributions made ≥5
+    #   projection years ago are penalty-free (conservative model).
+    # roth_contrib_queue = ring buffer of last 5 years' contributions;
+    #   the oldest entry vests each year.
+    # roth_ira_balance = total Roth value including earnings (grows at market rate).
+    roth_ira_balance: float
+    roth_contribution_basis: float
+    roth_vested_basis: float          # penalty-free portion (≥5 yrs old)
+    roth_contrib_queue: list          # list[float] of last 5 contributions, FIFO
 
     # Cumulative inflation factor — rolling product of (1+inf_t) for t=1..year-1.
     # Tracked in state so each year's factor is correct regardless of whether inflation
@@ -221,6 +249,10 @@ class YearlySnapshot:
     is_partner_working: bool
 
     # Business income and equity
+    roth_ira_balance: float
+    roth_contribution_basis: float
+    roth_vested_basis: float
+    annual_roth_contribution: float
     annual_business_income: float = 0.0
     business_equity: float = 0.0
     # Car one-off costs (for display / debugging)
@@ -248,7 +280,8 @@ class RetirementReadiness:
     """Result of the retirement readiness analysis."""
     years_to_retirement: int
     retirement_year: int
-    projected_balance_at_retirement: float
+    projected_balance_at_retirement: float        # tax-adjusted after-tax value
+    projected_balance_pretax: float               # raw sum before tax haircut
     required_balance: float
     on_track: bool
     funded_pct: float
@@ -469,7 +502,14 @@ class ProjectionEngine:
     def compute_retirement_readiness(
         self,
         snapshots: Optional[list[YearlySnapshot]] = None,
+        withdrawal_tax_rate: Optional[float] = None,
+        capital_gains_rate: Optional[float] = None,
     ) -> Optional[RetirementReadiness]:
+        """
+        withdrawal_tax_rate and capital_gains_rate override the values in
+        RetirementProfile when provided — avoids rebuilding a new ProjectionEngine
+        just to display after-tax retirement readiness in the UI.
+        """
         """
         Returns None when no RetirementProfile is configured.
 
@@ -502,8 +542,25 @@ class ProjectionEngine:
         # Projected balance = all investable assets at retirement year
         # (same pool used by the Retirement Readiness panel — single source of truth)
         snap = next((s for s in snapshots if s.year == years_to_ret), snapshots[-1])
-        projected = (snap.retirement_balance + snap.hsa_balance + snap.brokerage_balance
-                    + snap.uninvested_cash + snap.cash_buffer)
+        # Apply post-retirement withdrawal taxes to get the after-tax spendable value.
+        # Roth and HSA are tax-free; 401k/IRA are taxed at ordinary income rates;
+        # brokerage is taxed at capital gains rates on withdrawal.
+        # Both tax rates default to 0% for backward compatibility.
+        r401k_tax = (withdrawal_tax_rate if withdrawal_tax_rate is not None
+                     else rp.retirement_withdrawal_tax_rate)
+        cap_gains  = (capital_gains_rate if capital_gains_rate is not None
+                      else rp.capital_gains_tax_rate)
+        projected_pretax = (
+            snap.retirement_balance + snap.hsa_balance + snap.roth_ira_balance
+            + snap.brokerage_balance + snap.uninvested_cash + snap.cash_buffer
+        )
+        projected = (
+            snap.retirement_balance * (1 - r401k_tax)   # 401k/IRA: taxed as income
+            + snap.hsa_balance                           # HSA: tax-free (medical)
+            + snap.roth_ira_balance                      # Roth: fully tax-free
+            + snap.brokerage_balance * (1 - cap_gains)  # Brokerage: cap gains on gains
+            + snap.uninvested_cash + snap.cash_buffer    # Cash: already post-tax
+        )
 
         # Income need at retirement start (nominal dollars)
         nominal_income = rp.desired_annual_income * (1 + inflation) ** years_to_ret
@@ -538,6 +595,7 @@ class ProjectionEngine:
             years_to_retirement=years_to_ret,
             retirement_year=snap.year,
             projected_balance_at_retirement=projected,
+            projected_balance_pretax=projected_pretax,
             required_balance=required,
             on_track=projected >= required,
             funded_pct=funded_pct,
@@ -598,6 +656,11 @@ class ProjectionEngine:
             uninvested_cash=0.0,
             cash_buffer=0.0,
             parent_care_active=p.lifestyle.annual_parent_care_cost > 0,
+            roth_ira_balance=p.investments.current_roth_ira_balance,
+            roth_contribution_basis=p.investments.current_roth_ira_balance,
+            # Existing balance is assumed to be fully vested (owner has had it ≥5 yrs)
+            roth_vested_basis=p.investments.current_roth_ira_balance,
+            roth_contrib_queue=[],
             cumulative_inflation=1.0,
             cars=self._init_cars(p.car),
             kid_car_loans=[],
@@ -763,7 +826,16 @@ class ProjectionEngine:
         hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
         biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year)
         tax, aotc = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
-        net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k
+
+        # Backdoor Roth IRA contribution (post-tax — no deduction, reduces net income).
+        # Limit: $7,000/person × (2 if married), always fixed nominal dollars.
+        if self._plan.strategies.use_backdoor_roth:
+            roth_limit   = _ROTH_IRA_LIMIT * (2 if state.is_married else 1)
+            roth_contrib = min(inv.roth_contribution_for_year(year), roth_limit)
+        else:
+            roth_contrib = 0.0
+
+        net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k - roth_contrib
 
         # --- Expenses ---
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
@@ -785,13 +857,15 @@ class ProjectionEngine:
         )
 
         # --- Asset growth ---
-        ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer = self._asset_growth(
+        g = self._asset_growth(
             state, year, mkt, hsa, k401 + biz_solo_401k + employer_match, partner_k401,
             annual_529_save, drawdown_529, brokerage_earmark, breathing_room,
+            roth_contrib=roth_contrib,
+            roth_basis_available=state.roth_vested_basis,
             annual_expenses=lifestyle_cost + housing_cost,
         )
 
-        nw = ret_bal + hsa_bal + col529_bal + brok_bal + home_equity + uninvested + new_buffer + biz_equity
+        nw = g.retirement + g.hsa + g.col529 + g.roth_balance + g.brokerage + home_equity + g.uninvested + g.cash_buffer + biz_equity
 
         return YearlySnapshot(
             year=year,
@@ -811,14 +885,14 @@ class ProjectionEngine:
             annual_car_payment=car_pmt,
             annual_wedding_save=wedding_save,
             annual_breathing_room=breathing_room,
-            retirement_balance=ret_bal,
-            brokerage_balance=brok_bal,
-            college_529_balance=col529_bal,
+            retirement_balance=g.retirement,
+            brokerage_balance=g.brokerage,
+            college_529_balance=g.col529,
             home_value=home_value,
             home_equity=home_equity,
-            hsa_balance=hsa_bal,
-            uninvested_cash=uninvested,
-            cash_buffer=new_buffer,
+            hsa_balance=g.hsa,
+            uninvested_cash=g.uninvested,
+            cash_buffer=g.cash_buffer,
             mortgage_balance=eoy_mortgage,
             net_worth=nw,
             filing_status=state.filing_status,
@@ -827,6 +901,10 @@ class ProjectionEngine:
             is_married=state.is_married,
             is_working=state.is_working,
             is_partner_working=state.is_partner_working,
+            roth_ira_balance=g.roth_balance,
+            roth_contribution_basis=g.roth_basis,
+            roth_vested_basis=state.roth_vested_basis,
+            annual_roth_contribution=roth_contrib,
             annual_business_income=biz_net,
             business_equity=biz_equity,
             car_purchase_cost=car_purchase,
@@ -1252,9 +1330,11 @@ class ProjectionEngine:
         drawdown_529: float,
         brokerage_earmark: float,
         breathing_room: float,
+        roth_contrib: float = 0.0,
+        roth_basis_available: float = 0.0,
         annual_expenses: float = 0.0,
-    ) -> tuple[float, float, float, float, float, float]:
-        """Returns (retirement, hsa, col529, brokerage, uninvested_cash, cash_buffer)."""
+    ) -> _Growth:
+        """Returns named growth result — see _Growth for field docs."""
         col = self._plan.college
         inv = self._plan.investments
 
@@ -1275,19 +1355,34 @@ class ProjectionEngine:
         buffer_floor = annual_expenses * inv.cash_buffer_months / 12
         current_buf  = state.cash_buffer
 
+        # --- Roth IRA balance (grows at market rate, basis tracks contributions) ---
+        roth_bal   = state.roth_ira_balance * (1 + mkt) + roth_contrib
+        roth_basis = state.roth_contribution_basis + roth_contrib
+
         if breathing_room >= 0:
             topup      = min(breathing_room, max(0.0, buffer_floor - current_buf))
             new_buffer = current_buf + topup
             investable = breathing_room - topup   # what remains after topping buffer
         else:
-            deficit    = -breathing_room          # positive amount
+            # Deficit waterfall (with backdoor Roth):
+            # income already absorbed → cash buffer → uninvested cash →
+            # Roth contribution basis (tax-free) → brokerage (last resort)
+            deficit    = -breathing_room
             buf_drawn  = min(current_buf, deficit)
             new_buffer = current_buf - buf_drawn
             investable = -(deficit - buf_drawn)   # remaining deficit (negative) or 0
 
-        # --- Brokerage / uninvested ---
+        # --- Brokerage / uninvested — Roth basis inserted before brokerage ---
         if inv.auto_invest_surplus:
-            brok_bal   = state.brokerage_balance * (1 + mkt) + brokerage_earmark + investable
+            brok_flow = brokerage_earmark + investable  # investable may be negative
+            if brok_flow < 0 and roth_basis_available > 0:
+                # Draw from Roth contribution basis (5-year rule: only vintages
+                # at least 5 projection years old are penalty-free).
+                roth_drawn = min(roth_basis_available, -brok_flow)
+                roth_bal   = max(0.0, roth_bal   - roth_drawn)
+                roth_basis = max(0.0, roth_basis - roth_drawn)
+                brok_flow  = brok_flow + roth_drawn  # reduce deficit
+            brok_bal   = state.brokerage_balance * (1 + mkt) + brok_flow
             uninvested = 0.0
         else:
             brok_bal = state.brokerage_balance * (1 + mkt) + brokerage_earmark
@@ -1295,12 +1390,20 @@ class ProjectionEngine:
                 uninvested = state.uninvested_cash + investable
             else:
                 deficit2   = -investable
-                avail      = state.uninvested_cash
-                drawn      = min(avail, deficit2)
-                uninvested = avail - drawn
-                brok_bal  += -(deficit2 - drawn)
+                # drain uninvested cash first
+                avail_uninvested = state.uninvested_cash
+                drawn_uninvested = min(avail_uninvested, deficit2)
+                uninvested       = avail_uninvested - drawn_uninvested
+                remaining2       = deficit2 - drawn_uninvested
+                # then Roth basis before brokerage
+                if remaining2 > 0 and roth_basis_available > 0:
+                    roth_drawn = min(roth_basis_available, remaining2)
+                    roth_bal   = max(0.0, roth_bal   - roth_drawn)
+                    roth_basis = max(0.0, roth_basis - roth_drawn)
+                    remaining2 = remaining2 - roth_drawn
+                brok_bal  += -remaining2
 
-        return ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer
+        return _Growth(ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer, roth_bal, roth_basis)
 
     # ------------------------------------------------------------------ #
     # State advancement                                                    #
@@ -1329,6 +1432,19 @@ class ProjectionEngine:
         state.college_529_balance = snap.college_529_balance
         state.uninvested_cash       = snap.uninvested_cash
         state.cash_buffer           = snap.cash_buffer
+        state.roth_ira_balance        = snap.roth_ira_balance
+        state.roth_contribution_basis  = snap.roth_contribution_basis
+        # 5-year vesting queue: push this year's contribution, pop the one
+        # that is now 5 years old (it becomes penalty-free next year).
+        # We use a simple list as FIFO (max len 5).
+        queue = list(state.roth_contrib_queue)
+        queue.append(snap.annual_roth_contribution)
+        if len(queue) >= 5:
+            vesting_now = queue.pop(0)   # oldest contribution, now ≥5 yrs old
+        else:
+            vesting_now = 0.0
+        state.roth_contrib_queue  = queue
+        state.roth_vested_basis  += vesting_now
         # Advance cumulative inflation: multiply by this year's rate
         actual_inf = inflation if inflation is not None else p.investments.annual_inflation_rate
         state.cumulative_inflation *= (1 + actual_inf)
