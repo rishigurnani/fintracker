@@ -939,6 +939,15 @@ class ProjectionEngine:
     # Computation helpers                                                  #
     # ------------------------------------------------------------------ #
 
+    def _age_in_year(self, year: int) -> Optional[int]:
+        """Primary's age in a projection year, or None without a RetirementProfile.
+
+        Single source of age for every age-aware rule (401k catch-up, salary
+        plateau) so the derivation lives in one place.
+        """
+        rp = self._plan.retirement
+        return rp.current_age + (year - 1) if rp else None
+
     def _contributions(
         self, state: EngineState, year: int
     ) -> tuple[float, float, float, float]:
@@ -955,9 +964,7 @@ class ProjectionEngine:
         # age is unknown and limit_401k falls back to the catch-up ceiling.
         # The partner shares the primary's age basis (no separate partner age is
         # modelled); this only matters when a partner contributes above the base.
-        rp = self._plan.retirement
-        age = rp.current_age + (year - 1) if rp else None
-        k401_cap = limit_401k(age)
+        k401_cap = limit_401k(self._age_in_year(year))
         k401         = min(inv.annual_401k_contribution, k401_cap)
         partner_k401 = (
             min(inv.partner_annual_401k_contribution, k401_cap)
@@ -1419,8 +1426,21 @@ class ProjectionEngine:
         salary_growth: Optional[float] = None,
     ) -> None:
         p   = self._plan
-        sg  = salary_growth if salary_growth is not None else p.investments.annual_salary_growth_rate
-        psg = salary_growth if salary_growth is not None else p.investments.partner_salary_growth_rate
+        inv = p.investments
+        inf = inflation if inflation is not None else inv.annual_inflation_rate
+
+        # Salary real-growth plateau: once the primary reaches salary_growth_peak_age,
+        # real raises stop — nominal growth is capped at inflation minus the configured
+        # real decline (and never lifted above the underlying rate). Needs a
+        # RetirementProfile for age; without one, growth is unchanged. Partner shares
+        # the primary's age basis (no separate partner age is modelled).
+        age = self._age_in_year(snap.year + 1)
+        def _plateau(rate: float) -> float:
+            if age is not None and age >= inv.salary_growth_peak_age:
+                return min(rate, inf - inv.salary_real_decline_rate)
+            return rate
+        sg  = _plateau(salary_growth if salary_growth is not None else inv.annual_salary_growth_rate)
+        psg = _plateau(salary_growth if salary_growth is not None else inv.partner_salary_growth_rate)
 
         if state.is_working:
             state.income_primary *= (1 + sg)
@@ -1447,8 +1467,7 @@ class ProjectionEngine:
         state.roth_contrib_queue  = queue
         state.roth_vested_basis  += vesting_now
         # Advance cumulative inflation: multiply by this year's rate
-        actual_inf = inflation if inflation is not None else p.investments.annual_inflation_rate
-        state.cumulative_inflation *= (1 + actual_inf)
+        state.cumulative_inflation *= (1 + inf)
         state.business_equity     = snap.business_equity
         if self._plan.business and snap.year >= self._plan.business.start_year:
             state.business_revenue *= (1 + self._plan.business.revenue_growth_rate)

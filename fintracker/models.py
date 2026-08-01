@@ -382,6 +382,13 @@ class InvestmentProfile:
     partner_salary_growth_rate: float = 0.04
     annual_home_appreciation_rate: float = 0.035
 
+    # Salary real-growth plateau. After salary_growth_peak_age the projection
+    # stops granting real raises: nominal growth is capped at inflation minus
+    # salary_real_decline_rate (0 = flat plateau; >0 = late-career real decline).
+    # Age requires a RetirementProfile; without one, salary grows unchanged.
+    salary_growth_peak_age: int = 55
+    salary_real_decline_rate: float = 0.0
+
     # Projection behaviour — whether surplus breathing room is swept into
     # brokerage (earns market return) or left as uninvested cash (0% return).
     # Stored here rather than StrategyToggles because it is a cash-flow routing

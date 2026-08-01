@@ -138,6 +138,8 @@ _INVESTMENTS_SPEC = [
     ("annual_salary_growth_rate", float, 0.04),
     ("partner_salary_growth_rate", float, 0.04),
     ("annual_home_appreciation_rate", float, 0.035),
+    ("salary_growth_peak_age", int, 55),
+    ("salary_real_decline_rate", float, 0.0),
     ("cash_buffer_months", float, 0.0),
     ("current_roth_ira_balance", float, 0.0),
 ]
