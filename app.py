@@ -1469,6 +1469,16 @@ def _compute_milestones(plan, snapshots) -> list:
         milestones.append(("⚠️ Peak Cash Deficit", f"Year {worst_liquid.year}",
                            fmt_dollar(worst_liquid.brokerage_balance)))
 
+    # Wedding fund paid out — one card per wedding year, showing the amount saved
+    # (contributions plus investment growth) at the time the child marries, in that
+    # year's dollars, with the equivalent in today's dollars for context.
+    weddings = [s for s in snapshots if s.annual_wedding_spend > 0]
+    for idx, s in enumerate(weddings, 1):
+        label = "💍 Child's Wedding Fund" if len(weddings) == 1 else f"💍 Child #{idx}'s Wedding Fund"
+        today = s.to_todays_dollars(s.annual_wedding_spend)
+        milestones.append((label, fmt_dollar(s.annual_wedding_spend),
+                           f"Year {s.year} · {fmt_dollar(today)} in today's $"))
+
     if not milestones:
         milestones.append(("Net Worth $1M", f"Not reached in {plan.projection_years} years", ""))
     return milestones

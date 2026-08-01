@@ -57,6 +57,8 @@ _AOTC_PHASEOUT_SINGLE_HIGH = 90_000
 _AOTC_PHASEOUT_MFJ_LOW     = 160_000
 _AOTC_PHASEOUT_MFJ_HIGH    = 180_000
 
+_WEDDING_AGE = 26          # age a child's wedding is paid; saving runs through age 25
+
 
 # ---------------------------------------------------------------------------
 # Historical S&P 500 annual total returns (1926–2025)
@@ -187,6 +189,9 @@ class EngineState:
     cars: list[dict]
     # Kid car loans — one entry per child who has received a car
     kid_car_loans: list[dict]
+    # Wedding sinking fund — invested value accrued per child (parallel to
+    # child_birth_years); held inside brokerage, spent at the wedding.
+    wedding_fund: list[float]
 
     @property
     def gross_income(self) -> float:
@@ -257,8 +262,16 @@ class YearlySnapshot:
     # Car one-off costs (for display / debugging)
     car_purchase_cost: float = 0.0
     car_sale_proceeds: float = 0.0
+    annual_wedding_spend: float = 0.0   # wedding paid from the sinking fund this year
     # Intentional cash buffer (earns 0%; maintained before sweeping to brokerage)
     cash_buffer: float = 0.0
+    # Cumulative price level vs projection start (the engine's own inflation factor).
+    # Divide any nominal figure in this year by it to express it in today's dollars.
+    cumulative_inflation: float = 1.0
+
+    def to_todays_dollars(self, nominal: float) -> float:
+        """Convert a nominal figure from this projection year into today's dollars."""
+        return nominal / self.cumulative_inflation if self.cumulative_inflation else nominal
 
     @property
     def total_assets(self) -> float:
@@ -688,6 +701,7 @@ class ProjectionEngine:
             cumulative_inflation=1.0,
             cars=self._init_cars(p.car),
             kid_car_loans=[],
+            wedding_fund=[0.0] * p.lifestyle.num_children,
             business_equity=0.0,
             business_revenue=(p.business.annual_revenue if p.business else 0.0),
         )
@@ -750,6 +764,7 @@ class ProjectionEngine:
             if ev.new_child:
                 birth = ev.child_birth_year_override if ev.child_birth_year_override is not None else year
                 state.child_birth_years.append(birth)
+                state.wedding_fund.append(0.0)
                 state.num_children += 1
 
             if ev.new_pet:
@@ -865,9 +880,12 @@ class ProjectionEngine:
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
         lifestyle_cost, medical_oop, parent_care = self._lifestyle(state, inf_f, year)
         college_gross, drawdown_529, net_college, annual_529_save = self._college(state, year, inf_f, r529)
-        wedding_save = self._wedding_save(state, year, inf_f)
+        wedding_save, wedding_spend = self._weddings(state, year, mkt)
         car_pmt, car_purchase, car_sale = self._cars(state, year, inf_f)
         brokerage_earmark = inv.annual_brokerage_contribution
+        # Wedding savings stay invested in brokerage until the wedding, so route
+        # them into the brokerage inflow instead of letting them leave the books.
+        brokerage_inflow = brokerage_earmark + wedding_save
 
         breathing_room = (
             net_income
@@ -875,15 +893,14 @@ class ProjectionEngine:
             - lifestyle_cost
             - annual_529_save
             - net_college
-            - brokerage_earmark
+            - brokerage_inflow
             - car_pmt
-            - wedding_save
         )
 
         # --- Asset growth ---
         g = self._asset_growth(
             state, year, mkt, hsa, k401 + biz_solo_401k + employer_match, partner_k401,
-            annual_529_save, drawdown_529, brokerage_earmark, breathing_room,
+            annual_529_save, drawdown_529, brokerage_inflow, breathing_room,
             roth_contrib=roth_contrib,
             roth_basis_available=state.roth_vested_basis,
             annual_expenses=lifestyle_cost + housing_cost,
@@ -908,6 +925,7 @@ class ProjectionEngine:
             annual_aotc_credit=aotc,
             annual_car_payment=car_pmt,
             annual_wedding_save=wedding_save,
+            annual_wedding_spend=wedding_spend,
             annual_breathing_room=breathing_room,
             retirement_balance=g.retirement,
             brokerage_balance=g.brokerage,
@@ -933,6 +951,7 @@ class ProjectionEngine:
             business_equity=biz_equity,
             car_purchase_cost=car_purchase,
             car_sale_proceeds=car_sale,
+            cumulative_inflation=inf_f,
         )
 
     # ------------------------------------------------------------------ #
@@ -1136,14 +1155,30 @@ class ProjectionEngine:
         )
         return eligible * _AOTC_MAX_CREDIT * phase
 
-    def _wedding_save(self, state: EngineState, year: int, inf_f: float) -> float:
-        """Annual wedding fund savings — stops when each child turns 25."""
+    def _weddings(self, state: EngineState, year: int, mkt: float) -> tuple[float, float]:
+        """Wedding sinking fund — save, invested in brokerage, then spend at the wedding.
+
+        Returns (annual_savings, wedding_spend). Each child's fund accrues the
+        per-child rate and grows at the market rate while it waits; at the wedding
+        it is paid out of brokerage (where it was held). Contributions run through
+        age 25 (age < _WEDDING_AGE), matching the legacy stop age, so the yearly
+        savings figure is unchanged; the payout lands when the child turns 26.
+        """
         rate = self._plan.lifestyle.annual_wedding_fund_per_child
         if not rate:
-            return 0.0
-        return rate * sum(
-            1 for by in state.child_birth_years if (year - by) <= 25
-        )
+            return 0.0, 0.0
+        save = spend = 0.0
+        for i, by in enumerate(state.child_birth_years):
+            age = year - by
+            state.wedding_fund[i] *= (1 + mkt)        # invested alongside brokerage
+            if age < _WEDDING_AGE:
+                state.wedding_fund[i] += rate          # nominal contribution (as before)
+                save += rate
+            elif age == _WEDDING_AGE:
+                spend += state.wedding_fund[i]         # wedding paid from the accrued fund
+                state.wedding_fund[i] = 0.0
+        state.brokerage_balance -= spend               # fund was held in brokerage
+        return save, spend
 
     def _business(
         self,
