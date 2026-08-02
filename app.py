@@ -19,7 +19,7 @@ from fintracker.models import (
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier,
     RothContributionPhase, InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
 )
-from fintracker.tax_engine import TaxEngine
+from fintracker.tax_engine import TaxEngine, state_display_name
 from fintracker.mortgage import MortgageCalculator
 from fintracker.strategies import StrategyEngine
 from fintracker.projections import ProjectionEngine
@@ -1148,7 +1148,7 @@ def _tab_mortgage(plan, mortgage_calc) -> None:
 # ── TAB 5: Tax Strategies ────────────────────────────────
 
 
-def _tab_tax(strategy_result, yr1, tax_result) -> None:
+def _tab_tax(plan, snapshots, strategy_result, yr1, tax_result, marginal_rate=0.0) -> None:
     st.markdown('<div class="section-header">Tax Optimization Analysis</div>', unsafe_allow_html=True)
 
     sa1, sa2, sa3, sa4 = st.columns(4)
@@ -1217,6 +1217,44 @@ def _tab_tax(strategy_result, yr1, tax_result) -> None:
         showlegend=False,
     )
     st.plotly_chart(fig_wf, width='stretch')
+
+    # Year-1 rates the waterfall doesn't show (effective + marginal, with the
+    # state named so the state's contribution is traceable).
+    state_name = state_display_name(plan.income.state)
+    eff_rate = tax_result.total_annual_tax / gross if gross else 0.0
+    st.caption(
+        f"Year 1: **{eff_rate:.1%}** effective · **{marginal_rate:.1%}** marginal tax rate "
+        f"(federal + {state_name} state)."
+    )
+
+    # ── Per-year tax detail ──────────────────────────────────
+    st.markdown(f"#### Taxes by Year — {state_name}")
+    st.caption(
+        f"State tax reflects **{state_name}** rules. Filing status is shown per year "
+        "(it changes at a marriage event). Federal is net of education credits; "
+        "federal and state brackets are inflation-indexed each projection year."
+    )
+    _filing_label = {
+        FilingStatus.SINGLE: "Single",
+        FilingStatus.MARRIED_FILING_JOINTLY: "MFJ",
+        FilingStatus.HEAD_OF_HOUSEHOLD: "HoH",
+    }
+    state_col = f"State ({state_name})"
+    per_year = pd.DataFrame([{
+        "Year": s.year,
+        "Filing": _filing_label.get(s.filing_status, s.filing_status.value),
+        "Gross Income": s.gross_income,
+        "Federal": s.annual_federal_tax,
+        "FICA": s.annual_fica_tax,
+        state_col: s.annual_state_tax,
+        "Total Tax": s.annual_tax_total,
+        "Effective Rate": (s.annual_tax_total / s.gross_income) if s.gross_income else 0.0,
+    } for s in snapshots])
+    display_df = per_year.copy()
+    for c in ["Gross Income", "Federal", "FICA", state_col, "Total Tax"]:
+        display_df[c] = display_df[c].apply(fmt_dollar)
+    display_df["Effective Rate"] = per_year["Effective Rate"].apply(lambda x: f"{x:.1%}")
+    st.dataframe(display_df, hide_index=True, width='stretch', height=360)
 
 # ── TAB 1: Projections ───────────────────────────────────
 
@@ -1847,6 +1885,10 @@ def render_dashboard(plan: FinancialPlan) -> None:
         yr1_income_profile, yr1_inv_profile, plan.strategies,
         num_children=yr1.num_children,
     )
+    # Combined federal + state marginal rate for the year-1 tax picture.
+    marginal_rate = tax_engine.marginal_rate(
+        yr1_income_profile, yr1_inv_profile, plan.strategies,
+    )
 
     # Strategy analysis uses the same year-1 state
     strategy_result = strategy_engine.analyze(
@@ -1907,7 +1949,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
         _tab_mortgage(plan=plan, mortgage_calc=mortgage_calc)
 
     with tabs[4]:
-        _tab_tax(strategy_result=strategy_result, yr1=yr1, tax_result=tax_result)
+        _tab_tax(plan=plan, snapshots=snapshots, strategy_result=strategy_result,
+                 yr1=yr1, tax_result=tax_result, marginal_rate=marginal_rate)
 
     with tabs[0]:
         _tab_projections(plan=plan, snapshots=snapshots, projection_engine=projection_engine)

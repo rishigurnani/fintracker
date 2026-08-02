@@ -101,7 +101,11 @@ class TestRetirementReadiness:
                     annual_inflation_rate=0.03,
                     annual_salary_growth_rate=0.0,
                 ),
-                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+                # maximize_401k=True so the contribution earns its tax deduction —
+                # that's the mechanism by which more 401k savings lifts net worth.
+                # (With it False the 401k is offset out of brokerage dollar-for-
+                # dollar and total net worth is identical regardless of amount.)
+                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=True),
                 projection_years=30,
                 retirement=RetirementProfile(
                     current_age=35, retirement_age=65,

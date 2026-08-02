@@ -226,17 +226,17 @@ class TestStateTax:
         assert r.state_income_tax == 0.0
 
     def test_georgia_flat_tax(self):
-        # GA flat rate 5.39%; taxable = gross - GA std deduction ($12k for single)
+        # GA flat rate 4.99% (2026); taxable = gross - GA std deduction ($15k single)
         gross = 100_000
         r = self._calc(gross, State.GEORGIA)
-        expected = max(0, gross - 12_000) * 0.0539
+        expected = max(0, gross - 15_000) * 0.0499
         assert r.state_income_tax == pytest.approx(expected, abs=1.0)
 
     def test_georgia_mfj_std_deduction_doubles(self):
         gross = 200_000
         single = self._calc(gross, State.GEORGIA, FilingStatus.SINGLE)
         mfj = self._calc(gross, State.GEORGIA, FilingStatus.MARRIED_FILING_JOINTLY)
-        # MFJ deduction is $24k vs $12k → lower state tax
+        # MFJ deduction is $30k vs $15k → lower state tax
         assert mfj.state_income_tax < single.state_income_tax
 
     def test_california_higher_rate_than_georgia(self):
@@ -298,3 +298,47 @@ class TestMarginalRate:
         inc_tx = IncomeProfile(gross_annual_income=100_000, filing_status=FilingStatus.SINGLE, state=State.TEXAS)
         inc_ga = IncomeProfile(gross_annual_income=100_000, filing_status=FilingStatus.SINGLE, state=State.GEORGIA)
         assert engine.marginal_rate(inc_tx, inv, strat) < engine.marginal_rate(inc_ga, inv, strat)
+
+
+class TestInflationIndexing:
+    """Brackets/deductions inflation-index by inflation_factor to prevent nominal
+    bracket creep in multi-year projections."""
+
+    def _tax(self, gross, factor):
+        return TaxEngine().calculate(
+            IncomeProfile(gross, FilingStatus.SINGLE, State.TEXAS),
+            InvestmentProfile(),
+            StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            inflation_factor=factor,
+        )
+
+    def test_default_factor_is_unchanged(self):
+        base = self._tax(120_000, 1.0)
+        assert base.federal_income_tax > 0
+
+    def test_indexing_lowers_tax_on_inflated_income(self):
+        # A nominal income scaled by the same factor as the brackets should keep
+        # the SAME effective federal rate — real position preserved.
+        base = self._tax(120_000, 1.0)
+        infl = self._tax(120_000 * 1.03 ** 29, 1.03 ** 29)   # ~year-30 nominal
+        base_rate = base.federal_income_tax / 120_000
+        infl_rate = infl.federal_income_tax / (120_000 * 1.03 ** 29)
+        assert infl_rate == pytest.approx(base_rate, rel=1e-6)
+
+    def test_without_indexing_creep_overstates_tax(self):
+        # Same inflated income taxed against FROZEN brackets pays a higher
+        # effective rate than against indexed brackets (the bug being fixed).
+        gross = 120_000 * 1.03 ** 29
+        frozen = self._tax(gross, 1.0)
+        indexed = self._tax(gross, 1.03 ** 29)
+        assert frozen.federal_income_tax > indexed.federal_income_tax
+
+    def test_ss_wage_base_indexes_but_addl_medicare_threshold_does_not(self):
+        # SS wage base scales with the factor (more wages become SS-taxable in
+        # nominal terms); the Additional Medicare threshold is statutorily fixed.
+        factor = 2.0
+        t = self._tax(400_000, factor)
+        # SS taxed up to the indexed wage base (168_600 * 2 = 337_200).
+        assert t.social_security_tax == pytest.approx(168_600 * 2.0 * 0.062, rel=1e-9)
+        # Additional Medicare still kicks in at the fixed 200k (not 400k).
+        assert t.additional_medicare_tax > 0

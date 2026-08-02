@@ -472,3 +472,47 @@ class TestHSAFamilyTier:
         snaps = ProjectionEngine(plan).run_deterministic()
         assert snaps[0].annual_hsa_contributions <= 4_150 + 1   # single cap
         assert snaps[1].annual_hsa_contributions == pytest.approx(8_300, abs=1)  # family cap
+
+class TestPerYearTaxBreakdown:
+    """The per-year tax breakdown must reconcile and be traceable to the state."""
+
+    def _plan(self, state, years=3):
+        return FinancialPlan(
+            income=IncomeProfile(300_000, FilingStatus.MARRIED_FILING_JOINTLY, state),
+            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=3_000),
+            lifestyle=LifestyleProfile(),
+            investments=InvestmentProfile(
+                current_liquid_cash=100_000, annual_401k_contribution=23_000,
+                annual_hsa_contribution=4_150, annual_market_return=0.0,
+                annual_inflation_rate=0.03, annual_salary_growth_rate=0.02,
+            ),
+            strategies=StrategyToggles(maximize_hsa=True, maximize_401k=True),
+            projection_years=years,
+        )
+
+    def test_components_sum_to_total_every_year(self):
+        # Federal (net of credits) + FICA + State must equal the reported total tax.
+        for s in ProjectionEngine(self._plan(State.GEORGIA, years=10)).run_deterministic():
+            assert s.annual_federal_tax + s.annual_fica_tax + s.annual_state_tax == \
+                pytest.approx(s.annual_tax_total, abs=1)
+
+    def test_only_state_component_changes_between_states(self):
+        # Switching GA -> NY changes only the state line; federal & FICA are identical,
+        # so the difference is fully traceable to the state.
+        ga = ProjectionEngine(self._plan(State.GEORGIA)).run_deterministic()[0]
+        ny = ProjectionEngine(self._plan(State.NEW_YORK)).run_deterministic()[0]
+        assert ga.annual_federal_tax == pytest.approx(ny.annual_federal_tax, abs=1)
+        assert ga.annual_fica_tax == pytest.approx(ny.annual_fica_tax, abs=1)
+        assert ny.annual_state_tax > ga.annual_state_tax   # NY taxes higher than GA flat
+
+    def test_no_income_tax_state_has_zero_state_component(self):
+        tx = ProjectionEngine(self._plan(State.TEXAS)).run_deterministic()[0]
+        assert tx.annual_state_tax == 0.0
+
+
+def test_state_display_name():
+    from fintracker.tax_engine import state_display_name
+    assert state_display_name(State.GEORGIA) == "Georgia"
+    assert state_display_name(State.NEW_YORK) == "New York"
+    assert state_display_name(State.TEXAS) == "Texas"
+    assert state_display_name(State.OTHER) == "Custom flat rate"

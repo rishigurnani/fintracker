@@ -389,6 +389,20 @@ class InvestmentProfile:
     salary_growth_peak_age: int = 55
     salary_real_decline_rate: float = 0.0
 
+    # Long-term capital-gains tax rate on taxable brokerage gains. Applied when
+    # gains are realized (any brokerage drawdown) and to remaining unrealized gains
+    # at retirement. US long-term rates are 0/15/20% by income (+3.8% NIIT for high
+    # earners); 15% is typical. Defaults to 0% (off) for backward compatibility.
+    # Falls back to RetirementProfile.capital_gains_tax_rate when left at 0.
+    capital_gains_tax_rate: float = 0.0
+
+    # Effective cap-gains rate applied to the *remaining unrealized* gains in the
+    # retirement-readiness haircut. SIMPLIFIED ASSUMPTION: a retiree draws the
+    # brokerage down gradually and often lands in the 0%/15% LTCG bracket, so this
+    # is typically lower than the working-years rate above (e.g. 0.0 or 0.075).
+    # When None, the haircut falls back to capital_gains_tax_rate (no discount).
+    retirement_capital_gains_tax_rate: Optional[float] = None
+
     # Projection behaviour — whether surplus breathing room is swept into
     # brokerage (earns market return) or left as uninvested cash (0% return).
     # Stored here rather than StrategyToggles because it is a cash-flow routing

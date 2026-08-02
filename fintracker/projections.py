@@ -39,7 +39,7 @@ from fintracker.models import (
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles, by_filing_status,
 )
-from fintracker.tax_engine import TaxEngine
+from fintracker.tax_engine import TaxEngine, TaxResult
 from fintracker.mortgage import MortgageCalculator
 
 
@@ -108,14 +108,15 @@ from typing import NamedTuple
 
 class _Growth(NamedTuple):
     """Return value of _asset_growth — named fields beat an 8-tuple."""
-    retirement:   float
-    hsa:          float
-    col529:       float
-    brokerage:    float
-    uninvested:   float
-    cash_buffer:  float
-    roth_balance: float
-    roth_basis:   float
+    retirement:      float
+    hsa:             float
+    col529:          float
+    brokerage:       float
+    uninvested:      float
+    cash_buffer:     float
+    roth_balance:    float
+    roth_basis:      float
+    brokerage_gains: float   # cumulative unrealized gains within `brokerage`
 
 # ---------------------------------------------------------------------------
 # Engine state — typed, explicit, no loose dicts
@@ -157,6 +158,7 @@ class EngineState:
     # Balances
     retirement_balance: float
     brokerage_balance: float
+    brokerage_gains: float          # cumulative unrealized gains within brokerage_balance
     hsa_balance: float
     college_529_balance: float
     uninvested_cash: float
@@ -192,10 +194,26 @@ class EngineState:
     # Wedding sinking fund — invested value accrued per child (parallel to
     # child_birth_years); held inside brokerage, spent at the wedding.
     wedding_fund: list[float]
+    # Capital gains realized so far this projection year (reset annually); taxed
+    # in _compute_year. Populated by sell_brokerage().
+    realized_gains_ytd: float
 
     @property
     def gross_income(self) -> float:
         return self.income_primary + self.income_partner
+
+    def sell_brokerage(self, amount: float) -> None:
+        """Withdraw ``amount`` from brokerage, realizing a pro-rata share of its
+        unrealized gains (accumulated into realized_gains_ytd for cap-gains tax).
+
+        Single chokepoint for brokerage debits so balance, basis, and gains stay
+        consistent — deposits stay plain ``+=`` (new basis, no gain realized).
+        """
+        if amount > 0 and self.brokerage_balance > 0:
+            realized = self.brokerage_gains * min(1.0, amount / self.brokerage_balance)
+            self.brokerage_gains -= realized
+            self.realized_gains_ytd += realized
+        self.brokerage_balance -= amount
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +242,7 @@ class YearlySnapshot:
     annual_brokerage_contribution: float
     annual_aotc_credit: float
     annual_car_payment: float
+    annual_capital_gains_tax: float
     annual_wedding_save: float
 
     # Cash flow
@@ -232,6 +251,7 @@ class YearlySnapshot:
     # Assets
     retirement_balance: float
     brokerage_balance: float
+    brokerage_gains: float          # unrealized gains within brokerage_balance (for cap-gains tax)
     college_529_balance: float
     home_value: float
     home_equity: float
@@ -268,6 +288,12 @@ class YearlySnapshot:
     # Cumulative price level vs projection start (the engine's own inflation factor).
     # Divide any nominal figure in this year by it to express it in today's dollars.
     cumulative_inflation: float = 1.0
+
+    # Per-year tax breakdown. Federal is net of education credits (AOTC) so the
+    # three components always sum to annual_tax_total.
+    annual_federal_tax: float = 0.0
+    annual_fica_tax: float = 0.0
+    annual_state_tax: float = 0.0
 
     def to_todays_dollars(self, nominal: float) -> float:
         """Convert a nominal figure from this projection year into today's dollars."""
@@ -348,6 +374,16 @@ def _legacy_car_down(car) -> float:
         # All cars have explicit purchase years — no upfront deduction
         return 0.0
     return car.down_payment * car.num_cars
+
+
+def _after_tax_value(balance: float, taxable_base: float, rate: float) -> float:
+    """Account value after a withdrawal tax that applies only to `taxable_base`.
+
+    Making the taxable base explicit keeps each account honest: a 401k's whole
+    balance is ordinary income (base == balance), whereas a taxable brokerage is
+    taxed only on its gains (base == gains, not the full balance).
+    """
+    return balance - taxable_base * rate
 
 
 def _pay_loan_year(loan: dict, annual_rate: float, term_years: int) -> float:
@@ -585,17 +621,20 @@ class ProjectionEngine:
         # Both tax rates default to 0% for backward compatibility.
         r401k_tax = (withdrawal_tax_rate if withdrawal_tax_rate is not None
                      else rp.retirement_withdrawal_tax_rate)
+        # Retirement haircut uses the (typically lower) retirement drawdown rate.
         cap_gains  = (capital_gains_rate if capital_gains_rate is not None
-                      else rp.capital_gains_tax_rate)
+                      else self._retirement_cap_gains_rate())
         projected_pretax = (
             snap.retirement_balance + snap.hsa_balance + snap.roth_ira_balance
             + snap.brokerage_balance + snap.uninvested_cash + snap.cash_buffer
         )
         projected = (
-            snap.retirement_balance * (1 - r401k_tax)   # 401k/IRA: taxed as income
+            # 401k/IRA: entire balance is ordinary income on withdrawal.
+            _after_tax_value(snap.retirement_balance, snap.retirement_balance, r401k_tax)
             + snap.hsa_balance                           # HSA: tax-free (medical)
             + snap.roth_ira_balance                      # Roth: fully tax-free
-            + snap.brokerage_balance * (1 - cap_gains)  # Brokerage: cap gains on gains
+            # Brokerage: capital gains apply to the gains only, not the cost basis.
+            + _after_tax_value(snap.brokerage_balance, snap.brokerage_gains, cap_gains)
             + snap.uninvested_cash + snap.cash_buffer    # Cash: already post-tax
         )
 
@@ -688,6 +727,9 @@ class ProjectionEngine:
             mortgage_balance=p.housing.loan_amount if not p.housing.is_renting else 0.0,
             retirement_balance=inv.current_retirement_balance,
             brokerage_balance=initial_brokerage,
+            # Starting brokerage is treated as all cost basis (no embedded gains);
+            # gains accrue from projected market appreciation going forward.
+            brokerage_gains=0.0,
             hsa_balance=0.0,
             college_529_balance=0.0,
             uninvested_cash=0.0,
@@ -702,6 +744,7 @@ class ProjectionEngine:
             cars=self._init_cars(p.car),
             kid_car_loans=[],
             wedding_fund=[0.0] * p.lifestyle.num_children,
+            realized_gains_ytd=0.0,
             business_equity=0.0,
             business_revenue=(p.business.annual_revenue if p.business else 0.0),
         )
@@ -755,6 +798,7 @@ class ProjectionEngine:
 
     def _apply_timeline_events(self, state: EngineState, year: int, _amort_cache: Optional[dict] = None) -> None:
         p = self._plan
+        state.realized_gains_ytd = 0.0   # reset the year's realized-gains tally
         for ev in p.events_for_year(year):
 
             if ev.marriage:
@@ -800,7 +844,7 @@ class ProjectionEngine:
 
             # One-off cash
             state.brokerage_balance += ev.extra_one_time_income
-            state.brokerage_balance -= ev.extra_one_time_expense
+            state.sell_brokerage(ev.extra_one_time_expense)
 
             # Home purchase
             if ev.buy_home:
@@ -817,7 +861,7 @@ class ProjectionEngine:
             proceeds = equity - state.home_value * ev.seller_closing_cost_rate
             state.brokerage_balance += max(0.0, proceeds)
 
-        state.brokerage_balance -= new_down + new_price * ev.buyer_closing_cost_rate
+        state.sell_brokerage(new_down + new_price * ev.buyer_closing_cost_rate)
 
         new_hp = HousingProfile(
             home_price=new_price, down_payment=new_down, interest_rate=new_rate,
@@ -864,7 +908,7 @@ class ProjectionEngine:
         # --- Contributions & tax ---
         hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
         biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year)
-        tax, aotc = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
+        tax, aotc, tax_breakdown = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
 
         # Backdoor Roth IRA contribution (post-tax — no deduction, reduces net income).
         # Limit: $7,000/person × (2 if married), always fixed nominal dollars.
@@ -887,6 +931,10 @@ class ProjectionEngine:
         # them into the brokerage inflow instead of letting them leave the books.
         brokerage_inflow = brokerage_earmark + wedding_save
 
+        # Capital-gains tax on gains realized by this year's brokerage sales
+        # (home/car/wedding/business/one-off drawdowns accrued in realized_gains_ytd).
+        cap_gains_tax = state.realized_gains_ytd * self._cap_gains_rate()
+
         breathing_room = (
             net_income
             - housing_cost
@@ -895,6 +943,7 @@ class ProjectionEngine:
             - net_college
             - brokerage_inflow
             - car_pmt
+            - cap_gains_tax
         )
 
         # --- Asset growth ---
@@ -923,12 +972,17 @@ class ProjectionEngine:
             annual_hsa_contributions=hsa,
             annual_brokerage_contribution=brokerage_earmark,
             annual_aotc_credit=aotc,
+            annual_federal_tax=max(0.0, tax_breakdown.federal_income_tax - aotc),
+            annual_fica_tax=tax_breakdown.total_fica,
+            annual_state_tax=tax_breakdown.state_income_tax,
             annual_car_payment=car_pmt,
+            annual_capital_gains_tax=cap_gains_tax,
             annual_wedding_save=wedding_save,
             annual_wedding_spend=wedding_spend,
             annual_breathing_room=breathing_room,
             retirement_balance=g.retirement,
             brokerage_balance=g.brokerage,
+            brokerage_gains=g.brokerage_gains,
             college_529_balance=g.col529,
             home_value=home_value,
             home_equity=home_equity,
@@ -966,6 +1020,26 @@ class ProjectionEngine:
         """
         rp = self._plan.retirement
         return rp.current_age + (year - 1) if rp else None
+
+    def _cap_gains_rate(self) -> float:
+        """Long-term capital-gains rate: InvestmentProfile first, with
+        RetirementProfile.capital_gains_tax_rate as a backward-compatible fallback."""
+        rate = self._plan.investments.capital_gains_tax_rate
+        if rate:
+            return rate
+        rp = self._plan.retirement
+        return rp.capital_gains_tax_rate if rp else 0.0
+
+    def _retirement_cap_gains_rate(self) -> float:
+        """Effective cap-gains rate for the retirement-readiness haircut on the
+        *remaining unrealized* gains.
+
+        SIMPLIFIED ASSUMPTION: a retiree draws the brokerage down gradually and
+        often sits in the 0%/15% LTCG bracket, so this can be set lower than the
+        working-years rate. Falls back to the accumulation rate when unset.
+        """
+        rate = self._plan.investments.retirement_capital_gains_tax_rate
+        return rate if rate is not None else self._cap_gains_rate()
 
     def _contributions(
         self, state: EngineState, year: int
@@ -1021,8 +1095,8 @@ class ProjectionEngine:
         k401: float,
         r529: float,
         inf_f: float,
-    ) -> tuple[float, float]:
-        """Returns (effective_tax, aotc_credit)."""
+    ) -> tuple[float, float, TaxResult]:
+        """Returns (effective_tax, aotc_credit, tax_breakdown)."""
         p = self._plan
         tmp_inc = IncomeProfile(
             gross_annual_income=state.gross_income,
@@ -1035,11 +1109,14 @@ class ProjectionEngine:
             annual_401k_contribution=k401,
             annual_529_contribution=r529,
         )
-        raw_tax  = self._tax.calculate(tmp_inc, tmp_inv, p.strategies,
-                                       num_children=state.num_children).total_annual_tax
+        # inf_f inflation-indexes the tax brackets/deductions to this projection
+        # year, mirroring the IRS's annual indexing (prevents nominal bracket creep).
+        breakdown = self._tax.calculate(tmp_inc, tmp_inv, p.strategies,
+                                        num_children=state.num_children,
+                                        inflation_factor=inf_f)
         aotc     = self._aotc_credit(state, year, state.gross_income, state.is_married, inf_f)
-        eff_tax  = max(0.0, raw_tax - aotc)
-        return eff_tax, aotc
+        eff_tax  = max(0.0, breakdown.total_annual_tax - aotc)
+        return eff_tax, aotc, breakdown
 
     def _housing(
         self, state: EngineState, year: int, inf_f: float
@@ -1177,7 +1254,7 @@ class ProjectionEngine:
             elif age == _WEDDING_AGE:
                 spend += state.wedding_fund[i]         # wedding paid from the accrued fund
                 state.wedding_fund[i] = 0.0
-        state.brokerage_balance -= spend               # fund was held in brokerage
+        state.sell_brokerage(spend)                    # fund was held in brokerage
         return save, spend
 
     def _business(
@@ -1203,7 +1280,7 @@ class ProjectionEngine:
 
         # One-time initial investment in start year
         if year == biz.start_year and biz.initial_investment > 0:
-            state.brokerage_balance -= biz.initial_investment
+            state.sell_brokerage(biz.initial_investment)
 
         # Business sale: liquidate equity into brokerage once, then silence permanently.
         if biz.sale_year is not None and year >= biz.sale_year:
@@ -1266,7 +1343,7 @@ class ProjectionEngine:
         Single home for the "put money down, open a loan" step shared by first
         purchases, replacements, and kids' cars.
         """
-        state.brokerage_balance -= nominal_down
+        state.sell_brokerage(nominal_down)
         principal = max(0.0, nominal_price - nominal_down)
         return principal, self._car_monthly_pi(principal, rate, term_years)
 
@@ -1446,7 +1523,15 @@ class ProjectionEngine:
                     remaining2 = remaining2 - roth_drawn
                 brok_bal  += -remaining2
 
-        return _Growth(ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer, roth_bal, roth_basis)
+        # Track cumulative unrealized capital gains: only market appreciation (not
+        # contributions or withdrawals) creates a gain. Cash flows change value and
+        # basis equally, so they leave gains untouched. Capped at the balance so a
+        # large withdrawal effectively realizes gains (approximates sell-to-spend).
+        brok_gain = max(0.0, state.brokerage_balance) * mkt
+        brokerage_gains = max(0.0, min(state.brokerage_gains + brok_gain, brok_bal))
+
+        return _Growth(ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer,
+                       roth_bal, roth_basis, brokerage_gains)
 
     # ------------------------------------------------------------------ #
     # State advancement                                                    #
@@ -1484,6 +1569,7 @@ class ProjectionEngine:
 
         state.retirement_balance  = snap.retirement_balance
         state.brokerage_balance   = snap.brokerage_balance
+        state.brokerage_gains     = snap.brokerage_gains
         state.hsa_balance         = snap.hsa_balance
         state.college_529_balance = snap.college_529_balance
         state.uninvested_cash       = snap.uninvested_cash

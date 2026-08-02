@@ -90,10 +90,13 @@ class _StateTaxConfig:
 
 _STATE_TAX_CONFIGS: dict[State, _StateTaxConfig] = {
     State.GEORGIA: _StateTaxConfig(
+        # Flat 4.99% for 2026 (down from 5.19%). GA is on a scheduled decline of
+        # ~0.125pp/yr toward a 3.99% floor, contingent on state revenue targets;
+        # modelled here as a static current-year rate. Verify against the GA DOR.
         name="Georgia",
-        brackets=[(float("inf"), 0.0539)],  # Flat 5.39% (2024+)
-        standard_deduction_single=12_000,
-        standard_deduction_mfj=24_000,
+        brackets=[(float("inf"), 0.0499)],  # Flat 4.99% (2026)
+        standard_deduction_single=15_000,
+        standard_deduction_mfj=30_000,
         allows_529_deduction=True,
         per_beneficiary_529_deduction=8_000,  # $4k single / $8k MFJ (as of 2024)
     ),
@@ -175,6 +178,14 @@ _STATE_TAX_CONFIGS: dict[State, _StateTaxConfig] = {
 }
 
 
+def state_display_name(state: State) -> str:
+    """Human-readable state name for UI labels (e.g. 'Georgia', 'New York')."""
+    cfg = _STATE_TAX_CONFIGS.get(state)
+    if cfg:
+        return cfg.name
+    return "Custom flat rate" if state == State.OTHER else state.value
+
+
 @dataclass
 class TaxResult:
     """Full annual tax breakdown."""
@@ -213,19 +224,42 @@ class TaxResult:
 _apply_brackets = progressive_tax
 
 
+def _scale_brackets(brackets: list[tuple[float, float]], factor: float) -> list[tuple[float, float]]:
+    """Inflation-index bracket bounds by ``factor`` (rates unchanged; inf stays inf).
+
+    Real IRS/state brackets re-index to inflation each year; scaling the 2024
+    bounds by the projection year's cumulative inflation keeps a taxpayer in the
+    same *real* bracket instead of creeping into higher nominal ones.
+    """
+    if factor == 1.0:
+        return brackets
+    return [(bound * factor, rate) for bound, rate in brackets]
+
+
 def _federal_income_tax(gross: float, filing_status: FilingStatus,
-                        k401_deduction: float, hsa_deduction: float) -> float:
-    """Federal income tax after pre-tax 401k/HSA and the standard deduction."""
-    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600)
+                        k401_deduction: float, hsa_deduction: float,
+                        inflation_factor: float = 1.0) -> float:
+    """Federal income tax after pre-tax 401k/HSA and the standard deduction.
+
+    Brackets and the standard deduction are inflation-indexed by inflation_factor
+    (1.0 = the base tax year).
+    """
+    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600) * inflation_factor
     fed_taxable = max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
     brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
-    return _apply_brackets(fed_taxable, brackets)
+    return _apply_brackets(fed_taxable, _scale_brackets(brackets, inflation_factor))
 
 
 def _fica_taxes(gross: float, hsa_deduction: float,
-                filing_status: FilingStatus) -> tuple[float, float, float]:
-    """FICA: (social security, medicare, additional medicare). HSA is FICA-exempt."""
-    ss_base = min(gross - hsa_deduction, _SS_WAGE_BASE_2024)
+                filing_status: FilingStatus,
+                inflation_factor: float = 1.0) -> tuple[float, float, float]:
+    """FICA: (social security, medicare, additional medicare). HSA is FICA-exempt.
+
+    The Social Security wage base is inflation-indexed (it rises annually in
+    reality); the Additional Medicare Tax threshold is NOT — it is fixed by
+    statute and does not index.
+    """
+    ss_base = min(gross - hsa_deduction, _SS_WAGE_BASE_2024 * inflation_factor)
     ss_tax = max(0.0, ss_base) * _SS_RATE
 
     medicare_base = max(0.0, gross - hsa_deduction)
@@ -243,8 +277,13 @@ def _fica_taxes(gross: float, hsa_deduction: float,
 def _state_income_tax(income: IncomeProfile, filing_status: FilingStatus, gross: float,
                       k401_deduction: float, hsa_deduction: float,
                       strategies: StrategyToggles, investments: InvestmentProfile,
-                      num_children: int) -> tuple[float, float]:
-    """State income tax and the state 529 deduction applied: (state_tax, state_529_deduction)."""
+                      num_children: int, inflation_factor: float = 1.0) -> tuple[float, float]:
+    """State income tax and the state 529 deduction applied: (state_tax, state_529_deduction).
+
+    State brackets and standard deduction are inflation-indexed by inflation_factor.
+    (Simplification: a few states don't index in reality; flat-tax states have no
+    bounds to index.)
+    """
     state = income.state
     if state == State.OTHER:
         state_tax = max(0.0, gross - k401_deduction - hsa_deduction) * income.other_state_flat_rate
@@ -258,7 +297,7 @@ def _state_income_tax(income: IncomeProfile, filing_status: FilingStatus, gross:
         filing_status,
         config.standard_deduction_single,
         config.standard_deduction_mfj,
-    )
+    ) * inflation_factor
     state_hsa = hsa_deduction if config.allows_hsa_deduction else 0.0
     state_401k = k401_deduction if config.allows_401k_deduction else 0.0
 
@@ -271,7 +310,7 @@ def _state_income_tax(income: IncomeProfile, filing_status: FilingStatus, gross:
         state_529_deduction = 0.0
 
     state_taxable = max(0.0, gross - state_401k - state_hsa - state_529_deduction - state_std)
-    return _apply_brackets(state_taxable, config.brackets), state_529_deduction
+    return _apply_brackets(state_taxable, _scale_brackets(config.brackets, inflation_factor)), state_529_deduction
 
 
 class TaxEngine:
@@ -291,6 +330,7 @@ class TaxEngine:
         num_children: int = 0,
         filing_status_override: FilingStatus | None = None,
         gross_income_override: float | None = None,
+        inflation_factor: float = 1.0,
     ) -> TaxResult:
         """Calculate full annual tax liability.
 
@@ -301,6 +341,11 @@ class TaxEngine:
             num_children: Used for state 529 deduction calculation.
             filing_status_override: Override filing status (used in projections).
             gross_income_override: Override gross income (used in projections).
+            inflation_factor: Cumulative price level vs the base tax year; scales
+                brackets, standard deductions, and the SS wage base so nominal
+                income in a future projection year is taxed against inflation-
+                indexed thresholds (1.0 = base year; the default keeps single-year
+                callers unchanged).
         """
         filing_status = filing_status_override or income.filing_status
         gross = gross_income_override if gross_income_override is not None else income.total_gross_income
@@ -309,11 +354,13 @@ class TaxEngine:
         hsa_deduction = investments.annual_hsa_contribution if strategies.maximize_hsa else 0.0
         k401_deduction = investments.annual_401k_contribution if strategies.maximize_401k else 0.0
 
-        federal_tax = _federal_income_tax(gross, filing_status, k401_deduction, hsa_deduction)
-        ss_tax, medicare_tax, add_medicare_tax = _fica_taxes(gross, hsa_deduction, filing_status)
+        federal_tax = _federal_income_tax(gross, filing_status, k401_deduction, hsa_deduction,
+                                          inflation_factor)
+        ss_tax, medicare_tax, add_medicare_tax = _fica_taxes(gross, hsa_deduction, filing_status,
+                                                             inflation_factor)
         state_tax, state_529_deduction = _state_income_tax(
             income, filing_status, gross, k401_deduction, hsa_deduction,
-            strategies, investments, num_children,
+            strategies, investments, num_children, inflation_factor,
         )
 
         return TaxResult(
