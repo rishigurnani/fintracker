@@ -18,6 +18,7 @@ from fintracker.models import (
     IncomeProfile, HousingProfile, LifestyleProfile,
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier,
     RothContributionPhase, InvestmentProfile, StrategyToggles, FinancialPlan, TimelineEvent,
+    Failsafe, FailsafeCondition, FailsafeAction,
 )
 from fintracker.tax_engine import TaxEngine, state_display_name
 from fintracker.mortgage import MortgageCalculator
@@ -1005,6 +1006,141 @@ def _events_section(defaults) -> 'list[TimelineEvent]':
     return events
 
 
+_FS_METRICS = ["brokerage_balance", "liquid_assets", "investable_assets",
+               "retirement_balance", "home_equity", "net_worth"]
+_FS_COMPARATORS = ["below", "above"]
+_FS_MATCH = ["any", "all"]
+
+
+def _failsafe_condition_inputs(i, j, cond_def) -> 'FailsafeCondition':
+    """Widgets for one trigger condition (a `when:` item)."""
+    c1, c2 = st.columns(2)
+    metric = c1.selectbox(
+        "Metric", _FS_METRICS,
+        index=_FS_METRICS.index(cond_def.metric) if (cond_def and cond_def.metric in _FS_METRICS) else 0,
+        key=f"fs_cm_{i}_{j}",
+    )
+    comparator = c2.selectbox(
+        "Comparator", _FS_COMPARATORS,
+        index=_FS_COMPARATORS.index(cond_def.comparator) if (cond_def and cond_def.comparator in _FS_COMPARATORS) else 0,
+        key=f"fs_cc_{i}_{j}",
+    )
+    threshold = st.number_input(
+        "Threshold ($)", min_value=0, max_value=100_000_000, step=10_000,
+        value=int(cond_def.threshold) if cond_def else 100_000, key=f"fs_ct_{i}_{j}",
+    )
+    p1, p2, p3 = st.columns(3)
+    present_value = p1.checkbox("Today's $", value=_wd(cond_def, "present_value", True), key=f"fs_cpv_{i}_{j}")
+    start_year = p2.number_input("Start yr", min_value=1, max_value=60,
+                                 value=_wd(cond_def, "start_year", 1, int), key=f"fs_cs_{i}_{j}")
+    end_year = p3.number_input(
+        "End yr (0=end)", min_value=0, max_value=60,
+        value=int(cond_def.end_year) if (cond_def and cond_def.end_year is not None) else 0,
+        key=f"fs_ce_{i}_{j}",
+    )
+    return FailsafeCondition(
+        metric=metric, comparator=comparator, threshold=float(threshold),
+        present_value=present_value, start_year=int(start_year),
+        end_year=int(end_year) if end_year > 0 else None,
+    )
+
+
+def _failsafe_action_inputs(i, act_def) -> 'FailsafeAction':
+    """Widgets for a failsafe's action (the `then:` block)."""
+    st.markdown("**Then — action**")
+    present_value = st.checkbox("Amounts in today's $", value=_wd(act_def, "present_value", True), key=f"fs_apv_{i}")
+    partner_income = st.number_input(
+        "Partner income while active ($, 0 = none)", min_value=0, max_value=5_000_000, step=5_000,
+        value=int(act_def.partner_income) if (act_def and act_def.partner_income) else 0, key=f"fs_api_{i}",
+    )
+    primary_income = st.number_input(
+        "Your income while active ($, 0 = none)", min_value=0, max_value=5_000_000, step=5_000,
+        value=int(act_def.primary_income) if (act_def and act_def.primary_income) else 0, key=f"fs_apri_{i}",
+    )
+    suspend = st.checkbox(
+        "Suspend 401k/IRA contributions", value=_wd(act_def, "suspend_retirement_contributions", False),
+        key=f"fs_asusp_{i}", help="Zeroes 401k/IRA deferrals (and the contingent employer match) while active.",
+    )
+    cut_vac = st.checkbox(
+        "Override vacation budget", value=(act_def is not None and act_def.annual_vacation is not None),
+        key=f"fs_acutv_{i}", help="Force the annual vacation budget to a set amount while active.",
+    )
+    annual_vacation = None
+    if cut_vac:
+        annual_vacation = float(st.number_input(
+            "Vacation budget while active ($)", min_value=0, max_value=1_000_000, step=1_000,
+            value=int(act_def.annual_vacation) if (act_def and act_def.annual_vacation is not None) else 4_000,
+            key=f"fs_avac_{i}",
+        ))
+    a1, a2 = st.columns(2)
+    one_time_income = a1.number_input("One-time income ($)", min_value=0, max_value=5_000_000, step=5_000,
+                                      value=_wd(act_def, "one_time_income", 0, int), key=f"fs_aoti_{i}")
+    one_time_expense = a2.number_input("One-time expense ($)", min_value=0, max_value=5_000_000, step=5_000,
+                                       value=_wd(act_def, "one_time_expense", 0, int), key=f"fs_aote_{i}")
+    return FailsafeAction(
+        partner_income=float(partner_income) if partner_income > 0 else None,
+        primary_income=float(primary_income) if primary_income > 0 else None,
+        one_time_income=float(one_time_income),
+        one_time_expense=float(one_time_expense),
+        present_value=present_value,
+        suspend_retirement_contributions=suspend,
+        annual_vacation=annual_vacation,
+    )
+
+
+def _failsafe_inputs(i, fs_def) -> 'Failsafe':
+    """Render one failsafe's widgets and return the assembled Failsafe."""
+    name = st.text_input("Name", value=_wd(fs_def, "name", f"failsafe {i+1}"), key=f"fs_name_{i}")
+    b1, b2 = st.columns(2)
+    match = b1.selectbox("Match", _FS_MATCH,
+                         index=_FS_MATCH.index(fs_def.match) if (fs_def and fs_def.match in _FS_MATCH) else 0,
+                         key=f"fs_match_{i}", help="'any' fires when any condition is true; 'all' requires all.")
+    once = b2.checkbox("Fire once", value=_wd(fs_def, "once", True), key=f"fs_once_{i}",
+                       help="On: fires a single time per simulation. Off: re-evaluates every year — "
+                            "pair with Duration = 1 for recurring belt-tightening (e.g. pause 401k any year cash is short).")
+    d1, d2 = st.columns(2)
+    delay = d1.number_input("Delay (yrs)", min_value=0, max_value=30,
+                            value=_wd(fs_def, "delay_years", 0, int), key=f"fs_delay_{i}",
+                            help="Lag between the trigger firing and the action taking effect.")
+    duration = d2.number_input("Duration (yrs, 0 = permanent)", min_value=0, max_value=60,
+                               value=int(fs_def.duration_years) if (fs_def and fs_def.duration_years is not None) else 0,
+                               key=f"fs_dur_{i}")
+
+    st.markdown(f"**When — triggers** (fires if **{match}** are true)")
+    n_cond_default = len(fs_def.conditions) if (fs_def and fs_def.conditions) else 1
+    n_cond = st.number_input("Number of conditions", min_value=1, max_value=4,
+                             value=n_cond_default, key=f"fs_ncond_{i}")
+    conditions = []
+    for j in range(int(n_cond)):
+        cond_def = fs_def.conditions[j] if (fs_def and j < len(fs_def.conditions)) else None
+        st.caption(f"Condition {j+1}")
+        conditions.append(_failsafe_condition_inputs(i, j, cond_def))
+
+    action = _failsafe_action_inputs(i, fs_def.action if fs_def else None)
+    return Failsafe(
+        name=name, conditions=conditions, action=action, match=match,
+        delay_years=int(delay), duration_years=int(duration) if duration > 0 else None, once=once,
+    )
+
+
+def _failsafes_section(defaults) -> 'list[Failsafe]':
+    st.sidebar.header("🛟 Failsafes")
+    st.sidebar.caption("Contingency actions that trigger when a metric crosses a threshold "
+                       "(evaluated per simulation path).")
+    loaded = defaults.failsafes if defaults else []
+    n = st.sidebar.number_input("Number of failsafes", min_value=0, max_value=10,
+                                value=len(loaded), key="fs_count")
+    out: list = []
+    for i in range(int(n)):
+        fs_def = loaded[i] if i < len(loaded) else None
+        with st.sidebar.expander(
+            f"Failsafe {i+1}" + (f": {fs_def.name}" if (fs_def and fs_def.name) else ""),
+            expanded=(i == 0),
+        ):
+            out.append(_failsafe_inputs(i, fs_def))
+    return out
+
+
 def _load_config_expander() -> None:
     """Render the 'Load config' expander; stash an uploaded plan in session_state."""
     with st.sidebar.expander("📂 Load / Save Config", expanded=False):
@@ -1061,6 +1197,7 @@ _SECTION_BUILDERS = {
     "🚗 Car":         lambda d, c: c.update(car=_car_section(d)),
     "🏢 Business":    lambda d, c: c.update(business=_business_section(d)),
     "🗓️ Events":      lambda d, c: c.update(timeline_events=_events_section(d)),
+    "🛟 Failsafes":   lambda d, c: c.update(failsafes=_failsafes_section(d)),
 }
 
 
@@ -1097,6 +1234,7 @@ def build_sidebar() -> FinancialPlan:
         car=_wd(defaults, "car", None),
         business=_wd(defaults, "business", None),
         timeline_events=_wd(defaults, "timeline_events", []),
+        failsafes=_wd(defaults, "failsafes", []),
     )
     _SECTION_BUILDERS[section](defaults, components)
 
@@ -1817,6 +1955,27 @@ def _mc_simulation_params() -> dict:
                  "(1929–2024), including deflation, 1970s stagflation (13.3%), "
                  "and 2021–22 surge (7%). OFF: draws from a normal distribution.",
         )
+        both_hist = use_hist and use_hist_inf
+        bcol1, bcol2 = st.columns(2)
+        block_bs = bcol1.toggle(
+            "Joint block bootstrap",
+            value=True,
+            disabled=not both_hist,
+            help="ON (recommended): sample equity and inflation JOINTLY as "
+                 "calendar-year-aligned pairs drawn in multi-year blocks, so "
+                 "stagflation (bad stocks + high inflation) stays bundled and "
+                 "multi-year regimes (sticky inflation, crash-then-recovery) are "
+                 "preserved. Salary growth is tied to the sampled inflation. "
+                 "OFF: draw each series independently, one year at a time. "
+                 "Requires both historical toggles ON.",
+        )
+        mean_block = bcol2.slider(
+            "Mean block length (yrs)", 1.0, 10.0, 2.0, 1.0,
+            disabled=not (both_hist and block_bs),
+            help="Average length of each contiguous historical run in the block "
+                 "bootstrap (stationary bootstrap; block lengths are random with "
+                 "this mean).",
+        )
         mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
         n_sims = mc_col1.number_input(
             "Simulations", min_value=100, max_value=10_000,
@@ -1843,6 +2002,7 @@ def _mc_simulation_params() -> dict:
     return dict(
         n_sims=int(n_sims), use_hist=use_hist, use_hist_inf=use_hist_inf,
         mkt_std=mkt_std, inf_std=inf_std, sg_std=sg_std, mc_seed=mc_seed,
+        block_bs=block_bs, mean_block=float(mean_block),
     )
 
 
@@ -1860,6 +2020,7 @@ def _mc_networth_fan_chart(mc, snapshots, n_sims) -> None:
     hist_parts = []
     if mc.use_historical_returns:   hist_parts.append("hist. returns")
     if mc.use_historical_inflation: hist_parts.append("hist. inflation")
+    if mc.block_bootstrap:          hist_parts.append("block bootstrap")
     mode_label = (", ".join(hist_parts) if hist_parts
                   else f"Normal(σ_mkt={mc.market_return_std:.0%}, σ_inf={mc.inflation_std:.0%})")
     fig_mc.update_layout(
@@ -1873,10 +2034,16 @@ def _mc_liquidity_warning(mc) -> None:
     """Error / warning / success banner summarising liquidity risk across sims."""
     high_risk_years = [(yr, p) for yr, p in zip(mc.years, mc.prob_negative_liquid) if p > 0.10]
     if high_risk_years:
-        yr_list = ", ".join(f"Year {yr} ({p:.0%})" for yr, p in high_risk_years[:5])
+        first_yr = high_risk_years[0][0]
+        peak_yr, peak_p = max(high_risk_years, key=lambda t: t[1])
+        count = len(high_risk_years)
+        span = (
+            f"Year {first_yr}" if count == 1
+            else f"{count} of your projected years, starting in Year {first_yr}"
+        )
         st.error(
             f"⚠️ **Significant liquidity risk detected.** In more than 10% of simulations, "
-            f"liquid assets go negative in: {yr_list}. "
+            f"liquid assets go negative in {span} — peaking at Year {peak_yr} ({peak_p:.0%}). "
             f"Consider building a larger cash buffer or reducing fixed expenses."
         )
     elif any(p > 0 for p in mc.prob_negative_liquid):
@@ -1886,6 +2053,28 @@ def _mc_liquidity_warning(mc) -> None:
         )
     else:
         st.success("✅ **No liquidity risk.** Liquid assets stayed positive in all simulations.")
+
+
+def _mc_failsafe_metrics(plan, mc) -> None:
+    """One tile per failsafe: the % of simulations in which it fired.
+
+    Makes it obvious at a glance whether a failsafe is actually triggering on
+    the current numbers (0% = the condition is never hit; a high % = it is
+    doing a lot of the work holding up the downside)."""
+    if not plan.failsafes:
+        return
+    st.markdown("**Failsafes** — share of simulations in which each one triggered")
+    cols = st.columns(min(len(plan.failsafes), 4))
+    for i, fs in enumerate(plan.failsafes):
+        rate = mc.failsafe_fire_rates.get(fs.name, 0.0)
+        help_txt = (
+            "Never triggered in these simulations — the trigger condition wasn't "
+            "met on any path. Check the threshold and year window."
+            if rate == 0 else
+            "Fraction of simulated futures in which this failsafe's condition was "
+            "met and its action kicked in."
+        )
+        cols[i % len(cols)].metric(f"🛟 {fs.name}", f"{rate:.0%}", help=help_txt)
 
 
 @st.cache_data(show_spinner=False)
@@ -1905,10 +2094,11 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
         "**Liquidity risk** = probability of brokerage + cash going negative in a given year "
         "(having to liquidate retirement accounts or take on debt). "
 
-        "**Historical mode** (recommended): market returns sampled from 100 years of S&P 500 "
-        "actuals (1926–2025) — preserving fat tails, crash years, and boom years as they "
-        "really happened. "
-        "Inflation and salary growth are always drawn from normal distributions. "
+        "**Historical mode** (recommended): market returns and inflation are sampled from "
+        "~100 years of actuals (S&P 500 1926–2025, CPI 1929–2024) — preserving fat tails, "
+        "crash years, and boom years as they really happened. With **joint block bootstrap** "
+        "on, the two are drawn together in multi-year blocks so stagflation stays bundled and "
+        "multi-year regimes are preserved, and salary growth tracks the sampled inflation. "
         "Shows the full range of outcomes including liquidity risk."
     )
 
@@ -1920,6 +2110,7 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
         use_historical_returns=p["use_hist"], use_historical_inflation=p["use_hist_inf"],
         market_return_std=p["mkt_std"], inflation_std=p["inf_std"],
         salary_growth_std=p["sg_std"],
+        block_bootstrap=p["block_bs"], mean_block_years=p["mean_block"],
     )
     with st.spinner(f"Running {n_sims:,} simulations…"):
         # Unseeded (non-reproducible) runs bypass the cache so each run reshuffles.
@@ -1939,6 +2130,8 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
         delta=f"worst in year {worst_liq_yr}",
         delta_color="inverse",
     )
+
+    _mc_failsafe_metrics(plan, mc)
 
     # ── Net worth fan chart ───────────────────────────────────
     years_mc = mc.years

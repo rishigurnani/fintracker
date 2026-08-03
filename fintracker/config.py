@@ -30,6 +30,7 @@ from fintracker.models import (
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, EmployerMatch, MatchTier, KidCarProfile, CollegeProfile, RothContributionPhase, FilingStatus, RetirementProfile, State,
     IncomeProfile, HousingProfile, LifestyleProfile,
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
+    Failsafe, FailsafeCondition, FailsafeAction,
 )
 
 
@@ -278,6 +279,34 @@ _EVENT_SPEC = [
     ("extra_one_time_income", float, 0),
 ]
 
+# Failsafes: a `when:` list of conditions + a single `action:`, plus top-level
+# scalars. Conditions and action nest, so they are built separately and passed
+# to the outer _build as extra kwargs.
+_FAILSAFE_COND_SPEC = [
+    ("metric", str, "brokerage_balance"),
+    ("comparator", str, "below"),
+    ("threshold", float, 0.0),
+    ("present_value", bool, True),
+    ("start_year", int, 1),
+    ("end_year", _opt(int), None),
+]
+_FAILSAFE_ACTION_SPEC = [
+    ("partner_income", _opt(float), None),
+    ("primary_income", _opt(float), None),
+    ("one_time_income", float, 0.0),
+    ("one_time_expense", float, 0.0),
+    ("present_value", bool, True),
+    ("suspend_retirement_contributions", bool, False),
+    ("annual_vacation", _opt(float), None),
+]
+_FAILSAFE_SPEC = [
+    ("name", str, "failsafe"),
+    ("match", str, "any"),
+    ("delay_years", int, 0),
+    ("duration_years", _opt(int), None),
+    ("once", bool, True),
+]
+
 _CHILDCARE_PHASE_SPEC = [("age_start", int, 0), ("age_end", int, 0), ("monthly_cost", float, 0.0)]
 _ROTH_PHASE_SPEC = [("year_start", int, 0), ("year_end", int, 0), ("annual_amount", float, 0.0)]
 _MATCH_TIER_SPEC = [("match_pct", float, 0.0), ("up_to_pct_of_salary", float, 0.0)]
@@ -346,6 +375,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
 
     strategies = _build(StrategyToggles, s_d, _STRATEGIES_SPEC)
     events = [_dict_to_event(e) for e in d.get("timeline_events", [])]
+    failsafes = [_dict_to_failsafe(f) for f in d.get("failsafes", [])]
 
     return FinancialPlan(
         income=income,
@@ -354,6 +384,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         investments=investments,
         strategies=strategies,
         timeline_events=events,
+        failsafes=failsafes,
         projection_years=int(d.get("projection_years", 30)),
         retirement=_build(RetirementProfile, d["retirement"], _RETIREMENT_SPEC) if "retirement" in d else None,
         college=_build(CollegeProfile, d["college"], _COLLEGE_SPEC) if "college" in d else None,
@@ -366,6 +397,20 @@ def _dict_to_event(e: dict) -> TimelineEvent:
     # home_price_override is a load-only back-compat alias, so it lives outside the spec.
     return _build(TimelineEvent, e, _EVENT_SPEC,
                   home_price_override=e.get("home_price_override"))
+
+
+def _dict_to_failsafe(f: dict) -> Failsafe:
+    conditions = [_build(FailsafeCondition, c, _FAILSAFE_COND_SPEC)
+                  for c in f.get("when", [])]
+    action = _build(FailsafeAction, f.get("action", {}), _FAILSAFE_ACTION_SPEC)
+    return _build(Failsafe, f, _FAILSAFE_SPEC, conditions=conditions, action=action)
+
+
+def _failsafe_to_dict(fs: Failsafe) -> dict:
+    out = _dump(fs, _FAILSAFE_SPEC)
+    out["when"] = [_dump(c, _FAILSAFE_COND_SPEC) for c in fs.conditions]
+    out["action"] = _dump(fs.action, _FAILSAFE_ACTION_SPEC)
+    return out
 
 
 def _dict_to_childcare_profile(cp: dict) -> ChildcareProfile:
@@ -465,6 +510,8 @@ def _plan_to_dict(plan: FinancialPlan) -> dict:
         if plan.car.kids_car:
             car_d["kids_car"] = _dump(plan.car.kids_car, _KID_CAR_SPEC)
         d["car"] = car_d
+    if plan.failsafes:
+        d["failsafes"] = [_failsafe_to_dict(f) for f in plan.failsafes]
 
     return d
 

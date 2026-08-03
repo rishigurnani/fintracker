@@ -19,7 +19,7 @@ APP_PATH = str(REPO_ROOT / "app.py")
 
 SECTIONS = [
     "💵 Income", "🏠 Housing", "🌿 Lifestyle", "📊 Investments",
-    "🎯 Strategies", "🚗 Car", "🏢 Business", "🗓️ Events",
+    "🎯 Strategies", "🚗 Car", "🏢 Business", "🗓️ Events", "🛟 Failsafes",
 ]
 
 # Runs only build_sidebar() — skips the heavy Monte Carlo dashboard so the
@@ -58,6 +58,39 @@ def test_sidebar_section_renders_without_config(section):
     at.session_state["loaded_plan"] = None
     at.run()
     assert not at.exception, _errors(at)
+
+
+def test_failsafes_section_seeds_and_roundtrips_loaded_plan():
+    """The Failsafes section renders a loaded failsafe and rebuilds it into the plan."""
+    at = AppTest.from_string(_SIDEBAR_ONLY, default_timeout=60)
+    at.run()  # first run establishes the app + widgets
+
+    import sys, pathlib as _pl
+    sys.path.insert(0, _pl.Path(__file__).resolve().parent.parent.as_posix())
+    from tests.builders import make_plan
+    from fintracker.models import Failsafe, FailsafeCondition, FailsafeAction
+
+    fs = Failsafe(
+        name="partner returns to work", match="any", delay_years=1, duration_years=5, once=True,
+        conditions=[FailsafeCondition("brokerage_balance", "below", 100_000, True, 15, 30)],
+        action=FailsafeAction(partner_income=100_000, present_value=True),
+    )
+    plan = make_plan()
+    plan.failsafes = [fs]
+    at.session_state["loaded_plan"] = plan
+    at.sidebar.radio[0].set_value("🛟 Failsafes")
+    at.run()
+    assert not at.exception, _errors(at)
+
+    rebuilt = at.session_state["loaded_plan"]
+    assert len(rebuilt.failsafes) == 1
+    got = rebuilt.failsafes[0]
+    assert got.name == "partner returns to work"
+    assert got.delay_years == 1 and got.duration_years == 5 and got.once is True
+    assert got.conditions[0].metric == "brokerage_balance"
+    assert got.conditions[0].threshold == 100_000
+    assert got.conditions[0].start_year == 15 and got.conditions[0].end_year == 30
+    assert got.action.partner_income == 100_000
 
 
 def test_build_sidebar_returns_valid_plan_without_config():

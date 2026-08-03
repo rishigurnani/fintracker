@@ -798,6 +798,76 @@ class TimelineEvent:
 
 
 # ---------------------------------------------------------------------------
+# Failsafes — conditional events that fire when the running state crosses a
+# threshold, rather than on a fixed year. Because the condition is checked
+# against the live state each year, in Monte Carlo a failsafe triggers
+# path-dependently: only in the simulations that actually hit the threshold.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FailsafeCondition:
+    """One trigger test evaluated on start-of-year state.
+
+    ``metric`` is one of: ``brokerage_balance``, ``liquid_assets``,
+    ``investable_assets``, ``retirement_balance``, ``home_equity``,
+    ``net_worth``. ``comparator`` is ``below`` or ``above``. When
+    ``present_value`` is true the metric is deflated to today's dollars before
+    the comparison, so ``threshold`` is read in today's dollars. The condition
+    is only armed within ``[start_year, end_year]`` (``end_year`` None = horizon).
+    """
+    metric: str
+    comparator: str                    # 'below' | 'above'
+    threshold: float
+    present_value: bool = True
+    start_year: int = 1
+    end_year: Optional[int] = None
+
+
+@dataclass
+class FailsafeAction:
+    """What a failsafe does while active.
+
+    Sustained levers (``partner_income`` / ``primary_income``) *replace* that
+    person's earned income for the active window and revert when it ends; they
+    are taxed as ordinary earned income. One-off levers fire once, at activation.
+    When ``present_value`` is true all amounts are in today's dollars and are
+    inflated to nominal for the year they apply.
+    """
+    partner_income: Optional[float] = None
+    primary_income: Optional[float] = None
+    one_time_income: float = 0.0
+    one_time_expense: float = 0.0
+    present_value: bool = True
+    # Suspend 401k/IRA elective deferrals (and the contingent employer match)
+    # for each year the action is active. HSA and 529 contributions are left
+    # untouched. Naturally paired with a short duration + once=false so it
+    # re-evaluates every year the trigger holds (see docs).
+    suspend_retirement_contributions: bool = False
+    # Override the annual vacation budget while active (honours ``present_value``,
+    # so a value of 4000 means $4k in today's dollars that year). None leaves it.
+    annual_vacation: Optional[float] = None
+
+
+@dataclass
+class Failsafe:
+    """A conditional event: fire ``action`` when ``conditions`` are met.
+
+    ``match`` = ``any`` fires when any condition is true, ``all`` requires all.
+    ``delay_years`` is the lag between the trigger firing and the action taking
+    effect (e.g. a job hunt). ``duration_years`` is how long a sustained action
+    lasts (None = permanent). With ``once`` true the failsafe fires at most once
+    per simulation path.
+    """
+    name: str
+    conditions: list[FailsafeCondition]
+    action: FailsafeAction
+    match: str = "any"                 # 'any' | 'all'
+    delay_years: int = 0
+    duration_years: Optional[int] = None
+    once: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Top-level plan
 # ---------------------------------------------------------------------------
 
@@ -810,6 +880,7 @@ class FinancialPlan:
     investments: InvestmentProfile
     strategies: StrategyToggles = field(default_factory=StrategyToggles)
     timeline_events: list[TimelineEvent] = field(default_factory=list)
+    failsafes: list[Failsafe] = field(default_factory=list)
     projection_years: int = 30
     retirement: Optional[RetirementProfile] = None
     college: Optional[CollegeProfile] = None
