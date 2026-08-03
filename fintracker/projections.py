@@ -114,6 +114,32 @@ def _complete_order(order, fallback: tuple[str, ...]) -> list[str]:
     return seen
 
 
+def _deposit_growth_factor(annual_rate: float, period_months: float) -> float:
+    """Growth multiplier for a year's deposits under sub-annual compounding.
+
+    Annual rates are converted geometrically, so a *lump* starting balance grows by
+    exactly ``(1 + annual_rate)`` regardless of the compounding period — that is the
+    whole point of ``rate_period = (1 + annual)^(period/12) − 1``. The period only
+    affects money paid in *during* the year: with finer compounding those deposits
+    are dollar-cost-averaged across the sub-periods and earn part of a year's return
+    instead of being dropped in as a year-end lump.
+
+    Returns that factor: ``1.0`` at ``period_months == 12`` (annual — a deposit earns
+    nothing extra), ``> 1`` for finer periods (e.g. monthly), ``< 1`` for coarser
+    ones. Deposits are modelled as an ordinary annuity (equal instalments at the end
+    of each sub-period). Derivation: FV of ``n`` end-of-period deposits summing to 1
+    is ``[(1+rp)^n − 1] / (n·rp)``, and ``(1+rp)^n = 1 + annual_rate`` exactly, so the
+    factor is ``annual_rate / (n·rp)``.
+    """
+    if period_months <= 0 or period_months == 12 or annual_rate <= -1.0:
+        return 1.0
+    n = 12.0 / period_months                       # compounding periods per year
+    period_rate = (1.0 + annual_rate) ** (1.0 / n) - 1.0
+    if abs(period_rate) < 1e-12:                    # zero return → deposits don't grow
+        return 1.0
+    return annual_rate / (n * period_rate)
+
+
 def _available_sources(cash_buffer: float, uninvested_cash: float, ret_grown: float,
                        brok_grown: float, roth_basis: float, retired: bool) -> dict:
     """Post-growth balances a deficit can be funded from, keyed by source.
@@ -1742,13 +1768,14 @@ class ProjectionEngine:
         rate = self._plan.lifestyle.annual_wedding_fund_per_child
         if not rate:
             return 0.0, 0.0
+        dep_f = _deposit_growth_factor(mkt, self._plan.investments.compounding_period_months)
         save = spend = 0.0
         for i, by in enumerate(state.child_birth_years):
             age = year - by
             state.wedding_fund[i] *= (1 + mkt)        # invested alongside brokerage
             if age < _WEDDING_AGE:
-                state.wedding_fund[i] += rate          # nominal contribution (as before)
-                save += rate
+                state.wedding_fund[i] += rate * dep_f  # deposit earns partial-year growth
+                save += rate                           # cash saved (reported nominal)
             elif age == _WEDDING_AGE:
                 spend += state.wedding_fund[i]         # wedding paid from the accrued fund
                 state.wedding_fund[i] = 0.0
@@ -2010,16 +2037,23 @@ class ProjectionEngine:
         col = self._plan.college
         inv = self._plan.investments
 
-        ret_bal  = state.retirement_balance * (1 + mkt) + k401 + partner_k401
+        # Deposits made during the year earn a partial year of return under sub-annual
+        # compounding; dep_f scales them (1.0 when compounding is annual). The starting
+        # balance always grows by exactly (1 + rate) — see _deposit_growth_factor.
+        period = inv.compounding_period_months
+        dep_f  = _deposit_growth_factor(mkt, period)
+
+        ret_bal  = state.retirement_balance * (1 + mkt) + (k401 + partner_k401) * dep_f
         # HSA grows, takes this year's contribution, then pays qualified medical
         # (capped at balance by the caller, so this stays >= 0).
-        hsa_bal  = state.hsa_balance * (1 + mkt) + hsa - hsa_medical_paid
+        hsa_bal  = state.hsa_balance * (1 + mkt) + hsa * dep_f - hsa_medical_paid
 
         r529_growth = (
             col.early_529_return if year <= col.glide_path_years else col.late_529_return
         ) if col else mkt
         col529_bal = max(0.0,
-            state.college_529_balance * (1 + r529_growth) + annual_529_save - drawdown_529
+            state.college_529_balance * (1 + r529_growth)
+            + annual_529_save * _deposit_growth_factor(r529_growth, period) - drawdown_529
         )
 
         # --- Cash buffer ---
@@ -2030,10 +2064,14 @@ class ProjectionEngine:
         current_buf  = state.cash_buffer
 
         # --- Roth IRA balance (grows at market rate, basis tracks contributions) ---
-        roth_bal   = state.roth_ira_balance * (1 + mkt) + roth_contrib
+        # The balance grows the deposit; the basis records dollars actually put in.
+        roth_bal   = state.roth_ira_balance * (1 + mkt) + roth_contrib * dep_f
         roth_basis = state.roth_contribution_basis + roth_contrib
 
-        brok_grown = state.brokerage_balance * (1 + mkt) + brokerage_earmark
+        brok_grown = state.brokerage_balance * (1 + mkt) + brokerage_earmark * dep_f
+        # Partial-year growth on brokerage deposits is unrealized gain (basis is the
+        # dollars deposited, value is deposit·dep_f); track it alongside balance growth.
+        brok_deposit_gain = brokerage_earmark * (dep_f - 1.0)
         taxable_withdrawal = withdrawal_tax = brokerage_withdrawal = roth_withdrawal = 0.0
 
         if breathing_room >= 0:
@@ -2042,7 +2080,8 @@ class ProjectionEngine:
             new_buffer = current_buf + topup
             investable = breathing_room - topup
             if inv.auto_invest_surplus:
-                brok_bal   = brok_grown + investable
+                brok_bal   = brok_grown + investable * dep_f
+                brok_deposit_gain += investable * (dep_f - 1.0)
                 uninvested = 0.0
             else:
                 brok_bal   = brok_grown
@@ -2077,11 +2116,12 @@ class ProjectionEngine:
             brokerage_withdrawal = reductions["brokerage"]
             brok_bal    = brok_grown - reductions["brokerage"] - shortfall
 
-        # Track cumulative unrealized capital gains: only market appreciation (not
-        # contributions or withdrawals) creates a gain. Cash flows change value and
-        # basis equally, so they leave gains untouched. Capped at the balance so a
-        # large withdrawal effectively realizes gains (approximates sell-to-spend).
-        brok_gain = max(0.0, state.brokerage_balance) * mkt
+        # Track cumulative unrealized capital gains: market appreciation on the
+        # starting balance, plus the partial-year growth earned by this year's
+        # deposits (their basis is the dollars paid in). Contributions/withdrawals
+        # otherwise move value and basis together, leaving gains untouched. Capped at
+        # the balance so a large withdrawal effectively realizes gains.
+        brok_gain = max(0.0, state.brokerage_balance) * mkt + brok_deposit_gain
         brokerage_gains = max(0.0, min(state.brokerage_gains + brok_gain, brok_bal))
 
         return _Growth(ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer,

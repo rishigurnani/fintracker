@@ -458,6 +458,15 @@ class InvestmentProfile:
     # the buffer is intentional and maintained even when auto_invest_surplus=True.
     cash_buffer_months: float = 0.0
 
+    # Compounding granularity for investment growth, in months (12 = annual, the
+    # default and the historical behaviour; 1 = monthly; 3/6 = quarterly/semiannual;
+    # 0.5 = twice-monthly; >12 = coarser than annual). Annual rates are converted
+    # geometrically — rate_period = (1 + annual)^(period/12) − 1 — so the starting
+    # balance always grows by exactly (1 + annual); the period only changes how much
+    # a year's DEPOSITS (contributions and swept surplus) grow, since they are
+    # dollar-cost-averaged across the sub-periods instead of added as a year-end lump.
+    compounding_period_months: float = 12.0
+
     # Starting Roth IRA balance (if you already have one)
     current_roth_ira_balance: float = 0.0
 

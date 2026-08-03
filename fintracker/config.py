@@ -168,6 +168,7 @@ _INVESTMENTS_SPEC = [
     ("capital_gains_tax_rate", float, 0.0),
     ("retirement_capital_gains_tax_rate", _opt(float), None),
     ("cash_buffer_months", float, 0.0),
+    ("compounding_period_months", float, 12.0),
     ("current_roth_ira_balance", float, 0.0),
 ]
 
