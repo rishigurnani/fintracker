@@ -174,6 +174,22 @@ def _wd(obj, attr, fallback, cast=None):
     return cast(val) if cast else val
 
 
+def _seed(key: str, default):
+    """Seed a widget's session_state value *once*, then return the key so the
+    widget can own its state via ``key=`` (stable identity) instead of a
+    ``value=``/``index=`` default.
+
+    The sidebar's ``value=`` defaults are read from ``loaded_plan``, which is only
+    written at the *end* of build_sidebar — so on the rerun that commits an edit,
+    the default still holds the previous value and Streamlit reverts the widget to
+    it on the first change (it sticks on the second). Keying the widget and seeding
+    its state once removes that one-rerun lag. Config loads clear the ``w_*`` keys
+    (see _load_config_expander) so a freshly loaded plan re-seeds these widgets.
+    """
+    st.session_state.setdefault(key, default)
+    return key
+
+
 def _childcare_phase_inputs(d_cp) -> ChildcareProfile:
     """Render age-based childcare cost inputs and return the profile."""
     st.sidebar.caption(
@@ -198,25 +214,24 @@ def _income_section(defaults) -> IncomeProfile:
     st.sidebar.header("💵 Income")
     gross = st.sidebar.number_input(
         "Gross Annual Income  (own rate)",
-        min_value=0, max_value=5_000_000,
-        value=_wd(d_inc, "gross_annual_income", 120_000, int), step=5_000,
+        min_value=0, max_value=5_000_000, step=100,
+        key=_seed("w_gross", _wd(d_inc, "gross_annual_income", 120_000, int)),
     )
     spouse = st.sidebar.number_input(
         "Spouse Gross Income  (own rate)",
-        min_value=0, max_value=5_000_000,
-        value=_wd(d_inc, "spouse_gross_annual_income", 0, int), step=5_000,
+        min_value=0, max_value=5_000_000, step=5_000,
+        key=_seed("w_spouse", _wd(d_inc, "spouse_gross_annual_income", 0, int)),
     )
+    filing_opts = [f.value for f in FilingStatus]
     filing = st.sidebar.selectbox(
-        "Filing Status",
-        options=[f.value for f in FilingStatus],
-        index=[f.value for f in FilingStatus].index(d_inc.filing_status.value) if d_inc else 0,
+        "Filing Status", options=filing_opts,
         format_func=lambda x: x.replace("_", " ").title(),
+        key=_seed("w_filing", d_inc.filing_status.value if d_inc else filing_opts[0]),
     )
     state_options = [s.value for s in State]
     state_val = st.sidebar.selectbox(
-        "State",
-        options=state_options,
-        index=state_options.index(d_inc.state.value) if d_inc else state_options.index("GA"),
+        "State", options=state_options,
+        key=_seed("w_state", d_inc.state.value if d_inc else "GA"),
     )
     other_rate = 0.05
     if state_val == "OTHER":
@@ -1002,7 +1017,14 @@ def _load_config_expander() -> None:
             tmp_path = f.name
         from fintracker.config import load_plan
         try:
-            st.session_state["loaded_plan"] = load_plan(tmp_path)
+            # Only (re)load + re-seed widgets when a *new* file is uploaded, so
+            # edits made after loading a config aren't wiped on every rerun.
+            sig = (uploaded.name, uploaded.size)
+            if st.session_state.get("_cfg_sig") != sig:
+                st.session_state["_cfg_sig"] = sig
+                st.session_state["loaded_plan"] = load_plan(tmp_path)
+                for k in [k for k in st.session_state if k.startswith("w_")]:
+                    del st.session_state[k]  # force keyed widgets to re-seed
             st.success("Config loaded!")
         except Exception as e:
             st.error(f"Error loading config: {e}")
@@ -1866,6 +1888,14 @@ def _mc_liquidity_warning(mc) -> None:
         st.success("✅ **No liquidity risk.** Liquid assets stayed positive in all simulations.")
 
 
+@st.cache_data(show_spinner=False)
+def _cached_monte_carlo(plan, **params):
+    """Memoize the ~5s simulation so re-selecting the Monte Carlo tab with an
+    unchanged plan/params is instant. Keyed on plan + params; only ever called
+    with a fixed seed (unseeded runs bypass this — see call site)."""
+    return ProjectionEngine(plan).run_monte_carlo(**params)
+
+
 def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1885,16 +1915,16 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     # ── Simulation parameters ────────────────────────────────
     p = _mc_simulation_params()
     n_sims = p["n_sims"]
+    params = dict(
+        n_simulations=n_sims, seed=42 if p["mc_seed"] else None,
+        use_historical_returns=p["use_hist"], use_historical_inflation=p["use_hist_inf"],
+        market_return_std=p["mkt_std"], inflation_std=p["inf_std"],
+        salary_growth_std=p["sg_std"],
+    )
     with st.spinner(f"Running {n_sims:,} simulations…"):
-        mc = projection_engine.run_monte_carlo(
-            n_simulations=n_sims,
-            seed=42 if p["mc_seed"] else None,
-            use_historical_returns=p["use_hist"],
-            use_historical_inflation=p["use_hist_inf"],
-            market_return_std=p["mkt_std"],
-            inflation_std=p["inf_std"],
-            salary_growth_std=p["sg_std"],
-        )
+        # Unseeded (non-reproducible) runs bypass the cache so each run reshuffles.
+        mc = (_cached_monte_carlo(plan, **params) if p["mc_seed"]
+              else ProjectionEngine(plan).run_monte_carlo(**params))
 
     # ── Summary KPIs ─────────────────────────────────────────
     mc1, mc2, mc3, mc4 = st.columns(4)
@@ -2088,24 +2118,20 @@ def render_dashboard(plan: FinancialPlan) -> None:
     st.markdown("")
 
     # ── Tabs ─────────────────────────────────────────────────
-    tabs = st.tabs(["📈 Projections", "🎲 Monte Carlo", "💰 Cash Flow", "🏠 Mortgage", "🎯 Tax Strategies"])
-
-    # ── TAB 3: Cash Flow ─────────────────────────────────────
-    with tabs[2]:
-        _tab_cash_flow(plan=plan, tax_result=tax_result, monthly_housing=monthly_housing, monthly_lifestyle=monthly_lifestyle, monthly_breathing=monthly_breathing, mortgage_calc=mortgage_calc)
-
-    with tabs[3]:
-        _tab_mortgage(plan=plan, mortgage_calc=mortgage_calc)
-
-    with tabs[4]:
-        _tab_tax(plan=plan, snapshots=snapshots, strategy_result=strategy_result,
-                 yr1=yr1, tax_result=tax_result, marginal_rate=marginal_rate)
-
-    with tabs[0]:
-        _tab_projections(plan=plan, snapshots=snapshots, projection_engine=projection_engine)
-
-    with tabs[1]:
-        _tab_monte_carlo(plan=plan, snapshots=snapshots, projection_engine=projection_engine)
+    # A segmented control (not st.tabs) so ONLY the active view's body runs each
+    # rerun. st.tabs executes every tab body on every rerun, which forced the ~5s
+    # Monte Carlo simulation to run even while the user was on Projections. Here
+    # the heavy MC only runs when its view is actually selected.
+    tab_renderers = {
+        "📈 Projections":   lambda: _tab_projections(plan=plan, snapshots=snapshots, projection_engine=projection_engine),
+        "🎲 Monte Carlo":   lambda: _tab_monte_carlo(plan=plan, snapshots=snapshots, projection_engine=projection_engine),
+        "💰 Cash Flow":     lambda: _tab_cash_flow(plan=plan, tax_result=tax_result, monthly_housing=monthly_housing, monthly_lifestyle=monthly_lifestyle, monthly_breathing=monthly_breathing, mortgage_calc=mortgage_calc),
+        "🏠 Mortgage":      lambda: _tab_mortgage(plan=plan, mortgage_calc=mortgage_calc),
+        "🎯 Tax Strategies": lambda: _tab_tax(plan=plan, snapshots=snapshots, strategy_result=strategy_result, yr1=yr1, tax_result=tax_result, marginal_rate=marginal_rate),
+    }
+    labels = list(tab_renderers)
+    active = st.segmented_control("View", labels, default=labels[0], label_visibility="collapsed") or labels[0]
+    tab_renderers[active]()
 
 # ─────────────────────────────────────────────────────────────
 # Entry point
