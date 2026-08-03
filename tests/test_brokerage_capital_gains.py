@@ -15,11 +15,14 @@ from fintracker.projections import ProjectionEngine, _after_tax_value
 from tests.builders import make_plan, investments, zero_lifestyle
 
 
-def _sale_plan(cap_gains_inv=0.20, cap_gains_ret=0.0):
+def _sale_plan(cap_gains_inv=0.20, cap_gains_ret=0.0, income=0):
     """Brokerage starts at 100k basis, grows 10%/yr; a 55k expense in year 2 forces
-    a sale of exactly half the account (worth 110k with 10k of gains by then)."""
+    a sale of exactly half the account (worth 110k with 10k of gains by then).
+
+    ``income`` positions the realized gain in the LTCG brackets: 0 leaves it in the
+    0% band; a high figure pushes it to 20%."""
     return make_plan(
-        income=IncomeProfile(0, FilingStatus.SINGLE, State.TEXAS),
+        income=IncomeProfile(income, FilingStatus.SINGLE, State.TEXAS),
         lifestyle=zero_lifestyle(),
         investments=investments(current_liquid_cash=0, current_brokerage_balance=100_000,
                                 annual_market_return=0.10,
@@ -127,35 +130,29 @@ class TestCapitalGainsAtRetirement:
 
 
 class TestPayAsYouGoRealization:
+    """Realized gains are taxed the year of the sale, through the LTCG brackets
+    stacked on that year's ordinary income (not a flat rate)."""
 
-    def test_sale_realizes_prorata_gains_and_taxes_them_that_year(self):
-        # Year 2 sells 55k of a 110k account that holds 10k gains → realizes half
-        # (5k) → 20% tax = 1k, charged the year of the sale.
-        snaps = ProjectionEngine(_sale_plan(cap_gains_inv=0.20)).run_deterministic()
+    def test_sale_is_taxed_in_a_high_income_year(self):
+        # The year-2 sale realizes gains; with high ordinary income they sit in a
+        # taxable LTCG band, so a positive cap-gains tax is charged that year.
+        snaps = ProjectionEngine(_sale_plan(income=600_000)).run_deterministic()
         assert snaps[0].annual_capital_gains_tax == 0.0          # no sale in year 1
-        assert snaps[1].annual_capital_gains_tax == pytest.approx(1_000, abs=1)
+        assert snaps[1].annual_capital_gains_tax > 0
+
+    def test_same_sale_is_untaxed_in_a_zero_income_year(self):
+        # Identical sale, but with no other income the realized gain falls in the
+        # 0% LTCG band → untaxed. That income-sensitivity is the point of real
+        # brackets (the flat rate would have taxed it either way). Exact bracket
+        # math is covered in test_ltcg_brackets.py.
+        snaps = ProjectionEngine(_sale_plan(income=0)).run_deterministic()
+        assert snaps[1].annual_capital_gains_tax == pytest.approx(0.0, abs=1)
 
     def test_realizing_reduces_unrealized_gains_so_no_double_tax(self):
         # After realizing 5k of the 10k gains via the sale, the tracker must drop
         # by that 5k (the rest keeps growing) — the realized gains aren't taxed
         # again by the retirement haircut.
-        snaps = ProjectionEngine(_sale_plan(cap_gains_inv=0.20)).run_deterministic()
-        # Pre-sale year 1: 10k gains. Post-sale (year 2) unrealized gains are the
-        # 5k that survived plus that year's fresh growth — strictly below the
-        # counterfactual with no sale.
-        no_sale = ProjectionEngine(_sale_plan(cap_gains_inv=0.20)).run_deterministic()
+        snaps = ProjectionEngine(_sale_plan()).run_deterministic()
+        no_sale = ProjectionEngine(_sale_plan()).run_deterministic()
         assert snaps[1].brokerage_gains < no_sale[0].brokerage_gains + 6_000
         assert snaps[1].brokerage_gains >= 0.0
-
-    def test_rate_comes_from_investment_profile(self):
-        snaps = ProjectionEngine(_sale_plan(cap_gains_inv=0.20, cap_gains_ret=0.0)).run_deterministic()
-        assert snaps[1].annual_capital_gains_tax == pytest.approx(1_000, abs=1)
-
-    def test_falls_back_to_retirement_profile_rate(self):
-        # InvestmentProfile rate 0 → fall back to RetirementProfile's 20%.
-        snaps = ProjectionEngine(_sale_plan(cap_gains_inv=0.0, cap_gains_ret=0.20)).run_deterministic()
-        assert snaps[1].annual_capital_gains_tax == pytest.approx(1_000, abs=1)
-
-    def test_zero_rate_means_no_realization_tax(self):
-        snaps = ProjectionEngine(_sale_plan(cap_gains_inv=0.0, cap_gains_ret=0.0)).run_deterministic()
-        assert all(s.annual_capital_gains_tax == 0.0 for s in snaps)

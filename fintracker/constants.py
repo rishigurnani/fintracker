@@ -31,6 +31,13 @@ def limit_401k(age: int | None) -> float:
         return LIMIT_401K_CATCHUP
     return LIMIT_401K
 
+# --- Primary-residence capital-gains exclusion (IRC §121) ---
+# Gain on the sale of a primary residence is excluded up to these amounts.
+# NOT inflation-indexed in law (fixed since 1997), so they stay nominal — their
+# real value erodes over a long projection, which is the correct behaviour.
+HOME_SALE_EXCLUSION_SINGLE = 250_000
+HOME_SALE_EXCLUSION_MFJ = 500_000
+
 # --- Roth IRA (2024) ---
 ROTH_IRA_LIMIT = 7_000                     # per person, per year
 ROTH_PHASEOUT_SINGLE = (146_000, 161_000)  # MAGI phase-out (single/HoH)

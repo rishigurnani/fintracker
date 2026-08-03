@@ -31,6 +31,7 @@ import numpy as np
 
 from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
+    HOME_SALE_EXCLUSION_SINGLE, HOME_SALE_EXCLUSION_MFJ,
     irmaa_annual_surcharge, limit_401k,
 )
 from fintracker.finance_math import linear_phaseout, monthly_amortized_payment
@@ -1054,6 +1055,17 @@ class ProjectionEngine:
             equity   = max(0.0, state.home_value - state.mortgage_balance)
             proceeds = equity - state.home_value * ev.seller_closing_cost_rate
             state.brokerage_balance += max(0.0, proceeds)
+            # Capital gain on the sale = amount realised (net of selling costs) minus
+            # the cost basis (home_price_ref = purchase price). The IRC §121 primary-
+            # residence exclusion shelters the first $250k/$500k; the rest is a
+            # long-term gain. Route it through realized_gains_ytd so the existing
+            # cap-gains-tax line taxes it and it also lifts MAGI (→ IRMAA), exactly
+            # like any other realised gain — rather than landing in brokerage untaxed.
+            amount_realized = state.home_value * (1 - ev.seller_closing_cost_rate)
+            gain            = max(0.0, amount_realized - state.home_price_ref)
+            exclusion       = (HOME_SALE_EXCLUSION_MFJ if state.is_married
+                               else HOME_SALE_EXCLUSION_SINGLE)
+            state.realized_gains_ytd += max(0.0, gain - exclusion)
 
         self._fund_purchase(state, new_down + new_price * ev.buyer_closing_cost_rate, ev.year)
 
@@ -1126,9 +1138,16 @@ class ProjectionEngine:
         # them into the brokerage inflow instead of letting them leave the books.
         brokerage_inflow = brokerage_earmark + wedding_save
 
-        # Capital-gains tax on gains realized by this year's brokerage sales
-        # (home/car/wedding/business/one-off drawdowns accrued in realized_gains_ytd).
-        cap_gains_tax = state.realized_gains_ytd * self._cap_gains_rate()
+        # Capital-gains tax on gains realized this year (home sale, plus brokerage
+        # sold to fund purchases — accrued in realized_gains_ytd). Taxed through the
+        # real 0/15/20% LTCG brackets stacked on this year's ordinary taxable income,
+        # so a gain in a low-income year is taxed lightly and a large lumpy gain
+        # reaches 20% automatically — no hand-set flat rate. (The flat
+        # capital_gains_tax_rate now only feeds the retirement-readiness haircut.)
+        tmp_inc, tmp_inv = self._tax_profiles(state, hsa, k401, r529)
+        cap_gains_tax = self._tax.capital_gains_tax(
+            state.realized_gains_ytd, tmp_inc, tmp_inv, p.strategies,
+            num_children=state.num_children, inflation_factor=inf_f)
 
         # HSA pays qualified medical expenses tax-free, which the model previously
         # ignored (the HSA only ever grew, ballooning absurdly). We spend it in
@@ -1434,16 +1453,12 @@ class ProjectionEngine:
 
         return hsa, k401, partner_k401, r529, employer_match
 
-    def _tax_and_credits(
-        self,
-        state: EngineState,
-        year: int,
-        hsa: float,
-        k401: float,
-        r529: float,
-        inf_f: float,
-    ) -> tuple[float, float, TaxResult]:
-        """Returns (effective_tax, aotc_credit, tax_breakdown)."""
+    def _tax_profiles(self, state: EngineState, hsa: float, k401: float, r529: float):
+        """Build the per-year (IncomeProfile, InvestmentProfile) the tax engine needs.
+
+        Shared by the ordinary income-tax call and the capital-gains call so both
+        see the same income, filing status, state, and deductions.
+        """
         p = self._plan
         tmp_inc = IncomeProfile(
             gross_annual_income=state.gross_income,
@@ -1456,6 +1471,20 @@ class ProjectionEngine:
             annual_401k_contribution=k401,
             annual_529_contribution=r529,
         )
+        return tmp_inc, tmp_inv
+
+    def _tax_and_credits(
+        self,
+        state: EngineState,
+        year: int,
+        hsa: float,
+        k401: float,
+        r529: float,
+        inf_f: float,
+    ) -> tuple[float, float, TaxResult]:
+        """Returns (effective_tax, aotc_credit, tax_breakdown)."""
+        p = self._plan
+        tmp_inc, tmp_inv = self._tax_profiles(state, hsa, k401, r529)
         # inf_f inflation-indexes the tax brackets/deductions to this projection
         # year, mirroring the IRS's annual indexing (prevents nominal bracket creep).
         breakdown = self._tax.calculate(tmp_inc, tmp_inv, p.strategies,

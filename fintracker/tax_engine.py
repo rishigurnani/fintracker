@@ -61,6 +61,16 @@ _STANDARD_DEDUCTIONS_2024: dict[FilingStatus, float] = {
     FilingStatus.HEAD_OF_HOUSEHOLD: 21_900,
 }
 
+# Long-term capital-gains bracket breakpoints (2024): (top of 0% band, top of 15%
+# band). Above the second figure the 20% rate applies. These are taxable-income
+# thresholds — a long-term gain is taxed by where it *stacks on top of* ordinary
+# taxable income. Like the ordinary brackets they are inflation-indexed each year.
+_LTCG_BREAKPOINTS_2024: dict[FilingStatus, tuple[float, float]] = {
+    FilingStatus.SINGLE: (47_025, 518_900),
+    FilingStatus.MARRIED_FILING_JOINTLY: (94_050, 583_750),
+    FilingStatus.HEAD_OF_HOUSEHOLD: (63_000, 551_350),
+}
+
 # FICA constants (2024)
 _SS_WAGE_BASE_2024 = 168_600
 _SS_RATE = 0.062
@@ -236,6 +246,16 @@ def _scale_brackets(brackets: list[tuple[float, float]], factor: float) -> list[
     return [(bound * factor, rate) for bound, rate in brackets]
 
 
+def _federal_taxable_income(gross: float, filing_status: FilingStatus,
+                            k401_deduction: float, hsa_deduction: float,
+                            inflation_factor: float = 1.0) -> float:
+    """Ordinary federal taxable income: gross less pre-tax 401k/HSA and the
+    (inflation-indexed) standard deduction. This is the base a long-term capital
+    gain stacks on top of."""
+    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600) * inflation_factor
+    return max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
+
+
 def _federal_income_tax(gross: float, filing_status: FilingStatus,
                         k401_deduction: float, hsa_deduction: float,
                         inflation_factor: float = 1.0) -> float:
@@ -244,10 +264,32 @@ def _federal_income_tax(gross: float, filing_status: FilingStatus,
     Brackets and the standard deduction are inflation-indexed by inflation_factor
     (1.0 = the base tax year).
     """
-    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600) * inflation_factor
-    fed_taxable = max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
+    fed_taxable = _federal_taxable_income(gross, filing_status, k401_deduction,
+                                          hsa_deduction, inflation_factor)
     brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
     return _apply_brackets(fed_taxable, _scale_brackets(brackets, inflation_factor))
+
+
+def _federal_ltcg_tax(gain: float, ordinary_taxable_income: float,
+                      filing_status: FilingStatus, inflation_factor: float = 1.0) -> float:
+    """Federal long-term capital-gains tax via the 0/15/20% brackets.
+
+    The gain occupies the band ``[ordinary_taxable_income, ordinary_taxable_income +
+    gain]``: the slice below the 0% top is untaxed, the slice up to the 15% top is
+    15%, the rest is 20%. Breakpoints are inflation-indexed so a future-year nominal
+    gain is measured against the same *real* thresholds — no forecasting of tax law.
+    """
+    if gain <= 0:
+        return 0.0
+    zero_top, fifteen_top = _LTCG_BREAKPOINTS_2024.get(
+        filing_status, _LTCG_BREAKPOINTS_2024[FilingStatus.SINGLE])
+    t0 = zero_top * inflation_factor
+    t1 = fifteen_top * inflation_factor
+    lo = max(0.0, ordinary_taxable_income)
+    hi = lo + gain
+    in_15 = max(0.0, min(hi, t1) - max(lo, t0))
+    in_20 = max(0.0, hi - max(lo, t1))
+    return in_15 * 0.15 + in_20 * 0.20
 
 
 def _fica_taxes(gross: float, hsa_deduction: float,
@@ -373,6 +415,49 @@ class TaxEngine:
             retirement_401k_deduction=k401_deduction,
             state_529_deduction=state_529_deduction,
         )
+
+    def capital_gains_tax(
+        self,
+        gain: float,
+        income: IncomeProfile,
+        investments: InvestmentProfile,
+        strategies: StrategyToggles,
+        num_children: int = 0,
+        filing_status_override: FilingStatus | None = None,
+        gross_income_override: float | None = None,
+        inflation_factor: float = 1.0,
+    ) -> float:
+        """Long-term capital-gains tax on ``gain``.
+
+        Federal: the 0/15/20% brackets, with the gain stacked on top of ordinary
+        federal taxable income (so a gain realized in a low-income year is taxed
+        lightly, and a large lumpy gain still reaches 20% — both automatically).
+        State: the gain is ordinary income in most states (incl. GA), so it is
+        taxed at the state's marginal rate via the (gross + gain) − (gross)
+        differential. All thresholds are inflation-indexed by ``inflation_factor``.
+        """
+        if gain <= 0:
+            return 0.0
+        filing_status = filing_status_override or income.filing_status
+        gross = gross_income_override if gross_income_override is not None else income.total_gross_income
+        hsa_deduction = investments.annual_hsa_contribution if strategies.maximize_hsa else 0.0
+        k401_deduction = investments.annual_401k_contribution if strategies.maximize_401k else 0.0
+
+        fed_ordinary = _federal_taxable_income(gross, filing_status, k401_deduction,
+                                               hsa_deduction, inflation_factor)
+        federal = _federal_ltcg_tax(gain, fed_ordinary, filing_status, inflation_factor)
+
+        # State treats the gain as ordinary income: marginal tax = state tax on
+        # (ordinary + gain) minus state tax on ordinary alone (the 529 deduction and
+        # everything else cancel in the difference).
+        state_base, _ = _state_income_tax(income, filing_status, gross, k401_deduction,
+                                          hsa_deduction, strategies, investments,
+                                          num_children, inflation_factor)
+        state_with_gain, _ = _state_income_tax(income, filing_status, gross + gain, k401_deduction,
+                                               hsa_deduction, strategies, investments,
+                                               num_children, inflation_factor)
+        state = max(0.0, state_with_gain - state_base)
+        return federal + state
 
     def marginal_rate(
         self,
