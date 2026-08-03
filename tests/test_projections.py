@@ -366,6 +366,7 @@ class TestHealthcareScaling:
             investments=InvestmentProfile(
                 current_liquid_cash=100_000, annual_market_return=0.08,
                 annual_inflation_rate=0.0,   # zero inflation so scaling is isolated
+                annual_healthcare_inflation_rate=0.0,
                 annual_salary_growth_rate=0.0,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
@@ -415,7 +416,8 @@ class TestHealthcareScaling:
             ),
             investments=InvestmentProfile(
                 current_liquid_cash=50_000, annual_market_return=0.0,
-                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                annual_inflation_rate=0.0, annual_healthcare_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             timeline_events=[

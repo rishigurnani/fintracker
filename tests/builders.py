@@ -23,6 +23,7 @@ def investments(**kw) -> InvestmentProfile:
     return InvestmentProfile(**{
         "annual_market_return": 0.0,
         "annual_inflation_rate": 0.0,
+        "annual_healthcare_inflation_rate": 0.0,
         "annual_salary_growth_rate": 0.0,
         **kw,
     })

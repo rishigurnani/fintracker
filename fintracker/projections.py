@@ -31,7 +31,7 @@ import numpy as np
 
 from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
-    limit_401k,
+    irmaa_annual_surcharge, limit_401k,
 )
 from fintracker.finance_math import linear_phaseout, monthly_amortized_payment
 from fintracker.models import (
@@ -58,6 +58,116 @@ _AOTC_PHASEOUT_MFJ_LOW     = 160_000
 _AOTC_PHASEOUT_MFJ_HIGH    = 180_000
 
 _WEDDING_AGE = 26          # age a child's wedding is paid; saving runs through age 25
+
+# Age at which traditional 401k/IRA withdrawals and Roth earnings become
+# penalty-free (IRS 59½, floored to an integer since the model tracks whole-year
+# ages). This is distinct from ``retirement_age`` (when earned income stops and
+# the portfolio de-risks): you can retire before or after becoming penalty-free.
+PENALTY_FREE_AGE = 59
+
+# ---------------------------------------------------------------------------
+# Retirement withdrawal waterfall
+# ---------------------------------------------------------------------------
+# Canonical set of accounts a cash-flow deficit can be funded from, in the
+# fallback order used to append any source a configured order omits. Only
+# ``retirement_401k`` is taxable (ordinary income); the rest are tax-free at the
+# point of withdrawal in this model (brokerage cap-gains are handled elsewhere).
+WITHDRAWAL_SOURCES: tuple[str, ...] = (
+    "cash_buffer", "uninvested_cash", "retirement_401k", "brokerage", "roth_basis",
+)
+
+# Pre-retirement deficits keep the legacy waterfall and never touch the 401k
+# (early-withdrawal penalties): cash → Roth basis → brokerage.
+_PRE_RETIREMENT_ORDER: tuple[str, ...] = (
+    "cash_buffer", "uninvested_cash", "roth_basis", "brokerage",
+)
+
+# Default retirement orders (cash first, Roth basis last); one is chosen from the
+# starting balance mix when StrategyToggles.retirement_withdrawal_order is None.
+_ORDER_BRACKET_FILL: tuple[str, ...] = (
+    "cash_buffer", "uninvested_cash", "retirement_401k", "brokerage", "roth_basis",
+)
+_ORDER_CONVENTIONAL: tuple[str, ...] = (
+    "cash_buffer", "uninvested_cash", "brokerage", "retirement_401k", "roth_basis",
+)
+
+# Lump-sum PURCHASES (down payments, one-off expenses, business, weddings) spend
+# brokerage first — savings earmarked for the purchase — then cash, then (retired
+# only) the 401k, then Roth basis. Uses the same waterfall engine as deficits.
+_PURCHASE_ORDER: tuple[str, ...] = (
+    "brokerage", "cash_buffer", "uninvested_cash", "retirement_401k", "roth_basis",
+)
+
+
+def _complete_order(order, fallback: tuple[str, ...]) -> list[str]:
+    """Sanitise a withdrawal order: keep known keys, then append any omitted
+    source in ``fallback`` order so a deficit can never be left unfunded while a
+    source still has money. Unknown keys are dropped."""
+    seen: list[str] = []
+    for key in order or ():
+        if key in WITHDRAWAL_SOURCES and key not in seen:
+            seen.append(key)
+    for key in fallback:
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _available_sources(cash_buffer: float, uninvested_cash: float, ret_grown: float,
+                       brok_grown: float, roth_basis: float, retired: bool) -> dict:
+    """Post-growth balances a deficit can be funded from, keyed by source.
+
+    The 401k/IRA is only offered once ``retired`` (age ≥ retirement_age); a
+    negative grown brokerage cannot lend, so it is floored at 0 (a genuine
+    shortfall is booked as negative brokerage by the caller).
+    """
+    return {
+        "cash_buffer":     cash_buffer,
+        "uninvested_cash": uninvested_cash,
+        "retirement_401k": ret_grown if retired else 0.0,
+        "brokerage":       max(0.0, brok_grown),
+        "roth_basis":      roth_basis,
+    }
+
+
+def _fund_deficit(available: dict, order, net_deficit: float, wd_tax_rate: float):
+    """Draw ``net_deficit`` net dollars from ``available`` balances in ``order``.
+
+    ``available`` maps each :data:`WITHDRAWAL_SOURCES` key to its balance;
+    ``retirement_401k`` is a *pre-tax* balance whose withdrawals are ordinary
+    income, so covering $1 of deficit consumes $1/(1-t) of it (the tax is grossed
+    up). Every other source is dollar-for-dollar.
+
+    Returns ``(reductions, taxable_withdrawal, withdrawal_tax, shortfall)`` where
+    ``reductions[key]`` is the balance drop for that account, ``taxable_withdrawal``
+    is the pre-tax 401k draw (its MAGI contribution), ``withdrawal_tax`` the tax on
+    it, and ``shortfall`` the deficit left unfunded after every source is exhausted.
+    Pure — it mutates nothing.
+    """
+    reductions = {key: 0.0 for key in available}
+    remaining  = max(0.0, net_deficit)
+    taxable_withdrawal = withdrawal_tax = 0.0
+
+    for key in order:
+        if remaining <= 1e-9:
+            break
+        bal = available.get(key, 0.0)
+        if bal <= 0:
+            continue
+        if key == "retirement_401k" and wd_tax_rate < 1.0:
+            net_capacity = bal * (1.0 - wd_tax_rate)          # net cash this balance can deliver
+            net_drawn    = min(remaining, net_capacity)
+            pre_tax      = net_drawn / (1.0 - wd_tax_rate)    # gross-up for the tax
+            reductions[key]     += pre_tax
+            taxable_withdrawal  += pre_tax
+            withdrawal_tax      += pre_tax - net_drawn
+            remaining           -= net_drawn
+        else:
+            drawn = min(remaining, bal)
+            reductions[key] += drawn
+            remaining       -= drawn
+
+    return reductions, taxable_withdrawal, withdrawal_tax, remaining
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +227,10 @@ class _Growth(NamedTuple):
     roth_balance:    float
     roth_basis:      float
     brokerage_gains: float   # cumulative unrealized gains within `brokerage`
+    taxable_withdrawal: float = 0.0  # pre-tax 401k/IRA drawn to fund a deficit (MAGI)
+    withdrawal_tax:     float = 0.0  # ordinary-income tax on that withdrawal
+    brokerage_withdrawal: float = 0.0  # brokerage drawn to fund a deficit this year
+    roth_withdrawal:      float = 0.0  # Roth (basis + qualified earnings) drawn this year
 
 # ---------------------------------------------------------------------------
 # Engine state — typed, explicit, no loose dicts
@@ -186,6 +300,8 @@ class EngineState:
     # Tracked in state so each year's factor is correct regardless of whether inflation
     # is constant (deterministic) or sampled per-year (Monte Carlo).
     cumulative_inflation: float
+    # Parallel factor for healthcare, which compounds at its own (higher) rate.
+    cumulative_healthcare_inflation: float
 
     # Car loan state — one dict per car
     cars: list[dict]
@@ -197,6 +313,16 @@ class EngineState:
     # Capital gains realized so far this projection year (reset annually); taxed
     # in _compute_year. Populated by sell_brokerage().
     realized_gains_ytd: float
+
+    # Pre-tax 401k/IRA withdrawn to fund lump-sum PURCHASES this year (reset
+    # annually), e.g. a car/home down payment when brokerage+cash are exhausted.
+    # Feeds MAGI/IRMAA and the reported retirement withdrawal, parallel to the
+    # operating-deficit withdrawal. Populated by _fund_purchase().
+    purchase_taxable_wd: float = 0.0
+
+    # Roth drawn to fund lump-sum PURCHASES this year (reset annually), reported
+    # alongside the deficit-path Roth draw. Populated by _fund_purchase().
+    purchase_roth_wd: float = 0.0
 
     @property
     def gross_income(self) -> float:
@@ -239,6 +365,7 @@ class YearlySnapshot:
     annual_parent_care_cost: float
     annual_retirement_contributions: float
     annual_hsa_contributions: float
+    annual_hsa_withdrawal: float           # HSA spent on qualified medical this year
     annual_brokerage_contribution: float
     annual_aotc_credit: float
     annual_car_payment: float
@@ -295,6 +422,31 @@ class YearlySnapshot:
     annual_fica_tax: float = 0.0
     annual_state_tax: float = 0.0
 
+    # Newly-modelled recurring costs (all already included in the aggregate they
+    # belong to — insurance premiums, self-LTC and Medicare are folded into
+    # annual_lifestyle_cost; car operating cost is a separate car outflow). These
+    # break them out for display and testing, mirroring how annual_medical_oop
+    # itemises a slice of the lifestyle bucket.
+    annual_insurance_premiums: float = 0.0   # health + disability + life
+    annual_self_ltc_cost: float = 0.0        # your own long-term care
+    annual_medicare_cost: float = 0.0        # base premium + IRMAA surcharge (65+)
+    annual_car_operating_cost: float = 0.0   # insurance/fuel/maintenance/registration
+
+    # Retirement drawdown: pre-tax 401k/IRA withdrawn to cover a deficit (ordinary
+    # income, the IRMAA MAGI driver) and the ordinary-income tax paid on it.
+    annual_retirement_withdrawal: float = 0.0
+    annual_retirement_withdrawal_tax: float = 0.0
+
+    # Brokerage drawn down to cover a deficit this year (already-taxed dollars).
+    annual_brokerage_withdrawal: float = 0.0
+
+    # Roth drawn this year (basis pre-retirement; basis + earnings once retired,
+    # a qualified tax-free distribution). Deficit- and purchase-path draws combined.
+    annual_roth_withdrawal: float = 0.0
+
+    # Life-insurance death benefit paid into the estate in the year of death (0 otherwise).
+    annual_life_insurance_payout: float = 0.0
+
     def to_todays_dollars(self, nominal: float) -> float:
         """Convert a nominal figure from this projection year into today's dollars."""
         return nominal / self.cumulative_inflation if self.cumulative_inflation else nominal
@@ -306,6 +458,18 @@ class YearlySnapshot:
             + self.college_529_balance + self.home_equity
             + self.hsa_balance + self.uninvested_cash + self.cash_buffer
             + self.business_equity
+        )
+
+    @property
+    def investable_assets(self) -> float:
+        """Investable financial assets (pre-tax) — retirement, HSA, Roth, brokerage,
+        and cash. Excludes home equity, the 529 (earmarked for college), and the
+        business (illiquid). Single source of truth for the retirement-readiness
+        pool and the app's "Total Investable Assets" line, so they cannot diverge.
+        """
+        return (
+            self.retirement_balance + self.hsa_balance + self.roth_ira_balance
+            + self.brokerage_balance + self.uninvested_cash + self.cash_buffer
         )
 
     @property
@@ -324,7 +488,7 @@ class RetirementReadiness:
     on_track: bool
     funded_pct: float
     annual_surplus_or_gap: float
-    desired_income_nominal: float
+    annual_cost_at_retirement: float   # first retirement-year cost of living (nominal)
     social_security_offset: float
 
 
@@ -434,7 +598,7 @@ class ProjectionEngine:
     def run_deterministic(self) -> list[YearlySnapshot]:
         state = self._initial_state()
         snapshots: list[YearlySnapshot] = []
-        for year in range(1, self._plan.projection_years + 1):
+        for year in range(1, self._horizon() + 1):
             self._apply_timeline_events(state, year)
             snap = self._compute_year(state, year)
             snapshots.append(snap)
@@ -473,7 +637,7 @@ class ProjectionEngine:
         """
         rng = np.random.default_rng(seed)
         inv = self._plan.investments
-        years = list(range(1, self._plan.projection_years + 1))
+        years = list(range(1, self._horizon() + 1))
         all_nw:  list[list[float]] = []
         all_liq: list[list[float]] = []   # brokerage balance per sim per year
 
@@ -586,21 +750,16 @@ class ProjectionEngine:
         """
         Returns None when no RetirementProfile is configured.
 
-        Required balance uses a growing annuity — spending inflates at
-        annual_inflation_rate throughout retirement, not just to retirement day.
-        This is the correct model: a retiree spending $290k/yr at age 65 will
-        need roughly $299k at 66, $308k at 67, etc.
+        Required balance = the present value of the ACTUAL projected cost of life
+        after retirement. For every retirement year we take the real modelled
+        outflow (housing + lifestyle + car) net of Social Security, then discount
+        it back to the retirement year at ``expected_post_retirement_return``:
 
-        Formula: PV of growing annuity
-            required = PMT / (r - g) * (1 - ((1+g)/(1+r))^n)
-        where PMT = nominal income needed at retirement start,
-              r   = expected_post_retirement_return,
-              g   = annual_inflation_rate (spending growth in retirement),
-              n   = years_in_retirement.
+            required = Σ_t  max(0, cost_t - ss_t) / (1 + r)^(t - retirement_year)
 
-        Edge cases:
-          r == g : required = PMT * n / (1 + r)   (L'Hôpital limit)
-          r == 0 : required = PMT * n              (no return, no growth help)
+        This tracks the true, non-flat cost curve — mortgage payoff, the spending
+        smile, healthcare inflation, and end-of-life care all flow through — rather
+        than assuming a flat ``desired_annual_income``.
         """
         rp = self._plan.retirement
         if rp is None:
@@ -624,10 +783,7 @@ class ProjectionEngine:
         # Retirement haircut uses the (typically lower) retirement drawdown rate.
         cap_gains  = (capital_gains_rate if capital_gains_rate is not None
                       else self._retirement_cap_gains_rate())
-        projected_pretax = (
-            snap.retirement_balance + snap.hsa_balance + snap.roth_ira_balance
-            + snap.brokerage_balance + snap.uninvested_cash + snap.cash_buffer
-        )
+        projected_pretax = snap.investable_assets
         projected = (
             # 401k/IRA: entire balance is ordinary income on withdrawal.
             _after_tax_value(snap.retirement_balance, snap.retirement_balance, r401k_tax)
@@ -638,22 +794,25 @@ class ProjectionEngine:
             + snap.uninvested_cash + snap.cash_buffer    # Cash: already post-tax
         )
 
-        # Income need at retirement start (nominal dollars)
-        nominal_income = rp.desired_annual_income * (1 + inflation) ** years_to_ret
-        ss_nominal     = rp.estimated_social_security_annual * (1 + inflation) ** years_to_ret
-        income_needed  = max(0.0, nominal_income - ss_nominal)
-
+        # Required nest egg = PV of the ACTUAL projected cost of life after
+        # retirement (housing + lifestyle + car each year), net of Social Security,
+        # discounted back to the retirement year at the post-retirement return.
         r, g, n = rp.expected_post_retirement_return, inflation, rp.years_in_retirement
+        retirement_snaps = [s for s in snapshots if s.year > years_to_ret]
+        required = 0.0
+        for s in retirement_snaps:
+            ss_t     = rp.estimated_social_security_annual * (1 + inflation) ** (s.year - 1)
+            cost_t   = (s.annual_housing_cost + s.annual_lifestyle_cost
+                        + s.annual_car_operating_cost)
+            net_need = max(0.0, cost_t - ss_t)
+            required += net_need / (1 + r) ** (s.year - years_to_ret)
 
-        if r == 0:
-            # No investment return: simple sum, no discounting
-            required = income_needed * n
-        elif abs(r - g) < 1e-9:
-            # r ≈ g: L'Hôpital limit of growing annuity formula
-            required = income_needed * n / (1 + r)
-        else:
-            # Growing annuity: PV = PMT/(r-g) * (1 - ((1+g)/(1+r))^n)
-            required = income_needed / (r - g) * (1 - ((1 + g) / (1 + r)) ** n)
+        # First retirement-year cost + SS at retirement, surfaced in the caption.
+        first_ret = retirement_snaps[0] if retirement_snaps else snap
+        annual_cost_at_retirement = (first_ret.annual_housing_cost
+                                     + first_ret.annual_lifestyle_cost
+                                     + first_ret.annual_car_operating_cost)
+        ss_nominal = rp.estimated_social_security_annual * (1 + inflation) ** years_to_ret
 
         funded_pct  = projected / required if required > 0 else math.inf
         balance_gap = projected - required
@@ -676,7 +835,7 @@ class ProjectionEngine:
             on_track=projected >= required,
             funded_pct=funded_pct,
             annual_surplus_or_gap=annual_gap,
-            desired_income_nominal=nominal_income,
+            annual_cost_at_retirement=annual_cost_at_retirement,
             social_security_offset=ss_nominal,
         )
 
@@ -741,6 +900,7 @@ class ProjectionEngine:
             roth_vested_basis=p.investments.current_roth_ira_balance,
             roth_contrib_queue=[],
             cumulative_inflation=1.0,
+            cumulative_healthcare_inflation=1.0,
             cars=self._init_cars(p.car),
             kid_car_loans=[],
             wedding_fund=[0.0] * p.lifestyle.num_children,
@@ -799,6 +959,8 @@ class ProjectionEngine:
     def _apply_timeline_events(self, state: EngineState, year: int, _amort_cache: Optional[dict] = None) -> None:
         p = self._plan
         state.realized_gains_ytd = 0.0   # reset the year's realized-gains tally
+        state.purchase_taxable_wd = 0.0  # reset the year's purchase-driven 401k draw
+        state.purchase_roth_wd = 0.0     # reset the year's purchase-driven Roth draw
         for ev in p.events_for_year(year):
 
             if ev.marriage:
@@ -844,11 +1006,43 @@ class ProjectionEngine:
 
             # One-off cash
             state.brokerage_balance += ev.extra_one_time_income
-            state.sell_brokerage(ev.extra_one_time_expense)
+            self._fund_purchase(state, ev.extra_one_time_expense, year)
 
             # Home purchase
             if ev.buy_home:
                 self._apply_home_purchase(state, ev, _amort_cache)
+
+        self._apply_auto_retirement(state, year)
+
+    def _apply_auto_retirement(self, state: EngineState, year: int) -> None:
+        """Stop earned income when the primary reaches retirement_age.
+
+        Previously the projection kept paying a growing salary past
+        retirement_age unless a manual stop_working event was added, decoupling
+        the projection from the retirement-readiness view. This fires once, in
+        the year the primary first reaches retirement_age (the crossing year, or
+        year 1 if already at/past it), mirroring a stop_working event for both
+        the primary and — since no separate partner age is modelled — the
+        partner. A later resume_working event still overrides it. No-op unless a
+        RetirementProfile is configured with auto_retire=True.
+        """
+        rp = self._plan.retirement
+        if not rp or not rp.auto_retire:
+            return
+        age = self._age_in_year(year)
+        if age is None or age < rp.retirement_age:
+            return
+        # Only at the crossing (first year age >= retirement_age); afterwards the
+        # is_working=False state persists on its own and must not re-zero income
+        # a resume_working event may have restored.
+        if not (year == 1 or (age - 1) < rp.retirement_age):
+            return
+        if state.is_working:
+            state.is_working = False
+            state.income_primary = 0.0
+        if state.is_partner_working:
+            state.is_partner_working = False
+            state.income_partner = 0.0
 
     def _apply_home_purchase(self, state: EngineState, ev, _amort_cache: Optional[dict] = None) -> None:
         p          = self._plan
@@ -861,7 +1055,7 @@ class ProjectionEngine:
             proceeds = equity - state.home_value * ev.seller_closing_cost_rate
             state.brokerage_balance += max(0.0, proceeds)
 
-        state.sell_brokerage(new_down + new_price * ev.buyer_closing_cost_rate)
+        self._fund_purchase(state, new_down + new_price * ev.buyer_closing_cost_rate, ev.year)
 
         new_hp = HousingProfile(
             home_price=new_price, down_payment=new_down, interest_rate=new_rate,
@@ -898,12 +1092,13 @@ class ProjectionEngine:
     ) -> YearlySnapshot:
         p   = self._plan
         inv = p.investments
-        mkt = market_return_override if market_return_override is not None else inv.annual_market_return
+        mkt = self._investment_return(year, market_return_override)
         inf = inflation_override if inflation_override is not None else inv.annual_inflation_rate
         # cumulative_inflation is the rolling product of (1+rate) for all prior years.
         # Using it directly — rather than (1+this_year_rate)^(year-1) — is correct
         # whether inflation is constant OR varies year-to-year (Monte Carlo).
         inf_f = state.cumulative_inflation
+        hc_f  = state.cumulative_healthcare_inflation
 
         # --- Contributions & tax ---
         hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
@@ -922,10 +1117,10 @@ class ProjectionEngine:
 
         # --- Expenses ---
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
-        lifestyle_cost, medical_oop, parent_care = self._lifestyle(state, inf_f, year)
+        lifestyle_base, medical_oop, parent_care, insurance_premiums, self_ltc = self._lifestyle(state, inf_f, hc_f, year)
         college_gross, drawdown_529, net_college, annual_529_save = self._college(state, year, inf_f, r529)
         wedding_save, wedding_spend = self._weddings(state, year, mkt)
-        car_pmt, car_purchase, car_sale = self._cars(state, year, inf_f)
+        car_pmt, car_purchase, car_sale, car_operating = self._cars(state, year, inf_f)
         brokerage_earmark = inv.annual_brokerage_contribution
         # Wedding savings stay invested in brokerage until the wedding, so route
         # them into the brokerage inflow instead of letting them leave the books.
@@ -935,16 +1130,54 @@ class ProjectionEngine:
         # (home/car/wedding/business/one-off drawdowns accrued in realized_gains_ytd).
         cap_gains_tax = state.realized_gains_ytd * self._cap_gains_rate()
 
-        breathing_room = (
+        # HSA pays qualified medical expenses tax-free, which the model previously
+        # ignored (the HSA only ever grew, ballooning absurdly). We spend it in
+        # RETIREMENT, not as incurred: with maximize_hsa the account is a retirement
+        # health vehicle — you let it compound tax-free while working (paying medical
+        # from income) and draw it down for the large medical/LTC costs of later
+        # life. Out-of-pocket + long-term care are known here and claim the HSA
+        # first; Medicare (which depends on MAGI) claims the remainder inside the
+        # fixed point below. Drawn from the grown, post-contribution HSA and capped
+        # at its balance, so it never goes negative.
+        retired          = self._is_retired(year)
+        hsa_available    = state.hsa_balance * (1 + mkt) + hsa
+        hsa_medical_paid = (min(medical_oop + self_ltc, max(0.0, hsa_available))
+                            if retired else 0.0)
+        hsa_remaining    = max(0.0, hsa_available - hsa_medical_paid) if retired else 0.0
+
+        # Breathing room excluding Medicare (which depends on MAGI, resolved below).
+        # The HSA-funded slice of medical is added back: it is paid from the HSA,
+        # so it does not draw on income or the cash waterfall.
+        base_breathing_room = (
             net_income
             - housing_cost
-            - lifestyle_cost
+            - lifestyle_base
+            + hsa_medical_paid
             - annual_529_save
             - net_college
             - brokerage_inflow
             - car_pmt
+            - car_operating
             - cap_gains_tax
         )
+
+        # Medicare + IRMAA (65+) is a healthcare cost folded into the lifestyle
+        # bucket. IRMAA depends on MAGI, which depends on the 401k/IRA withdrawal
+        # used to fund the retirement deficit, which in turn depends on Medicare
+        # (a spending item) — and the HSA can pay Medicare tax-free, shrinking that
+        # withdrawal and hence MAGI. Resolve the whole loop with a short fixed-point
+        # iteration: each pass previews the withdrawal for the current deficit (net
+        # of the HSA's Medicare payment), recomputes MAGI → Medicare, and stops once
+        # Medicare stabilises (Medicare is tiny next to the IRMAA bracket widths).
+        medicare_cost, hsa_for_medicare = self._solve_medicare(
+            state, year, inf_f, hc_f, mkt, biz_net, base_breathing_room,
+            k401 + biz_solo_401k + employer_match, partner_k401, brokerage_inflow,
+            hsa_remaining,
+        )
+        lifestyle_cost  = lifestyle_base + medicare_cost
+        # The HSA-funded slice of Medicare is added back (paid from the HSA, not cash).
+        breathing_room  = base_breathing_room - medicare_cost + hsa_for_medicare
+        total_hsa_drawn = hsa_medical_paid + hsa_for_medicare
 
         # --- Asset growth ---
         g = self._asset_growth(
@@ -953,9 +1186,16 @@ class ProjectionEngine:
             roth_contrib=roth_contrib,
             roth_basis_available=state.roth_vested_basis,
             annual_expenses=lifestyle_cost + housing_cost,
+            hsa_medical_paid=total_hsa_drawn,
         )
 
-        nw = g.retirement + g.hsa + g.col529 + g.roth_balance + g.brokerage + home_equity + g.uninvested + g.cash_buffer + biz_equity
+        # Life-insurance death benefit: a fixed nominal payout into the estate in
+        # the year the primary dies (the final projected year). Not inflated (level
+        # term coverage) and not spendable income — it lands straight in net worth.
+        life_payout = p.lifestyle.annual_life_insurance_death_benefit if self._is_death_year(year) else 0.0
+
+        nw = (g.retirement + g.hsa + g.col529 + g.roth_balance + g.brokerage + home_equity
+              + g.uninvested + g.cash_buffer + biz_equity + life_payout)
 
         return YearlySnapshot(
             year=year,
@@ -970,6 +1210,7 @@ class ProjectionEngine:
             annual_parent_care_cost=parent_care,
             annual_retirement_contributions=k401 + partner_k401 + employer_match,
             annual_hsa_contributions=hsa,
+            annual_hsa_withdrawal=total_hsa_drawn,
             annual_brokerage_contribution=brokerage_earmark,
             annual_aotc_credit=aotc,
             annual_federal_tax=max(0.0, tax_breakdown.federal_income_tax - aotc),
@@ -1006,6 +1247,19 @@ class ProjectionEngine:
             car_purchase_cost=car_purchase,
             car_sale_proceeds=car_sale,
             cumulative_inflation=inf_f,
+            annual_insurance_premiums=insurance_premiums,
+            annual_self_ltc_cost=self_ltc,
+            annual_medicare_cost=medicare_cost,
+            annual_car_operating_cost=car_operating,
+            annual_retirement_withdrawal=g.taxable_withdrawal + state.purchase_taxable_wd,
+            annual_retirement_withdrawal_tax=(
+                g.withdrawal_tax
+                + state.purchase_taxable_wd * (
+                    p.retirement.retirement_withdrawal_tax_rate if p.retirement else 0.0)
+            ),
+            annual_brokerage_withdrawal=g.brokerage_withdrawal,
+            annual_roth_withdrawal=g.roth_withdrawal + state.purchase_roth_wd,
+            annual_life_insurance_payout=life_payout,
         )
 
     # ------------------------------------------------------------------ #
@@ -1020,6 +1274,99 @@ class ProjectionEngine:
         """
         rp = self._plan.retirement
         return rp.current_age + (year - 1) if rp else None
+
+    def _death_year(self) -> Optional[int]:
+        """Projection year the primary dies (age == life_expectancy_age), or None.
+
+        None when no RetirementProfile or no life_expectancy_age is set. Otherwise
+        the death year *defines the projection endpoint*, whether that is earlier
+        or later than projection_years — so the year-by-year tables always run
+        right through death rather than stopping at an arbitrary horizon.
+        """
+        rp = self._plan.retirement
+        if rp is None or rp.life_expectancy_age is None:
+            return None
+        return max(1, rp.life_expectancy_age - rp.current_age + 1)
+
+    def _horizon(self) -> int:
+        """Number of years to actually project. When a life_expectancy_age is set it
+        governs the endpoint (extending past or truncating projection_years so the
+        projection ends the year the primary dies); otherwise projection_years."""
+        death = self._death_year()
+        return death if death is not None else self._plan.projection_years
+
+    def _is_death_year(self, year: int) -> bool:
+        return year == self._death_year()
+
+    def _is_retired(self, year: int) -> bool:
+        """True once the primary reaches retirement_age (needs a RetirementProfile).
+
+        Marks when earned income stops, the portfolio de-risks, and the HSA switches
+        from accumulating to paying medical. Distinct from :meth:`_is_penalty_free`,
+        which gates penalty-free access to the 401k/IRA and Roth earnings.
+        """
+        rp = self._plan.retirement
+        if rp is None:
+            return False
+        age = self._age_in_year(year)
+        return age is not None and age >= rp.retirement_age
+
+    def _is_penalty_free(self, year: int) -> bool:
+        """True once the primary is past 59½ — when the 401k/IRA and Roth earnings
+        become penalty-free to withdraw, independent of ``retirement_age``.
+
+        Someone who retires early (before 59½) still cannot tap those accounts
+        without penalty; someone past 59½ but still working can. Needs a
+        RetirementProfile for the age basis.
+        """
+        rp = self._plan.retirement
+        if rp is None:
+            return False
+        age = self._age_in_year(year)
+        return age is not None and age >= PENALTY_FREE_AGE
+
+    def _investment_return(self, year: int, override: Optional[float]) -> float:
+        """Single source of truth for this year's investment growth rate.
+
+        A Monte-Carlo ``override`` (a sampled return) always wins. Otherwise the
+        portfolio de-risks at retirement: retired years grow at the
+        RetirementProfile's ``expected_post_retirement_return`` rather than the
+        accumulation-phase ``annual_market_return``. This keeps the year-by-year
+        projection consistent with the retirement-readiness calc, which discounts
+        the cost stream at the same post-retirement rate.
+        """
+        if override is not None:
+            return override
+        rp = self._plan.retirement
+        if rp is not None and self._is_retired(year):
+            return rp.expected_post_retirement_return
+        return self._plan.investments.annual_market_return
+
+    def _default_retirement_order(self) -> list[str]:
+        """Pick a withdrawal order from the starting balance mix.
+
+        A large traditional 401k/IRA relative to the brokerage favours the
+        "bracket-fill" order (draw the 401k before the brokerage) to shrink future
+        RMDs and smooth taxes; otherwise the conventional order spends the
+        already-taxed brokerage first and lets the 401k keep deferring.
+        """
+        inv = self._plan.investments
+        if inv.current_retirement_balance >= inv.current_brokerage_balance:
+            return list(_ORDER_BRACKET_FILL)
+        return list(_ORDER_CONVENTIONAL)
+
+    def _withdrawal_order(self, penalty_free: bool) -> list[str]:
+        """Complete, sanitised source order for funding a deficit this year.
+
+        Before 59½ the 401k is off-limits (penalty), so the pre-retirement order
+        runs; once penalty-free the configured/default retirement order applies and
+        the 401k participates.
+        """
+        if not penalty_free:
+            return _complete_order(_PRE_RETIREMENT_ORDER, _PRE_RETIREMENT_ORDER)
+        configured = self._plan.strategies.retirement_withdrawal_order
+        base = configured if configured else self._default_retirement_order()
+        return _complete_order(base, WITHDRAWAL_SOURCES)
 
     def _cap_gains_rate(self) -> float:
         """Long-term capital-gains rate: InvestmentProfile first, with
@@ -1130,19 +1477,26 @@ class ProjectionEngine:
 
         mc = state.mortgage_calc
         if mc:
-            monthly_pi    = mc.monthly_pi_payment()
             ref           = state.home_price_ref
             monthly_other = (
                 ref * (p.housing.annual_property_tax_rate + p.housing.annual_maintenance_rate)
                 + p.housing.annual_insurance
             ) / 12 * inf_f
-            pmi = (
-                mc._pmi_payment(state.mortgage_balance)
-                if state.mortgage_balance / ref > 0.80 and mc._p.requires_pmi else 0.0
-            )
-            cost = (monthly_pi + monthly_other + pmi) * 12
 
             mortgage_yr   = year - state.mortgage_year_offset
+            # Once the loan term is over the mortgage is paid off: stop charging
+            # P&I (and PMI) and bill only the ongoing carrying costs. Without this
+            # the fixed payment kept being charged for the whole projection.
+            if mortgage_yr > mc._p.loan_term_years:
+                monthly_pi = pmi = 0.0
+            else:
+                monthly_pi = mc.monthly_pi_payment()
+                pmi = (
+                    mc._pmi_payment(state.mortgage_balance)
+                    if state.mortgage_balance / ref > 0.80 and mc._p.requires_pmi else 0.0
+                )
+            cost = (monthly_pi + monthly_other + pmi) * 12
+
             eoy_balance   = state.amort_lookup.get(mortgage_yr, state.mortgage_balance)
             equity        = max(0.0, state.home_value - eoy_balance)
             return cost, equity, state.home_value, eoy_balance
@@ -1156,16 +1510,38 @@ class ProjectionEngine:
         return cost, state.home_value, state.home_value, 0.0
 
     def _lifestyle(
-        self, state: EngineState, inf_f: float, year: int = 1
-    ) -> tuple[float, float, float]:
-        """Returns (annual_lifestyle, medical_oop, parent_care)."""
+        self, state: EngineState, inf_f: float, hc_f: float, year: int = 1
+    ) -> tuple[float, float, float, float, float]:
+        """Returns (annual_lifestyle, medical_oop, parent_care, insurance_premiums, self_ltc).
+
+        ``inf_f`` is the general cumulative-inflation factor; ``hc_f`` is the
+        (typically higher) healthcare factor applied to medical OOP, the health-
+        insurance premium, and your own long-term care.
+        """
         lif = self._plan.lifestyle
 
-        medical     = lif.scaled_medical_oop(state.is_married, state.num_children) * inf_f
+        medical     = lif.scaled_medical_oop(state.is_married, state.num_children) * hc_f
         pets        = state.num_pets * lif.annual_pet_cost * inf_f
         vacation    = lif.annual_vacation * inf_f
         other       = lif.monthly_other_recurring * 12 * inf_f
         parent_care = lif.annual_parent_care_cost * inf_f if state.parent_care_active else 0.0
+
+        # Insurance premiums (see LifestyleProfile). Disability replaces earned
+        # income, so it lapses when you stop working; health (the employee share)
+        # applies while working and pre-Medicare, after which the RetirementProfile
+        # Medicare model takes over; life is charged every year until zeroed.
+        # Only the health share tracks healthcare inflation; disability/life follow
+        # the general rate.
+        age          = self._age_in_year(year)
+        medicare_age = self._plan.retirement.medicare_start_age if self._plan.retirement else 65
+        health       = (lif.annual_health_insurance_premium * hc_f
+                        if state.is_working and (age is None or age < medicare_age) else 0.0)
+        disability   = (lif.annual_disability_insurance_premium if state.is_working else 0.0) * inf_f
+        premiums     = health + disability + lif.annual_life_insurance_premium * inf_f
+
+        # Your own long-term care — age-gated, needs a RetirementProfile for age.
+        self_ltc = (lif.annual_self_ltc_cost * hc_f
+                    if age is not None and age >= lif.self_ltc_start_age else 0.0)
 
         # Childcare: age-bracketed profile takes priority over flat monthly_childcare.
         # Each child's age is computed from their birth year for accurate per-child costs.
@@ -1177,7 +1553,100 @@ class ProjectionEngine:
         else:
             childcare = state.num_children * lif.monthly_childcare * 12 * inf_f
 
-        return medical + pets + childcare + vacation + other + parent_care, medical, parent_care
+        # Retirement "spending smile": scale discretionary spending (vacation,
+        # pets, monthly "other") down in later life. Healthcare, insurance, care,
+        # LTC, and childcare are excluded — they keep tracking inflation/age.
+        smile = (self._plan.retirement.discretionary_spending_factor(age)
+                 if self._plan.retirement else 1.0)
+        discretionary = (pets + vacation + other) * smile
+
+        total = (medical + childcare + parent_care + premiums + self_ltc
+                 + discretionary)
+        return total, medical, parent_care, premiums, self_ltc
+
+    def _magi_for_irmaa(self, state: EngineState, biz_net: float,
+                        taxable_withdrawal: float = 0.0) -> float:
+        """MAGI used to place the household in an IRMAA bracket, in nominal dollars.
+
+        Built from income the engine actually recognises: earned + business
+        income, realised capital gains this year, and the pre-tax 401k/IRA
+        withdrawal used to fund a retirement deficit (ordinary income). In
+        retirement, earned income is ~0 and the withdrawal is the dominant term,
+        so IRMAA now tracks the real taxable draw rather than a proxy.
+        """
+        return (
+            state.gross_income
+            + max(0.0, biz_net)
+            + max(0.0, state.realized_gains_ytd)
+            + max(0.0, taxable_withdrawal)
+            + max(0.0, state.purchase_taxable_wd)   # 401k tapped for a lump-sum purchase
+        )
+
+    def _medicare(self, state: EngineState, year: int, magi: float,
+                  inf_f: float, hc_f: float) -> float:
+        """Annual Medicare cost (base premium + IRMAA surcharge) once age >= start.
+
+        Requires a RetirementProfile (for age and the premium); returns 0 before
+        Medicare age or when no RetirementProfile is configured. A married couple
+        is assumed to enrol together, so both the base premium and the per-person
+        IRMAA surcharge are charged twice. Premium and surcharge dollars grow at
+        the healthcare rate (``hc_f``); the IRMAA bracket thresholds are CPI-indexed
+        at the general rate (``inf_f``), mirroring how the SSA re-indexes them.
+        """
+        rp  = self._plan.retirement
+        age = self._age_in_year(year)
+        if not rp or age is None or age < rp.medicare_start_age:
+            return 0.0
+        enrolled  = 2 if state.is_married else 1
+        base      = rp.annual_medicare_premium * hc_f * enrolled
+        surcharge = irmaa_annual_surcharge(magi, state.is_married, inf_f) * hc_f * enrolled
+        return base + surcharge
+
+    def _solve_medicare(self, state: EngineState, year: int, inf_f: float, hc_f: float,
+                        mkt: float, biz_net: float, base_breathing_room: float,
+                        k401_total: float, partner_k401: float, brokerage_inflow: float,
+                        hsa_remaining: float = 0.0) -> tuple[float, float]:
+        """Medicare cost, resolving the IRMAA↔withdrawal↔Medicare loop.
+
+        Returns ``(medicare_cost, hsa_for_medicare)`` — the Medicare bill and the
+        tax-free slice of it the HSA pays (0 when the HSA is exhausted by earlier
+        medical or the household is not retired).
+
+        Medicare (a spending item) enlarges any retirement deficit, which enlarges
+        the taxable 401k withdrawal that funds it, which raises MAGI and hence
+        IRMAA — and the HSA can pay Medicare tax-free, shrinking that withdrawal.
+        This previews the withdrawal with the *same* waterfall the actual funding
+        uses (so MAGI is self-consistent), nets out the HSA's Medicare payment, and
+        iterates; it converges almost immediately because Medicare is small relative
+        to the IRMAA bracket widths. Below Medicare age it short-circuits with no
+        iteration.
+        """
+        if not self._is_retired(year) and self._medicare(state, year, 0.0, inf_f, hc_f) == 0.0:
+            # Not old enough for Medicare and not tapping the 401k → no feedback.
+            return self._medicare(state, year, self._magi_for_irmaa(state, biz_net), inf_f, hc_f), 0.0
+
+        penalty_free = self._is_penalty_free(year)
+        order    = self._withdrawal_order(penalty_free)
+        wd_rate  = (self._plan.retirement.retirement_withdrawal_tax_rate
+                    if self._plan.retirement else 0.0)
+        ret_grown  = state.retirement_balance * (1 + mkt) + k401_total + partner_k401
+        brok_grown = state.brokerage_balance * (1 + mkt) + brokerage_inflow
+        roth_avail = state.roth_ira_balance if penalty_free else state.roth_vested_basis
+        available  = _available_sources(state.cash_buffer, state.uninvested_cash, ret_grown,
+                                        brok_grown, roth_avail, penalty_free)
+
+        medicare = 0.0
+        for _ in range(6):
+            hsa_for_medicare = min(medicare, hsa_remaining)
+            # HSA pays its slice of Medicare, so only the rest enlarges the deficit.
+            deficit = max(0.0, -(base_breathing_room - medicare + hsa_for_medicare))
+            _, taxable_wd, _, _ = _fund_deficit(available, order, deficit, wd_rate)
+            magi = self._magi_for_irmaa(state, biz_net, taxable_wd)
+            updated = self._medicare(state, year, magi, inf_f, hc_f)
+            if abs(updated - medicare) < 1.0:
+                return updated, min(updated, hsa_remaining)
+            medicare = updated
+        return medicare, min(medicare, hsa_remaining)
 
     def _college(
         self,
@@ -1254,7 +1723,7 @@ class ProjectionEngine:
             elif age == _WEDDING_AGE:
                 spend += state.wedding_fund[i]         # wedding paid from the accrued fund
                 state.wedding_fund[i] = 0.0
-        state.sell_brokerage(spend)                    # fund was held in brokerage
+        self._fund_purchase(state, spend, year)        # fund was held in brokerage
         return save, spend
 
     def _business(
@@ -1280,7 +1749,7 @@ class ProjectionEngine:
 
         # One-time initial investment in start year
         if year == biz.start_year and biz.initial_investment > 0:
-            state.sell_brokerage(biz.initial_investment)
+            self._fund_purchase(state, biz.initial_investment, year)
 
         # Business sale: liquidate equity into brokerage once, then silence permanently.
         if biz.sale_year is not None and year >= biz.sale_year:
@@ -1334,28 +1803,77 @@ class ProjectionEngine:
 
         return net_income, se_tax, biz_equity, solo_k_total
 
+    def _fund_purchase(self, state: EngineState, amount: float, year: int) -> None:
+        """Fund a lump-sum outflow from the full asset waterfall.
+
+        Order: brokerage (realizing gains, as before) → cash buffer → uninvested
+        cash → 401k/IRA (only once retired; grossed up for withdrawal tax) → Roth
+        basis. This prevents a purchase from driving brokerage negative while other
+        accounts still hold money — the bug where a car/home down payment overdrew
+        an empty brokerage into an ever-compounding negative balance despite a large
+        401k. Any 401k draw accrues to ``purchase_taxable_wd`` so it flows into
+        MAGI/IRMAA and the reported withdrawal (same flat-rate tax model as deficit
+        funding). A genuine, all-accounts-exhausted shortfall is booked as negative
+        brokerage (real insolvency), matching the previous last-resort behaviour.
+        """
+        if amount <= 0:
+            return
+        penalty_free = self._is_penalty_free(year)
+        wd_rate = (self._plan.retirement.retirement_withdrawal_tax_rate
+                   if self._plan.retirement else 0.0)
+        # Same pure waterfall engine as operating deficits, on the pre-growth
+        # balances, in the purchase order (brokerage first). _available_sources
+        # gates the 401k to 59½ and floors a negative brokerage at 0. Past 59½ the
+        # whole Roth is qualified; before then only the basis is.
+        roth_avail = state.roth_ira_balance if penalty_free else state.roth_vested_basis
+        available = _available_sources(
+            state.cash_buffer, state.uninvested_cash, state.retirement_balance,
+            state.brokerage_balance, roth_avail, penalty_free,
+        )
+        reductions, taxable_wd, _tax, shortfall = _fund_deficit(
+            available, _PURCHASE_ORDER, amount, wd_rate)
+
+        # Apply the plan to state (brokerage via sell_brokerage so basis/gains stay
+        # consistent; the 401k draw is grossed up inside _fund_deficit).
+        if reductions["brokerage"] > 0:
+            state.sell_brokerage(reductions["brokerage"])
+        state.cash_buffer       -= reductions["cash_buffer"]
+        state.uninvested_cash   -= reductions["uninvested_cash"]
+        state.retirement_balance -= reductions["retirement_401k"]
+        state.purchase_taxable_wd += taxable_wd
+        roth_drawn = reductions["roth_basis"]
+        if roth_drawn > 0:
+            state.roth_ira_balance        = max(0.0, state.roth_ira_balance - roth_drawn)
+            state.roth_contribution_basis = max(0.0, state.roth_contribution_basis - roth_drawn)
+            state.roth_vested_basis       = max(0.0, state.roth_vested_basis - roth_drawn)
+            state.purchase_roth_wd       += roth_drawn
+        # Last resort — every account exhausted: book the shortfall as negative
+        # brokerage (real insolvency), matching the operating-deficit behaviour.
+        if shortfall > 1e-9:
+            state.brokerage_balance -= shortfall
+
     def _finance_purchase(
         self, state: EngineState, nominal_price: float, nominal_down: float,
-        rate: float, term_years: int,
+        rate: float, term_years: int, year: int,
     ) -> tuple[float, float]:
-        """Deduct ``nominal_down`` from brokerage; return (principal, monthly_payment).
+        """Fund ``nominal_down`` from the asset waterfall; return (principal, monthly).
 
         Single home for the "put money down, open a loan" step shared by first
         purchases, replacements, and kids' cars.
         """
-        state.sell_brokerage(nominal_down)
+        self._fund_purchase(state, nominal_down, year)
         principal = max(0.0, nominal_price - nominal_down)
         return principal, self._car_monthly_pi(principal, rate, term_years)
 
     def _cars(
         self, state: EngineState, year: int, inf_f: float
-    ) -> tuple[float, float, float]:
-        """Returns (annual_payment, purchase_cost, sale_proceeds)."""
+    ) -> tuple[float, float, float, float]:
+        """Returns (annual_payment, purchase_cost, sale_proceeds, operating_cost)."""
         car = self._plan.car
         if not car:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
 
-        total_pmt, total_purchase, total_sale = 0.0, 0.0, 0.0
+        total_pmt, total_purchase, total_sale, total_operating = 0.0, 0.0, 0.0, 0.0
 
         for c in state.cars:
             # --- First purchase (explicit first_buy_year mode) ---
@@ -1365,7 +1883,7 @@ class ProjectionEngine:
                     nominal_down = car.down_payment * inf_f
                     principal, monthly = self._finance_purchase(
                         state, car.car_price * inf_f, nominal_down,
-                        car.loan_rate, car.loan_term_years)
+                        car.loan_rate, car.loan_term_years, year)
                     total_purchase += nominal_down
                     c.update(loan_balance=principal, loan_year=1,
                              purchase_year=year, monthly_payment=monthly)
@@ -1383,13 +1901,17 @@ class ProjectionEngine:
                 nominal_down = car.down_payment * inf_f
                 principal, monthly = self._finance_purchase(
                     state, car.car_price * inf_f, nominal_down,
-                    car.loan_rate, car.loan_term_years)
+                    car.loan_rate, car.loan_term_years, year)
                 total_purchase += nominal_down
                 c.update(loan_balance=principal, loan_year=1,
                          purchase_year=year, monthly_payment=monthly)
 
             # --- Annual loan payment ---
             total_pmt += _pay_loan_year(c, car.loan_rate, car.loan_term_years)
+
+            # --- Operating cost (owning the car, independent of the loan) ---
+            # Charged every year the car exists (purchase_year is set above).
+            total_operating += car.annual_operating_cost_per_car * inf_f
 
         # --- Kids' first cars ---
         if car and car.kids_car:
@@ -1413,7 +1935,7 @@ class ProjectionEngine:
                         nominal_price = kc.car_price * inf_f
                         down          = nominal_price * kc.down_payment_pct
                         principal, monthly_pmt = self._finance_purchase(
-                            state, nominal_price, down, kc.loan_rate, kc.loan_term_years)
+                            state, nominal_price, down, kc.loan_rate, kc.loan_term_years, year)
                         total_purchase += down
                         state.kid_car_loans.append({
                             "child_idx":     child_idx,
@@ -1426,7 +1948,7 @@ class ProjectionEngine:
             for loan in state.kid_car_loans:
                 total_pmt += _pay_loan_year(loan, kc.loan_rate, kc.loan_term_years)
 
-        return total_pmt, total_purchase, total_sale
+        return total_pmt, total_purchase, total_sale, total_operating
 
     def _car_old_proceeds(
         self, state: EngineState, car: CarProfile, year: int
@@ -1453,13 +1975,16 @@ class ProjectionEngine:
         roth_contrib: float = 0.0,
         roth_basis_available: float = 0.0,
         annual_expenses: float = 0.0,
+        hsa_medical_paid: float = 0.0,
     ) -> _Growth:
         """Returns named growth result — see _Growth for field docs."""
         col = self._plan.college
         inv = self._plan.investments
 
         ret_bal  = state.retirement_balance * (1 + mkt) + k401 + partner_k401
-        hsa_bal  = state.hsa_balance        * (1 + mkt) + hsa
+        # HSA grows, takes this year's contribution, then pays qualified medical
+        # (capped at balance by the caller, so this stays >= 0).
+        hsa_bal  = state.hsa_balance * (1 + mkt) + hsa - hsa_medical_paid
 
         r529_growth = (
             col.early_529_return if year <= col.glide_path_years else col.late_529_return
@@ -1479,49 +2004,49 @@ class ProjectionEngine:
         roth_bal   = state.roth_ira_balance * (1 + mkt) + roth_contrib
         roth_basis = state.roth_contribution_basis + roth_contrib
 
+        brok_grown = state.brokerage_balance * (1 + mkt) + brokerage_earmark
+        taxable_withdrawal = withdrawal_tax = brokerage_withdrawal = roth_withdrawal = 0.0
+
         if breathing_room >= 0:
+            # Surplus: top up the cash buffer to its floor, then invest the rest.
             topup      = min(breathing_room, max(0.0, buffer_floor - current_buf))
             new_buffer = current_buf + topup
-            investable = breathing_room - topup   # what remains after topping buffer
-        else:
-            # Deficit waterfall (with backdoor Roth):
-            # income already absorbed → cash buffer → uninvested cash →
-            # Roth contribution basis (tax-free) → brokerage (last resort)
-            deficit    = -breathing_room
-            buf_drawn  = min(current_buf, deficit)
-            new_buffer = current_buf - buf_drawn
-            investable = -(deficit - buf_drawn)   # remaining deficit (negative) or 0
-
-        # --- Brokerage / uninvested — Roth basis inserted before brokerage ---
-        if inv.auto_invest_surplus:
-            brok_flow = brokerage_earmark + investable  # investable may be negative
-            if brok_flow < 0 and roth_basis_available > 0:
-                # Draw from Roth contribution basis (5-year rule: only vintages
-                # at least 5 projection years old are penalty-free).
-                roth_drawn = min(roth_basis_available, -brok_flow)
-                roth_bal   = max(0.0, roth_bal   - roth_drawn)
-                roth_basis = max(0.0, roth_basis - roth_drawn)
-                brok_flow  = brok_flow + roth_drawn  # reduce deficit
-            brok_bal   = state.brokerage_balance * (1 + mkt) + brok_flow
-            uninvested = 0.0
-        else:
-            brok_bal = state.brokerage_balance * (1 + mkt) + brokerage_earmark
-            if investable >= 0:
-                uninvested = state.uninvested_cash + investable
+            investable = breathing_room - topup
+            if inv.auto_invest_surplus:
+                brok_bal   = brok_grown + investable
+                uninvested = 0.0
             else:
-                deficit2   = -investable
-                # drain uninvested cash first
-                avail_uninvested = state.uninvested_cash
-                drawn_uninvested = min(avail_uninvested, deficit2)
-                uninvested       = avail_uninvested - drawn_uninvested
-                remaining2       = deficit2 - drawn_uninvested
-                # then Roth basis before brokerage
-                if remaining2 > 0 and roth_basis_available > 0:
-                    roth_drawn = min(roth_basis_available, remaining2)
-                    roth_bal   = max(0.0, roth_bal   - roth_drawn)
-                    roth_basis = max(0.0, roth_basis - roth_drawn)
-                    remaining2 = remaining2 - roth_drawn
-                brok_bal  += -remaining2
+                brok_bal   = brok_grown
+                uninvested = state.uninvested_cash + investable
+        else:
+            # Deficit: fund it from accounts in the configured order. Before
+            # retirement the 401k/IRA is excluded (penalties) and the legacy order
+            # applies; in retirement the 401k participates and is taxed as ordinary
+            # income (grossed up) — see _fund_deficit / _withdrawal_order.
+            penalty_free = self._is_penalty_free(year)
+            order   = self._withdrawal_order(penalty_free)
+            wd_rate = (self._plan.retirement.retirement_withdrawal_tax_rate
+                       if self._plan.retirement else 0.0)
+            # Past 59½ the whole Roth (basis + earnings) is a qualified, tax-free
+            # distribution; before then only the contribution basis is penalty-free,
+            # so earnings stay locked.
+            roth_avail = roth_bal if penalty_free else roth_basis_available
+            available = _available_sources(current_buf, state.uninvested_cash, ret_bal,
+                                           brok_grown, roth_avail, penalty_free)
+            reductions, taxable_withdrawal, withdrawal_tax, shortfall = _fund_deficit(
+                available, order, -breathing_room, wd_rate)
+
+            new_buffer  = current_buf          - reductions["cash_buffer"]
+            uninvested  = state.uninvested_cash - reductions["uninvested_cash"]
+            ret_bal    -= reductions["retirement_401k"]
+            roth_drawn  = reductions["roth_basis"]
+            roth_withdrawal = roth_drawn
+            roth_bal    = max(0.0, roth_bal   - roth_drawn)
+            roth_basis  = max(0.0, roth_basis - roth_drawn)
+            # Any deficit no source could cover shows as a negative brokerage
+            # balance (insolvency), matching the previous last-resort behaviour.
+            brokerage_withdrawal = reductions["brokerage"]
+            brok_bal    = brok_grown - reductions["brokerage"] - shortfall
 
         # Track cumulative unrealized capital gains: only market appreciation (not
         # contributions or withdrawals) creates a gain. Cash flows change value and
@@ -1531,7 +2056,9 @@ class ProjectionEngine:
         brokerage_gains = max(0.0, min(state.brokerage_gains + brok_gain, brok_bal))
 
         return _Growth(ret_bal, hsa_bal, col529_bal, brok_bal, uninvested, new_buffer,
-                       roth_bal, roth_basis, brokerage_gains)
+                       roth_bal, roth_basis, brokerage_gains,
+                       taxable_withdrawal, withdrawal_tax, brokerage_withdrawal,
+                       roth_withdrawal)
 
     # ------------------------------------------------------------------ #
     # State advancement                                                    #
@@ -1589,6 +2116,8 @@ class ProjectionEngine:
         state.roth_vested_basis  += vesting_now
         # Advance cumulative inflation: multiply by this year's rate
         state.cumulative_inflation *= (1 + inf)
+        # Healthcare compounds at its own fixed rate (not the sampled inflation).
+        state.cumulative_healthcare_inflation *= (1 + p.investments.annual_healthcare_inflation_rate)
         state.business_equity     = snap.business_equity
         if self._plan.business and snap.year >= self._plan.business.start_year:
             state.business_revenue *= (1 + self._plan.business.revenue_growth_rate)

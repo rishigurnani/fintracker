@@ -392,6 +392,51 @@ class TestNetWorthIntegrity:
             assert s.home_equity >= 0, f"Year {s.year}: negative equity {s.home_equity:.2f}"
 
 
+class TestMortgagePayoff:
+    """Once the loan term ends, only carrying costs remain — no phantom P&I."""
+
+    def _owned_home_plan(self):
+        # Zero inflation/appreciation so escrow is a clean, constant number.
+        # 15-yr loan; property tax + maintenance + insurance = 400k*2% + 2k = 10k/yr.
+        return FinancialPlan(
+            income=IncomeProfile(200_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=HousingProfile(
+                400_000, 80_000, 0.065, loan_term_years=15,
+                annual_property_tax_rate=0.01, annual_maintenance_rate=0.01,
+                annual_insurance=2_000,
+            ),
+            lifestyle=LifestyleProfile(
+                annual_vacation=0, monthly_other_recurring=0,
+                annual_medical_oop=0, medical_auto_scale=False, num_pets=0,
+            ),
+            investments=InvestmentProfile(
+                current_liquid_cash=1_000_000, annual_market_return=0.0,
+                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                annual_home_appreciation_rate=0.0,
+            ),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            projection_years=17,
+        )
+
+    def test_pi_stops_after_loan_term(self):
+        snaps = ProjectionEngine(self._owned_home_plan()).run_deterministic()
+        by_year = {s.year: s for s in snaps}
+        escrow = 10_000.0  # 400k*(1%+1%) + 2k, zero inflation
+
+        # Final loan year still pays P&I (materially above escrow-only).
+        assert by_year[15].annual_housing_cost > escrow + 1_000
+        assert by_year[15].mortgage_balance == pytest.approx(0.0, abs=1.0)
+
+        # After payoff: carrying costs only, no phantom mortgage payment.
+        assert by_year[16].annual_housing_cost == pytest.approx(escrow)
+        assert by_year[17].annual_housing_cost == pytest.approx(escrow)
+
+    def test_home_equity_is_full_value_after_payoff(self):
+        snaps = ProjectionEngine(self._owned_home_plan()).run_deterministic()
+        s = next(x for x in snaps if x.year == 16)
+        assert s.home_equity == pytest.approx(s.home_value)
+
+
 # ── 7. 529 contributions ──────────────────────────────────────────────────────
 
 class TestFivetwentynine:
@@ -475,7 +520,8 @@ class TestMedicalScaling:
             ),
             investments=InvestmentProfile(
                 current_liquid_cash=500_000, annual_market_return=0.0,
-                annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                annual_inflation_rate=0.0, annual_healthcare_inflation_rate=0.0,
+                annual_salary_growth_rate=0.0,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             timeline_events=[

@@ -40,6 +40,23 @@ lifestyle:
   medical_auto_scale: true        # scales on marriage + per-child
   medical_spouse_multiplier: 1.8  # family plan roughly 80% more than single
   medical_per_child_annual: 1500
+  # Insurance premiums you pay out of take-home (today's dollars, inflated).
+  # health: your share of employer/marketplace premiums — applied while working
+  #   and before Medicare age (RetirementProfile then models Medicare instead).
+  # disability: only relevant while working, so it stops at retirement.
+  # life: charged every year (set to 0 once a term policy lapses).
+  annual_health_insurance_premium: 0
+  annual_disability_insurance_premium: 0
+  annual_life_insurance_premium: 0
+  # Life-insurance death benefit (coverage amount, not a premium). Paid into the
+  # estate/net worth in the year the primary dies (set retirement.life_expectancy_age).
+  # Fixed nominal (level term — NOT inflated); zero it if the policy lapses first.
+  annual_life_insurance_death_benefit: 0
+  # Your own long-term / end-of-life care (parents are annual_parent_care_cost).
+  # Applies once the primary reaches self_ltc_start_age (needs a retirement: block
+  # for age). Today's dollars, inflated.
+  annual_self_ltc_cost: 0
+  self_ltc_start_age: 80
   annual_vacation: 5000
   monthly_other_recurring: 500
   # Parent care: annual cost of supporting aging parents (in-home care,
@@ -66,7 +83,8 @@ investments:
 
   # Economic assumptions
   annual_market_return: 0.08          # 8% nominal (applies to all investment accounts)
-  annual_inflation_rate: 0.03         # 3%
+  annual_inflation_rate: 0.03         # 3% general basket
+  annual_healthcare_inflation_rate: 0.05  # medical/health-premium/self-LTC/Medicare grow faster (~5%)
   annual_salary_growth_rate: 0.04     # primary income growth
   partner_salary_growth_rate: 0.04    # partner income growth (can differ)
   annual_home_appreciation_rate: 0.035
@@ -77,6 +95,18 @@ strategies:
   maximize_401k: true                 # applies 401k pre-tax treatment
   use_roth_ladder: false
   roth_conversion_annual_amount: 0
+  # Order accounts are drawn to cover a retirement deficit (spending > income at
+  # or after retirement_age). Before retirement the 401k/IRA is never touched.
+  # 401k/IRA draws are taxed at retirement.retirement_withdrawal_tax_rate and
+  # count toward Medicare IRMAA. Omit any source and it's appended automatically.
+  # Leave unset (default) to pick automatically from your starting balances:
+  #   large traditional 401k/IRA vs brokerage → draw 401k before brokerage
+  #   ("bracket-fill", shrinks future RMDs); otherwise brokerage before 401k.
+  # retirement_withdrawal_order:
+  #   - cash_buffer
+  #   - retirement_401k      # <- move this after 'brokerage' for conventional order
+  #   - brokerage
+  #   - roth_basis
 
 # ── Retirement Readiness (optional) ───────────────────────────────────────────
 # If present, the Projections tab shows whether your savings are on track.
@@ -106,6 +136,25 @@ retirement:
   # Your estimated Social Security benefit in TODAY'S dollars.
   # Use ssa.gov to get your personalised estimate. Set to 0 to be conservative.
   estimated_social_security_annual: 0
+  # Medicare — modelled as a healthcare cost from medicare_start_age onward.
+  # annual_medicare_premium is the base Part B + Part D premium per enrolled
+  # person (today's dollars); an income-tiered IRMAA surcharge is added on top.
+  medicare_start_age: 65
+  annual_medicare_premium: 2100
+  # Automatic retirement: when true (default), earned income stops at
+  # retirement_age without needing a stop_working timeline event. Set false to
+  # keep earning past retirement_age (model phased retirement via events instead).
+  auto_retire: true
+  # Life expectancy / death age of the primary. When set, it DEFINES the projection
+  # endpoint — the year-by-year tables run right through the year they reach this
+  # age (extending past OR truncating projection_years), then all income, spending,
+  # and drawdowns stop. Bounds end-of-life costs like self-LTC and triggers any
+  # life-insurance death benefit. Omit / null to run exactly projection_years.
+  # life_expectancy_age: 90
+  # Ordinary-income tax rate applied to 401k/IRA withdrawals that fund a
+  # retirement deficit (grossed up so the net still covers spending). Also used
+  # in the retirement-readiness after-tax haircut. Typical: 0.22–0.32.
+  retirement_withdrawal_tax_rate: 0.0
 
 # ── College Costs (optional) ──────────────────────────────────────────────────
 # If present, the engine models college costs per child, draws down 529 balances
@@ -196,3 +245,23 @@ timeline_events:
   # - year: 3
   #   description: "New car"
   #   extra_one_time_expense: 35000
+
+# ── Cars (optional) ───────────────────────────────────────────────────────────
+# Models household car purchases, financing, replacement, and — new — the
+# recurring cost of *owning* each car (insurance, maintenance, fuel,
+# registration) on top of the loan payment. Remove/omit to disable. All dollar
+# amounts are today's dollars, inflated yearly.
+# car:
+#   car_price: 25000
+#   down_payment: 5000
+#   loan_rate: 0.065
+#   loan_term_years: 5
+#   replace_every_years: 10
+#   residual_value: 5000            # received when the old car is sold
+#   hand_down_age: 16               # child age that receives the old car instead
+#   num_cars: 1
+#   # Operating costs, charged per car for every year it exists:
+#   annual_insurance_per_car: 1500
+#   annual_maintenance_per_car: 1000
+#   annual_fuel_per_car: 2000
+#   annual_registration_per_car: 200

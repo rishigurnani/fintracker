@@ -22,7 +22,7 @@ from fintracker.models import (
 from fintracker.tax_engine import TaxEngine, state_display_name
 from fintracker.mortgage import MortgageCalculator
 from fintracker.strategies import StrategyEngine
-from fintracker.projections import ProjectionEngine
+from fintracker.projections import ProjectionEngine, PENALTY_FREE_AGE
 from fintracker.config import load_plan_or_sample, save_plan
 
 # ─────────────────────────────────────────────────────────────
@@ -315,6 +315,45 @@ def _lifestyle_section(defaults) -> LifestyleProfile:
         "Annual Medical OOP  (inflated yearly)", min_value=0, max_value=50_000,
         value=_wd(d_lif, "annual_medical_oop", 3_000, int), step=500,
     )
+    with st.sidebar.expander("🛡️ Insurance premiums & long-term care"):
+        health_prem = st.number_input(
+            "Health insurance premium — your share (annual, inflated)",
+            min_value=0, max_value=60_000,
+            value=_wd(d_lif, "annual_health_insurance_premium", 0, int), step=250,
+            help="Employee/marketplace premium you actually pay. Applied while "
+                 "working and before Medicare age; Medicare takes over after that.",
+        )
+        disability_prem = st.number_input(
+            "Disability insurance premium (annual, inflated)",
+            min_value=0, max_value=20_000,
+            value=_wd(d_lif, "annual_disability_insurance_premium", 0, int), step=100,
+            help="Only charged while working (it replaces earned income).",
+        )
+        life_prem = st.number_input(
+            "Life insurance premium (annual, inflated)",
+            min_value=0, max_value=20_000,
+            value=_wd(d_lif, "annual_life_insurance_premium", 0, int), step=100,
+            help="Charged every year. Set to 0 once a term policy lapses.",
+        )
+        life_benefit = st.number_input(
+            "Life insurance death benefit (coverage)",
+            min_value=0, max_value=10_000_000,
+            value=_wd(d_lif, "annual_life_insurance_death_benefit", 0, int), step=50_000,
+            help="Coverage amount paid into the estate/net worth in the year of death "
+                 "(set a Life expectancy age below). Fixed nominal — not inflated.",
+        )
+        self_ltc = st.number_input(
+            "Your own long-term care cost (annual, inflated)",
+            min_value=0, max_value=500_000,
+            value=_wd(d_lif, "annual_self_ltc_cost", 0, int), step=1_000,
+            help="Your end-of-life / LTC costs (parents are handled separately). "
+                 "Needs a retirement profile for age.",
+        )
+        self_ltc_start_age = st.number_input(
+            "Long-term care starts at age",
+            min_value=50, max_value=110,
+            value=_wd(d_lif, "self_ltc_start_age", 80, int), step=1,
+        )
     vacation = st.sidebar.number_input(
         "Annual Vacation  (inflated yearly)", min_value=0, max_value=100_000,
         value=_wd(d_lif, "annual_vacation", 5_000, int), step=1_000,
@@ -332,6 +371,12 @@ def _lifestyle_section(defaults) -> LifestyleProfile:
         num_pets=int(num_pets),
         annual_pet_cost=float(annual_pet),
         annual_medical_oop=float(medical),
+        annual_health_insurance_premium=float(health_prem),
+        annual_disability_insurance_premium=float(disability_prem),
+        annual_life_insurance_premium=float(life_prem),
+        annual_life_insurance_death_benefit=float(life_benefit),
+        annual_self_ltc_cost=float(self_ltc),
+        self_ltc_start_age=int(self_ltc_start_age),
         annual_vacation=float(vacation),
         monthly_other_recurring=float(other_monthly),
     )
@@ -488,6 +533,11 @@ def _investments_section(defaults) -> InvestmentProfile:
         annual_529_contribution=float(c529),
         annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
         annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
+        annual_healthcare_inflation_rate=float(st.sidebar.slider(
+            "Healthcare Inflation (%)", 0.0, 12.0,
+            _wd(d_inv, "annual_healthcare_inflation_rate", 5.0, lambda v: v * 100), 0.25,
+            help="Applies to medical OOP, the health-insurance premium, your own long-term care, "
+                 "and Medicare premiums + IRMAA. Historically ~5% vs ~3% general.")) / 100,
         annual_salary_growth_rate=float(st.sidebar.slider("Your Salary Growth (%)", 0.0, 15.0,
             _wd(d_inv, "annual_salary_growth_rate", 4.0, lambda v: v * 100), 0.5)) / 100,
         partner_salary_growth_rate=float(st.sidebar.slider("Partner Salary Growth (%)", 0.0, 15.0,
@@ -604,7 +654,43 @@ def _strategies_section(defaults):
     # Contribution schedule — shown only when toggle is ON
     if strategies.use_backdoor_roth:
         investments = _backdoor_roth_inputs(d_inc, roth_annual, roth_schedule, investments)
+
+    strategies = dataclasses.replace(
+        strategies,
+        retirement_withdrawal_order=_withdrawal_order_input(d_str),
+    )
     return strategies, investments
+
+
+# Preset withdrawal orders (cash first, Roth basis last). None ⇒ engine derives
+# from starting balances. Keys must match projections.WITHDRAWAL_SOURCES.
+_WITHDRAWAL_ORDER_PRESETS = {
+    "Auto (from balances)": None,
+    "401k before brokerage (bracket-fill)":
+        ["cash_buffer", "uninvested_cash", "retirement_401k", "brokerage", "roth_basis"],
+    "Brokerage before 401k (conventional)":
+        ["cash_buffer", "uninvested_cash", "brokerage", "retirement_401k", "roth_basis"],
+}
+
+
+def _withdrawal_order_input(d_str):
+    """Retirement withdrawal-order preset selector; returns an order list or None."""
+    labels = list(_WITHDRAWAL_ORDER_PRESETS)
+    current = _wd(d_str, "retirement_withdrawal_order", None)
+    try:
+        idx = list(_WITHDRAWAL_ORDER_PRESETS.values()).index(current)
+    except ValueError:
+        idx = 0  # a custom/unrecognised order falls back to showing "Auto"
+    with st.sidebar.expander("🏦 Retirement withdrawal order"):
+        st.caption(
+            "Which accounts fund spending once you're retired. 401k/IRA draws are "
+            "taxed as ordinary income and count toward Medicare IRMAA. Cash is "
+            "always first, Roth basis last."
+        )
+        choice = st.radio(
+            "Order", labels, index=idx, label_visibility="collapsed",
+        )
+    return _WITHDRAWAL_ORDER_PRESETS[choice]
 
 
 def _car_section(defaults) -> 'CarProfile | None':
@@ -647,6 +733,23 @@ def _car_section(defaults) -> 'CarProfile | None':
             num_cars=st.sidebar.selectbox(
                 "Number of cars", [1, 2, 3],
                 index=(d_car.num_cars - 1) if d_car else 0,
+            ),
+            annual_insurance_per_car=st.sidebar.number_input(
+                "Insurance per car / yr  (inflated yearly)", min_value=0, max_value=20_000,
+                value=_wd(d_car, "annual_insurance_per_car", 1_500, int), step=100,
+                help="Recurring cost of owning each car, on top of the loan payment.",
+            ),
+            annual_maintenance_per_car=st.sidebar.number_input(
+                "Maintenance per car / yr  (inflated yearly)", min_value=0, max_value=20_000,
+                value=_wd(d_car, "annual_maintenance_per_car", 1_000, int), step=100,
+            ),
+            annual_fuel_per_car=st.sidebar.number_input(
+                "Fuel per car / yr  (inflated yearly)", min_value=0, max_value=20_000,
+                value=_wd(d_car, "annual_fuel_per_car", 2_000, int), step=100,
+            ),
+            annual_registration_per_car=st.sidebar.number_input(
+                "Registration per car / yr  (inflated yearly)", min_value=0, max_value=5_000,
+                value=_wd(d_car, "annual_registration_per_car", 200, int), step=50,
             ),
         )
     return car
@@ -1259,6 +1362,38 @@ def _tab_tax(plan, snapshots, strategy_result, yr1, tax_result, marginal_rate=0.
 # ── TAB 1: Projections ───────────────────────────────────
 
 
+# Ages at which tax-advantaged accounts become penalty-free to withdraw, so a
+# retiree's "liquid" assets realistically include them:
+#   59 — traditional 401k/IRA and Roth (≈ the IRS 59½ penalty-free age)
+#   65 — HSA for any purpose (always penalty-free for medical)
+_PENALTY_FREE_RETIREMENT_AGE = PENALTY_FREE_AGE   # shared with the engine's waterfall gate
+_HSA_PENALTY_FREE_AGE = 65
+
+
+def _liquid_assets(plan, snapshots) -> list[float]:
+    """Per-year liquid assets, age-aware — what you could realistically spend.
+
+    Always liquid: brokerage + uninvested cash + cash buffer. Once penalty-free to
+    withdraw, retirement accounts are added: the traditional 401k/IRA at 59½ (net
+    of income tax, since withdrawals are taxable), Roth at 59½ (tax-free), and the
+    HSA at 65 (any-purpose). Without a RetirementProfile there is no age basis, so
+    retirement accounts are never counted.
+    """
+    rp = plan.retirement
+    current_age = rp.current_age if rp else None
+    wd_tax = rp.retirement_withdrawal_tax_rate if rp else 0.0
+    out = []
+    for s in snapshots:
+        liquid = s.brokerage_balance + s.uninvested_cash + s.cash_buffer
+        age = current_age + s.year - 1 if current_age is not None else None
+        if age is not None and age >= _PENALTY_FREE_RETIREMENT_AGE:
+            liquid += s.retirement_balance * (1.0 - wd_tax) + s.roth_ira_balance
+        if age is not None and age >= _HSA_PENALTY_FREE_AGE:
+            liquid += s.hsa_balance
+        out.append(liquid)
+    return out
+
+
 def _projection_income_chart(plan, snapshots, df, projection_engine) -> None:
     """Income vs expenses + balances chart with retirement/Roth/529 overlays."""
     fig_cf = go.Figure()
@@ -1275,7 +1410,8 @@ def _projection_income_chart(plan, snapshots, df, projection_engine) -> None:
         yaxis="y1",
     ))
     fig_cf.add_trace(go.Scatter(
-        x=df["Year"], y=df["Brokerage"], name="Liquid Assets (brokerage + cash, excl. retirement accounts)",
+        x=df["Year"], y=_liquid_assets(plan, snapshots),
+        name="Liquid Assets (brokerage + cash; +401k net-of-tax & Roth at 59½, HSA at 65)",
         line=dict(color="#f59e0b", width=2, dash="dot"),
         yaxis="y2",
         fill="tozeroy",
@@ -1283,12 +1419,10 @@ def _projection_income_chart(plan, snapshots, df, projection_engine) -> None:
     ))
 
     # ── Total investable assets + retirement target ─────────────
-    # Total investable = retirement + HSA + brokerage + cash (all accessible funds).
-    total_investable = [
-        s.retirement_balance + s.hsa_balance + s.roth_ira_balance
-        + s.brokerage_balance + s.uninvested_cash + s.cash_buffer
-        for s in snapshots
-    ]
+    # Total investable = retirement + HSA + Roth + brokerage + cash (all accessible
+    # funds). Uses YearlySnapshot.investable_assets — the same pool the retirement-
+    # readiness calc scores against, so the chart line and the readiness % agree.
+    total_investable = [s.investable_assets for s in snapshots]
     fig_cf.add_trace(go.Scatter(
         x=df["Year"], y=total_investable,
         name="Total Investable Assets (401k + HSA + Roth + brokerage + cash)",
@@ -1383,23 +1517,29 @@ def _projection_income_chart(plan, snapshots, df, projection_engine) -> None:
     st.plotly_chart(fig_cf, width='stretch')
 
 
-def _liquidity_warnings(snapshots) -> None:
-    """Surface negative / low liquid-asset years as an error or warning banner."""
-    negative_years = [s for s in snapshots if s.brokerage_balance < 0]
-    low_years = [s for s in snapshots if 0 <= s.brokerage_balance < 10_000]
+def _liquidity_warnings(plan, snapshots) -> None:
+    """Surface negative / low liquid-asset years as an error or warning banner.
+
+    Liquid assets are age-aware (see _liquid_assets): retirement accounts count
+    only once penalty-free to withdraw, so a retiree funding expenses from a large
+    401k/Roth/HSA is not flagged as illiquid.
+    """
+    pairs = list(zip(snapshots, _liquid_assets(plan, snapshots)))
+    negative_years = [(s, v) for s, v in pairs if v < 0]
+    low_years = [(s, v) for s, v in pairs if 0 <= v < 10_000]
     if negative_years:
-        first = negative_years[0]
-        worst = min(negative_years, key=lambda s: s.brokerage_balance)
+        first, _ = negative_years[0]
+        worst, worst_v = min(negative_years, key=lambda p: p[1])
         st.error(
             f"⚠️ **Liquid assets go negative in Year {first.year}** — "
-            f"worst point is **{fmt_dollar(worst.brokerage_balance)}** in Year {worst.year}. "
+            f"worst point is **{fmt_dollar(worst_v)}** in Year {worst.year}. "
             f"You would need to sell investments, take on debt, or reduce expenses to cover the shortfall."
         )
     elif low_years:
-        first = low_years[0]
+        first, _ = low_years[0]
         st.warning(
             f"⚠️ **Liquid assets fall below $10,000 in Year {first.year}** "
-            f"(lowest: **{fmt_dollar(min(s.brokerage_balance for s in low_years))}**). "
+            f"(lowest: **{fmt_dollar(min(v for _, v in low_years))}**). "
             f"Consider building a larger emergency buffer."
         )
 
@@ -1466,7 +1606,7 @@ def _retirement_readiness_panel(plan, snapshots, projection_engine) -> None:
 
     st.caption(
         f"Retire at age {plan.retirement.retirement_age} (year {rr_panel.years_to_retirement}) · "
-        f"Desired income: {fmt_dollar(rr_panel.desired_income_nominal)}/yr (nominal) · "
+        f"First-year retirement cost: {fmt_dollar(rr_panel.annual_cost_at_retirement)}/yr (nominal) · "
         + (f"SS offset: {fmt_dollar(rr_panel.social_security_offset)}/yr · " if rr_panel.social_security_offset > 0 else "")
         + f"Post-retirement return: {plan.retirement.expected_post_retirement_return:.0%}"
         + (f" · 401k tax {_401k_tax:.0%} · cap gains {_cg_tax:.0%}" if _tax_adjusted else "")
@@ -1538,14 +1678,19 @@ def _projection_data_table(df) -> None:
     with st.expander("📋 Full Year-by-Year Projection Table"):
         # ── Annual Cash Flows (what happened this year) ──────────
         st.markdown("**Annual Cash Flows** — income, costs, and surplus for each year")
-        flow_cols = ["Year", "Gross Income", "Taxes", "Net Income",
-                     "Housing Cost", "Lifestyle Cost", "Breathing Room"]
+        flow_cols = ["Year", "Gross Income", "Taxes", "Net Income", "Housing Cost",
+                     "Lifestyle Cost", "Car Operating", "401k Withdrawal",
+                     "Brokerage Withdrawal", "Roth Withdrawal", "Breathing Room"]
         flow_df = df[flow_cols].copy()
         flow_df["Gross Income"]  = flow_df["Gross Income"].apply(fmt_dollar)
         flow_df["Net Income"]    = flow_df["Net Income"].apply(fmt_dollar)
         flow_df["Taxes"]         = flow_df["Taxes"].apply(fmt_dollar)
         flow_df["Housing Cost"]  = flow_df["Housing Cost"].apply(fmt_dollar)
         flow_df["Lifestyle Cost"]= flow_df["Lifestyle Cost"].apply(fmt_dollar)
+        flow_df["Car Operating"] = flow_df["Car Operating"].apply(fmt_dollar)
+        flow_df["401k Withdrawal"] = flow_df["401k Withdrawal"].apply(fmt_dollar)
+        flow_df["Brokerage Withdrawal"] = flow_df["Brokerage Withdrawal"].apply(fmt_dollar)
+        flow_df["Roth Withdrawal"] = flow_df["Roth Withdrawal"].apply(fmt_dollar)
         flow_df["Breathing Room"]= flow_df["Breathing Room"].apply(
             lambda x: f"{'▲ ' if x >= 0 else '▼ '}{fmt_dollar(x)}"
         )
@@ -1573,7 +1718,11 @@ def _tab_projections(plan, snapshots, projection_engine) -> None:
         "Net Income": s.net_income,
         "Housing Cost": s.annual_housing_cost,
         "Lifestyle Cost": s.annual_lifestyle_cost,
+        "Car Operating": s.annual_car_operating_cost,
         "Breathing Room": s.annual_breathing_room,
+        "401k Withdrawal": s.annual_retirement_withdrawal,
+        "Brokerage Withdrawal": s.annual_brokerage_withdrawal,
+        "Roth Withdrawal": s.annual_roth_withdrawal,
         "Retirement": s.retirement_balance,
         "Brokerage": s.brokerage_balance,
         "Home Equity": s.home_equity,
@@ -1620,7 +1769,7 @@ def _tab_projections(plan, snapshots, projection_engine) -> None:
         )
         st.plotly_chart(fig_br, width='stretch')
 
-    _liquidity_warnings(snapshots)
+    _liquidity_warnings(plan, snapshots)
     _retirement_readiness_panel(plan, snapshots, projection_engine)
     _render_milestones(plan, snapshots)
     _projection_data_table(df)

@@ -57,8 +57,26 @@ def _opt_falsy(cast):
 
 
 def _build(cls, d, spec, **extra):
-    """Instantiate ``cls`` from dict ``d`` using ``spec`` (+ any ``extra`` kwargs)."""
-    kwargs = {name: cast(d.get(name, default)) for name, cast, default, *_ in spec}
+    """Instantiate ``cls`` from dict ``d`` using ``spec`` (+ any ``extra`` kwargs).
+
+    An *omitted* key falls back to the spec default. A key that is *present but
+    blank* in YAML parses as ``None`` — that is almost always a mistake (a stray
+    ``foo:`` line), so for a non-optional field it raises a clear, field-naming
+    error instead of crashing deep inside the cast (e.g. ``float(None)``) or
+    silently defaulting to a value the user never intended. Optional fields (spec
+    default ``None`` + an ``_opt`` cast) legitimately accept ``None`` and pass through.
+    """
+    def value(name, default):
+        if name in d:
+            v = d[name]
+            if v is None and default is not None:
+                raise ValueError(
+                    f"{cls.__name__}.{name} is present but blank in the config — "
+                    f"give it a value (e.g. {default!r}) or remove the line."
+                )
+            return v
+        return default
+    kwargs = {name: cast(value(name, default)) for name, cast, default, *_ in spec}
     kwargs.update(extra)
     return cls(**kwargs)
 
@@ -114,6 +132,12 @@ _LIFESTYLE_SPEC = [
     ("medical_auto_scale", bool, True),
     ("medical_spouse_multiplier", float, 1.8),
     ("medical_per_child_annual", float, 1_500),
+    ("annual_health_insurance_premium", float, 0),
+    ("annual_disability_insurance_premium", float, 0),
+    ("annual_life_insurance_premium", float, 0),
+    ("annual_life_insurance_death_benefit", float, 0),
+    ("annual_self_ltc_cost", float, 0),
+    ("self_ltc_start_age", int, 80),
     ("annual_vacation", float, 5_000),
     ("monthly_other_recurring", float, 500),
     ("annual_parent_care_cost", float, 0),
@@ -135,6 +159,7 @@ _INVESTMENTS_SPEC = [
     ("annual_brokerage_contribution", float, 0),
     ("annual_market_return", float, 0.08),
     ("annual_inflation_rate", float, 0.03),
+    ("annual_healthcare_inflation_rate", float, 0.05),
     ("annual_salary_growth_rate", float, 0.04),
     ("partner_salary_growth_rate", float, 0.04),
     ("annual_home_appreciation_rate", float, 0.035),
@@ -153,6 +178,8 @@ _STRATEGIES_SPEC = [
     ("use_roth_ladder", bool, False),
     ("use_backdoor_roth", bool, False),
     ("roth_conversion_annual_amount", float, 0),
+    # Optional list[str] of account keys; None → engine derives from balances.
+    ("retirement_withdrawal_order", _raw, None),
 ]
 
 _RETIREMENT_SPEC = [
@@ -164,6 +191,14 @@ _RETIREMENT_SPEC = [
     ("estimated_social_security_annual", float, 0),
     ("retirement_withdrawal_tax_rate", float, 0.0),
     ("capital_gains_tax_rate", float, 0.0),
+    ("medicare_start_age", int, 65),
+    ("annual_medicare_premium", float, 2_100),
+    ("auto_retire", bool, True),
+    ("life_expectancy_age", _opt(int), None),
+    ("spending_smile_slowgo_age", int, 75),
+    ("spending_smile_slowgo_factor", float, 0.90),
+    ("spending_smile_nogo_age", int, 85),
+    ("spending_smile_nogo_factor", float, 0.80),
 ]
 
 _COLLEGE_SPEC = [
@@ -201,6 +236,10 @@ _CAR_SPEC = [
     ("residual_value", float, 5_000),
     ("hand_down_age", int, 16),
     ("num_cars", int, 1),
+    ("annual_insurance_per_car", float, 1_500),
+    ("annual_maintenance_per_car", float, 1_000),
+    ("annual_fuel_per_car", float, 2_000),
+    ("annual_registration_per_car", float, 200),
 ]
 
 _KID_CAR_SPEC = [

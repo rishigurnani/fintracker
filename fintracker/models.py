@@ -201,6 +201,34 @@ class LifestyleProfile:
     medical_spouse_multiplier: float = 1.8   # family plan ~80% more than single
     medical_per_child_annual: float = 1_500  # paediatric OOP per child
 
+    # Insurance premiums (today's dollars, inflated yearly). These are the
+    # recurring premiums a W-2 household actually pays out of take-home — the
+    # projection previously ignored them, overstating take-home.
+    #   * health: the employee's share of employer-sponsored (or marketplace)
+    #     premiums. Applied while working and before Medicare eligibility; at
+    #     Medicare age it is superseded by RetirementProfile's Medicare model.
+    #   * disability: replaces earned income if you can't work — only relevant
+    #     while working, so it stops at retirement.
+    #   * life: applied every year (zero it out when a term policy lapses).
+    annual_health_insurance_premium: float = 0.0
+    annual_disability_insurance_premium: float = 0.0
+    annual_life_insurance_premium: float = 0.0
+
+    # Life-insurance death benefit (coverage amount, not a premium). Paid into the
+    # estate/net worth in the year the primary dies — see RetirementProfile's
+    # life_expectancy_age. A FIXED nominal amount (level term policies do not
+    # inflation-adjust), so it is NOT scaled by inflation. Zero it if your term
+    # policy will have lapsed by then. Only pays out when life_expectancy_age is
+    # reached within the projection horizon.
+    annual_life_insurance_death_benefit: float = 0.0
+
+    # Your own long-term / end-of-life care (parallel to annual_parent_care_cost,
+    # which covers your parents). Age-gated: applies once the primary reaches
+    # self_ltc_start_age. Needs a RetirementProfile for age; without one it is
+    # never applied. Today's dollars, inflated yearly.
+    annual_self_ltc_cost: float = 0.0
+    self_ltc_start_age: int = 80
+
     annual_vacation: float = 0.0
     monthly_other_recurring: float = 0.0
 
@@ -223,6 +251,9 @@ class LifestyleProfile:
             self.monthly_childcare * 12
             + self.annual_pet_cost
             + self.annual_medical_oop
+            + self.annual_health_insurance_premium
+            + self.annual_disability_insurance_premium
+            + self.annual_life_insurance_premium
             + self.annual_vacation
             + self.monthly_other_recurring * 12
             + self.annual_parent_care_cost
@@ -378,6 +409,14 @@ class InvestmentProfile:
     # Economic assumptions
     annual_market_return: float = 0.08
     annual_inflation_rate: float = 0.03
+    # Healthcare inflates faster than the general basket (historically ~5% vs ~3%),
+    # so medical costs get their own rate: out-of-pocket medical, the health-
+    # insurance premium share, your own long-term care, and Medicare premiums +
+    # IRMAA surcharges all compound at this rate instead of annual_inflation_rate.
+    # (IRMAA *bracket thresholds* stay CPI-indexed at annual_inflation_rate, as the
+    # SSA re-indexes them.) Disability/life premiums and every non-medical cost use
+    # the general rate. Applied at a fixed rate even in Monte Carlo runs.
+    annual_healthcare_inflation_rate: float = 0.05
     annual_salary_growth_rate: float = 0.04
     partner_salary_growth_rate: float = 0.04
     annual_home_appreciation_rate: float = 0.035
@@ -461,6 +500,23 @@ class StrategyToggles:
     # Withdrawal waterfall: income → cash → Roth basis → brokerage.
     use_backdoor_roth: bool = False
 
+    # Order in which accounts are drawn to cover a *retirement* cash-flow deficit
+    # (a year at/after retirement_age where spending exceeds income). Before
+    # retirement the legacy waterfall (cash → Roth basis → brokerage) is used and
+    # the 401k/IRA is never touched. Valid keys (see projections.WITHDRAWAL_SOURCES):
+    #   "cash_buffer", "uninvested_cash", "retirement_401k", "brokerage", "roth_basis"
+    # 401k/IRA withdrawals are taxed as ordinary income at
+    # RetirementProfile.retirement_withdrawal_tax_rate (grossed up so the net still
+    # funds the deficit) and count toward MAGI for Medicare IRMAA.
+    # Any valid source omitted from the list is appended (so nothing is left
+    # unspendable); unknown keys are ignored.
+    # When None (default), the engine picks the order from the starting balances:
+    #   * a large traditional 401k/IRA relative to the brokerage → "bracket-fill"
+    #     (draw 401k before brokerage) to shrink future RMDs and smooth taxes;
+    #   * otherwise the conventional order (spend brokerage before the 401k).
+    # Cash is always drawn first and Roth basis is preserved for last.
+    retirement_withdrawal_order: Optional[list] = None  # list[str]
+
 
 # ---------------------------------------------------------------------------
 # Optional plan extensions
@@ -490,9 +546,60 @@ class RetirementProfile:
     retirement_withdrawal_tax_rate: float = 0.0   # applied to 401k/IRA balance
     capital_gains_tax_rate: float = 0.0           # applied to brokerage balance
 
+    # Medicare — modelled as a recurring healthcare cost once the primary reaches
+    # medicare_start_age. annual_medicare_premium is the base Part B + Part D
+    # premium per enrolled person (today's dollars, inflated). On top of the base,
+    # an income-tiered IRMAA surcharge is applied (see constants.irmaa_annual_surcharge).
+    # A married couple is assumed to enrol together (both pay), a simplification
+    # consistent with the engine modelling no separate partner age.
+    medicare_start_age: int = 65
+    annual_medicare_premium: float = 2_100.0   # ~Part B ($1,750) + Part D (~$350) base
+
+    # Automatic retirement: when True (default), earned income stops at
+    # retirement_age without needing a manual stop_working timeline event, which
+    # previously left the projection paying a growing salary into retirement.
+    # Only takes effect when a RetirementProfile is configured; set False to keep
+    # earning past retirement_age (e.g. to model phased/partial retirement via
+    # explicit timeline events instead).
+    auto_retire: bool = True
+
+    # Life expectancy / death age (the primary's). When set, it *defines the
+    # projection endpoint*: the projection runs through the year the primary
+    # reaches this age — extending past OR truncating projection_years — and then
+    # all income, spending, and drawdowns stop. This makes the year-by-year tables
+    # run right through death, naturally bounds end-of-life costs like self-LTC
+    # (which otherwise charge to the horizon), and marks the year any life-insurance
+    # death benefit pays into the estate. None (default) keeps the legacy
+    # behaviour: run exactly projection_years.
+    life_expectancy_age: Optional[int] = None
+
+    # Retirement "spending smile". Empirically, retirees' real discretionary
+    # spending declines with age (the go-go / slow-go / no-go years). This scales
+    # ONLY discretionary lifestyle (vacation, pets, monthly "other") by the
+    # primary's age — never medical, Medicare, insurance, care, or LTC costs,
+    # which keep inflating. Defaults model full spend through 74, then −10% for
+    # 75–84 and −20% at 85+. Set both factors to 1.0 to disable the smile.
+    spending_smile_slowgo_age: int = 75      # start of the −10% ("slow-go") band
+    spending_smile_slowgo_factor: float = 0.90
+    spending_smile_nogo_age: int = 85        # start of the −20% ("no-go") band
+    spending_smile_nogo_factor: float = 0.80
+
     @property
     def years_to_retirement(self) -> int:
         return max(0, self.retirement_age - self.current_age)
+
+    def discretionary_spending_factor(self, age: Optional[int]) -> float:
+        """Retirement-smile multiplier on discretionary lifestyle for a given age.
+
+        Returns 1.0 when age is unknown or below the slow-go threshold.
+        """
+        if age is None:
+            return 1.0
+        if age >= self.spending_smile_nogo_age:
+            return self.spending_smile_nogo_factor
+        if age >= self.spending_smile_slowgo_age:
+            return self.spending_smile_slowgo_factor
+        return 1.0
 
 
 @dataclass
@@ -615,6 +722,25 @@ class CarProfile:
     # e.g. [3, 5] means Car 1 bought in yr 3, Car 2 in yr 5.
     # Length must equal num_cars.  None = use legacy stagger (yr 1, yr 0, ...).
     first_purchase_years: Optional[list[int]] = None
+
+    # Operating costs — the recurring cost of *owning* a car, on top of the loan
+    # payment (which is the only cost the engine previously modelled). Applied
+    # per household car for every year the car exists. Today's dollars, inflated
+    # yearly. Kids' cars are not charged operating costs (kept out of scope).
+    annual_insurance_per_car: float = 1_500.0
+    annual_maintenance_per_car: float = 1_000.0
+    annual_fuel_per_car: float = 2_000.0
+    annual_registration_per_car: float = 200.0
+
+    @property
+    def annual_operating_cost_per_car(self) -> float:
+        """Total yearly cost to run one car (insurance + maintenance + fuel + reg)."""
+        return (
+            self.annual_insurance_per_car
+            + self.annual_maintenance_per_car
+            + self.annual_fuel_per_car
+            + self.annual_registration_per_car
+        )
 
 
 # ---------------------------------------------------------------------------

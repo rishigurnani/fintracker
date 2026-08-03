@@ -30,22 +30,30 @@ def _base_plan(**overrides) -> FinancialPlan:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestRetirementReadiness:
+    """The required nest egg is the PV of the ACTUAL projected retirement costs
+    (housing + lifestyle + car), not a flat desired-income figure. These plans
+    rent at a known, flat rate so the retirement cost stream — and thus the target
+    — is exact and easy to reason about."""
 
-    def _plan_with_retirement(self, current_age, retirement_age, desired_income,
-                               k401=20_000, ss=0, years=None):
+    def _plan(self, current_age, retirement_age, monthly_rent=2_000, k401=20_000,
+              ss=0, years=None, inflation=0.03, market=0.07, max_401k=False):
         yrs = years or (retirement_age - current_age + 5)
+        strat = StrategyToggles(maximize_hsa=False, maximize_401k=max_401k)
         return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            housing=renting_housing(monthly_rent=monthly_rent, annual_rent_increase_rate=0.0),
             lifestyle=zero_lifestyle(),
             investments=investments(
                 current_liquid_cash=50_000, current_retirement_balance=200_000,
-                annual_401k_contribution=k401, annual_market_return=0.07, annual_inflation_rate=0.03,
+                annual_401k_contribution=k401, annual_market_return=market,
+                annual_inflation_rate=inflation,
             ),
+            strategies=strat,
             projection_years=yrs,
             retirement=RetirementProfile(
                 current_age=current_age,
                 retirement_age=retirement_age,
-                desired_annual_income=desired_income,
+                desired_annual_income=80_000,   # retained field; no longer drives the target
                 years_in_retirement=30,
                 expected_post_retirement_return=0.05,
                 estimated_social_security_annual=ss,
@@ -58,89 +66,78 @@ class TestRetirementReadiness:
         assert engine.compute_retirement_readiness() is None
 
     def test_required_balance_positive(self):
-        plan = self._plan_with_retirement(35, 65, 80_000)
-        rr = ProjectionEngine(plan).compute_retirement_readiness()
+        rr = ProjectionEngine(self._plan(35, 65)).compute_retirement_readiness()
         assert rr.required_balance > 0
 
+    def test_required_balance_is_pv_of_actual_costs(self):
+        """Required = Σ (retirement-year cost) / (1+r)^(t - retirement_year)."""
+        plan = self._plan(35, 65, monthly_rent=2_000, k401=0, market=0.0, inflation=0.0)
+        snaps = ProjectionEngine(plan).run_deterministic()
+        rr = ProjectionEngine(plan).compute_retirement_readiness(snaps)
+        years_to_ret, r = 30, 0.05
+        expected = sum(
+            (s.annual_housing_cost + s.annual_lifestyle_cost + s.annual_car_operating_cost)
+            / (1 + r) ** (s.year - years_to_ret)
+            for s in snaps if s.year > years_to_ret
+        )
+        assert expected > 0
+        assert rr.required_balance == pytest.approx(expected)
+
+    def test_higher_retirement_costs_raise_required(self):
+        low  = ProjectionEngine(self._plan(35, 65, monthly_rent=1_000)).compute_retirement_readiness()
+        high = ProjectionEngine(self._plan(35, 65, monthly_rent=4_000)).compute_retirement_readiness()
+        assert high.required_balance > low.required_balance
+
     def test_on_track_with_high_savings(self):
-        """High 401k contributions over 30 years should put user on track."""
-        plan = self._plan_with_retirement(35, 65, 60_000, k401=30_500)
+        """High 401k contributions over 30 years should easily fund modest costs."""
+        plan = self._plan(35, 65, monthly_rent=1_000, k401=30_500, max_401k=True)
         rr = ProjectionEngine(plan).compute_retirement_readiness()
         assert rr.on_track, f"Expected on track, funded={rr.funded_pct:.1%}"
 
     def test_not_on_track_with_low_savings(self):
-        """Minimal savings over 5 years should not fund 30yr retirement."""
-        plan = self._plan_with_retirement(60, 65, 100_000, k401=5_000, years=5)
+        """Near-retirement, minimal savings, high living costs → underfunded."""
+        plan = self._plan(60, 65, monthly_rent=8_000, k401=1_000, years=20)
         rr = ProjectionEngine(plan).compute_retirement_readiness()
         assert not rr.on_track, f"Expected off track, funded={rr.funded_pct:.1%}"
 
     def test_social_security_reduces_required_balance(self):
-        """SS offset reduces the balance needed to fund retirement."""
-        plan_no_ss = self._plan_with_retirement(35, 65, 80_000, ss=0)
-        plan_with_ss = self._plan_with_retirement(35, 65, 80_000, ss=24_000)
-        rr_no = ProjectionEngine(plan_no_ss).compute_retirement_readiness()
-        rr_ss = ProjectionEngine(plan_with_ss).compute_retirement_readiness()
+        """SS is netted from each year's cost, lowering the required balance."""
+        rr_no = ProjectionEngine(self._plan(35, 65, ss=0, inflation=0.0)).compute_retirement_readiness()
+        rr_ss = ProjectionEngine(self._plan(35, 65, ss=12_000, inflation=0.0)).compute_retirement_readiness()
         assert rr_ss.required_balance < rr_no.required_balance
 
     def test_funded_pct_scales_with_savings(self):
         """More 401k savings → higher projected balance → higher funded_pct.
-        Uses no brokerage/liquid so retirement balance is the only variable
-        and the difference is clearly measurable."""
-        def make(k401):
-            return FinancialPlan(
-                income=IncomeProfile(80_000, FilingStatus.SINGLE, State.TEXAS),
-                housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-                lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                           annual_medical_oop=0, medical_auto_scale=False),
-                investments=InvestmentProfile(
-                    current_liquid_cash=0,
-                    current_retirement_balance=0,
-                    current_brokerage_balance=0,
-                    annual_401k_contribution=k401,
-                    annual_market_return=0.07,
-                    annual_inflation_rate=0.03,
-                    annual_salary_growth_rate=0.0,
-                ),
-                # maximize_401k=True so the contribution earns its tax deduction —
-                # that's the mechanism by which more 401k savings lifts net worth.
-                # (With it False the 401k is offset out of brokerage dollar-for-
-                # dollar and total net worth is identical regardless of amount.)
-                strategies=StrategyToggles(maximize_hsa=False, maximize_401k=True),
-                projection_years=30,
-                retirement=RetirementProfile(
-                    current_age=35, retirement_age=65,
-                    desired_annual_income=80_000,
-                    years_in_retirement=30,
-                    expected_post_retirement_return=0.05,
-                ),
-            )
-        rr_low  = ProjectionEngine(make(1_000)).compute_retirement_readiness()
-        rr_high = ProjectionEngine(make(20_000)).compute_retirement_readiness()
+        (Required is fixed by costs, so only the numerator moves.)"""
+        rr_low  = ProjectionEngine(self._plan(35, 65, k401=1_000, max_401k=True)).compute_retirement_readiness()
+        rr_high = ProjectionEngine(self._plan(35, 65, k401=20_000, max_401k=True)).compute_retirement_readiness()
         assert rr_high.funded_pct > rr_low.funded_pct, (
             f"High savings funded_pct ({rr_high.funded_pct:.4f}) should exceed "
             f"low savings ({rr_low.funded_pct:.4f})"
         )
 
-    def test_desired_income_inflated_to_nominal(self):
-        """Desired income must be inflated from today's dollars to retirement dollars."""
-        plan = self._plan_with_retirement(35, 65, 80_000)
-        rr = ProjectionEngine(plan).compute_retirement_readiness()
-        # 80k * (1.03)^30 >> 80k
-        assert rr.desired_income_nominal > 80_000
+    def test_annual_cost_at_retirement_matches_first_year(self):
+        """The reported cost equals the first retirement year's real outflow."""
+        plan = self._plan(35, 65, monthly_rent=2_000)
+        snaps = ProjectionEngine(plan).run_deterministic()
+        rr = ProjectionEngine(plan).compute_retirement_readiness(snaps)
+        first_ret = next(s for s in snaps if s.year > 30)
+        expected = (first_ret.annual_housing_cost + first_ret.annual_lifestyle_cost
+                    + first_ret.annual_car_operating_cost)
+        assert rr.annual_cost_at_retirement == pytest.approx(expected)
 
     def test_years_to_retirement_correct(self):
-        plan = self._plan_with_retirement(35, 65, 80_000)
-        rr = ProjectionEngine(plan).compute_retirement_readiness()
+        rr = ProjectionEngine(self._plan(35, 65)).compute_retirement_readiness()
         assert rr.years_to_retirement == 30
 
     def test_annual_surplus_positive_when_on_track(self):
-        plan = self._plan_with_retirement(35, 65, 40_000, k401=30_500)
+        plan = self._plan(35, 65, monthly_rent=1_000, k401=30_500, max_401k=True)
         rr = ProjectionEngine(plan).compute_retirement_readiness()
         if rr.on_track:
             assert rr.annual_surplus_or_gap > 0
 
     def test_annual_gap_negative_when_off_track(self):
-        plan = self._plan_with_retirement(60, 65, 200_000, k401=1_000, years=5)
+        plan = self._plan(60, 65, monthly_rent=8_000, k401=1_000, years=20)
         rr = ProjectionEngine(plan).compute_retirement_readiness()
         if not rr.on_track:
             assert rr.annual_surplus_or_gap < 0
@@ -171,77 +168,12 @@ class TestRetirementReadiness:
 
 
 
-    def test_required_balance_uses_growing_annuity(self):
-        """
-        REGRESSION: required_balance must use the growing annuity formula, not
-        a fixed annuity.  A fixed annuity assumes flat spending throughout
-        retirement; a growing annuity inflates spending at annual_inflation_rate
-        each year — the correct model for a real retiree.
-
-        For r=5%, g=3%, n=30, PMT=$194k:
-          Fixed annuity:   PMT * (1-(1+r)^-n)/r
-          Growing annuity: PMT / (r-g) * (1 - ((1+g)/(1+r))^n)
-        The growing annuity target is materially larger.
-        """
-        plan = FinancialPlan(
-            income=IncomeProfile(80_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
-                                       annual_medical_oop=0, medical_auto_scale=False),
-            investments=InvestmentProfile(
-                current_liquid_cash=0, current_retirement_balance=0,
-                annual_401k_contribution=0, annual_market_return=0.0,
-                annual_inflation_rate=0.03, annual_salary_growth_rate=0.0,
-            ),
-            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
-            projection_years=30,
-            retirement=RetirementProfile(
-                current_age=35, retirement_age=65,
-                desired_annual_income=100_000,
-                years_in_retirement=30,
-                expected_post_retirement_return=0.05,
-            ),
-        )
-        rr = ProjectionEngine(plan).compute_retirement_readiness()
-
-        # Manual growing annuity: PMT = 100k*(1.03)^30, r=5%, g=3%, n=30
-        import math
-        pmt = 100_000 * (1.03 ** 30)
-        r, g, n = 0.05, 0.03, 30
-        expected_growing = pmt / (r - g) * (1 - ((1 + g) / (1 + r)) ** n)
-        expected_fixed   = pmt * (1 - (1 + r) ** -n) / r
-
-        assert abs(rr.required_balance - expected_growing) < 1.0, (
-            f"Engine returned {rr.required_balance:,.0f}, "
-            f"expected growing annuity {expected_growing:,.0f}"
-        )
-        assert rr.required_balance > expected_fixed, (
-            f"Growing annuity ({rr.required_balance:,.0f}) should exceed "
-            f"fixed annuity ({expected_fixed:,.0f})"
-        )
-
-    def test_growing_annuity_edge_r_equals_g(self):
-        """When r == g exactly, formula uses L'Hôpital limit: PMT*n/(1+r)."""
-        plan = FinancialPlan(
-            income=IncomeProfile(80_000, FilingStatus.SINGLE, State.TEXAS),
-            housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
-            lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,
-                                       annual_medical_oop=0,medical_auto_scale=False),
-            investments=InvestmentProfile(current_liquid_cash=0,current_retirement_balance=0,
-                                          annual_401k_contribution=0,annual_market_return=0.0,
-                                          annual_inflation_rate=0.04,annual_salary_growth_rate=0.0),
-            strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
-            projection_years=30,
-            retirement=RetirementProfile(current_age=35,retirement_age=65,
-                                          desired_annual_income=50_000,years_in_retirement=20,
-                                          expected_post_retirement_return=0.04),
-        )
-        rr = ProjectionEngine(plan).compute_retirement_readiness()
-        pmt = 50_000 * (1.04**30)
-        expected = pmt * 20 / 1.04
-        assert abs(rr.required_balance - expected) < 1.0, (
-            f"r=g edge case: got {rr.required_balance:,.0f}, expected {expected:,.0f}"
-        )
+    def test_required_tracks_cost_curve_changes(self):
+        """The target responds to the real cost curve: cutting a retirement-era
+        cost (here, rent) lowers the required balance."""
+        cheap = ProjectionEngine(self._plan(35, 65, monthly_rent=2_000)).compute_retirement_readiness()
+        dear  = ProjectionEngine(self._plan(35, 65, monthly_rent=6_000)).compute_retirement_readiness()
+        assert dear.required_balance > cheap.required_balance
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1113,8 +1045,8 @@ class TestCarPurchases:
         s_car  = self._project(plan_car)[0]
         s_none = self._project(plan_none)[0]
         # At yr1: brokerage_car = brokerage_none - 5k_down (same net income, same market return)
-        # Total reduction = down_payment + annual_car_payment (both reduce brokerage)
-        expected_diff = 5_000 + s_car.annual_car_payment
+        # Total reduction = down_payment + loan payment + operating cost (all reduce brokerage)
+        expected_diff = 5_000 + s_car.annual_car_payment + s_car.annual_car_operating_cost
         actual_diff = s_none.brokerage_balance - s_car.brokerage_balance
         assert abs(actual_diff - expected_diff) < 1.0, \
             f"Expected diff {expected_diff:.0f}, got {actual_diff:.0f}"
