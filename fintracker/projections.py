@@ -24,10 +24,19 @@ Internally, each year is processed as:
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+# Monte Carlo runs the independent per-simulation loop across processes once the
+# batch is large enough to amortise process-startup overhead; below this it stays
+# serial (small runs and the test suite skip the pool). Output is identical
+# either way — the sims are independent and the RNG is pre-drawn.
+_MC_PARALLEL_MIN_SIMS = 1000
 
 from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
@@ -735,6 +744,33 @@ def _pay_loan_year(loan: dict, annual_rate: float, term_years: int) -> float:
     return annual_pmt
 
 
+def _mc_context():
+    """Start method for Monte Carlo worker processes.
+
+    macOS/Windows default to ``spawn``, which bootstraps each worker by
+    re-importing the parent's ``__main__`` — under ``streamlit run`` that is the
+    whole app, so every worker re-runs app.py's module-level Streamlit calls
+    (with no runtime → warnings) and re-imports its heavy deps, which wrecks the
+    speedup. ``fork`` inherits the parent's memory instead: no re-import, no app
+    code re-run. The workers here are pure compute (no logging / inherited-lock
+    use), so the usual fork-in-a-threaded-process hazard does not apply. Fall
+    back to ``spawn`` only where ``fork`` is unavailable (e.g. Windows).
+    """
+    if "fork" in mp.get_all_start_methods():
+        return mp.get_context("fork")
+    return mp.get_context("spawn")
+
+
+def _mc_worker(plan, all_mkt, all_inf, all_sg, years, amort_cache):
+    """Top-level (picklable) entry point for a Monte Carlo worker process.
+
+    Rebuilds a fresh engine from the (picklable) plan and runs the ordinary
+    per-sim loop over its slice of the pre-drawn RNG matrices. Kept module-level
+    so it survives the ``spawn`` start method used on macOS.
+    """
+    return ProjectionEngine(plan)._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache)
+
+
 class ProjectionEngine:
     """
     Runs deterministic and Monte Carlo projections for a FinancialPlan.
@@ -750,6 +786,10 @@ class ProjectionEngine:
     def __init__(self, plan: FinancialPlan) -> None:
         self._plan = plan
         self._tax = TaxEngine()
+        # Memoises the (path-independent) present value of future medical bills
+        # by year + the deterministic state inputs it depends on, so the medical-
+        # burden failsafe forecast is computed once instead of once per sim/year.
+        self._pv_medical_cache: dict = {}
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -814,8 +854,6 @@ class ProjectionEngine:
         rng = np.random.default_rng(seed)
         inv = self._plan.investments
         years = list(range(1, self._horizon() + 1))
-        all_nw:  list[list[float]] = []
-        all_liq: list[list[float]] = []   # brokerage balance per sim per year
 
         hist = np.array(_SP500_HISTORICAL_RETURNS)
 
@@ -868,9 +906,79 @@ class ProjectionEngine:
             all_sg = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std,
                                          (n_simulations, n_years)), -0.10, 0.20)
 
-        # Per-failsafe count of sims in which it fired at least once.
+        # Run the independent per-sim loop. For large batches, fan the sims out
+        # across processes (they are independent and the RNG is pre-drawn, so the
+        # combined result is identical to the serial path); otherwise stay serial.
+        n_cpu = os.cpu_count() or 1
+        if n_simulations >= _MC_PARALLEL_MIN_SIMS and n_cpu > 1:
+            bounds = [(k * n_simulations) // n_cpu for k in range(n_cpu + 1)]
+            slices = [(bounds[k], bounds[k + 1]) for k in range(n_cpu) if bounds[k] < bounds[k + 1]]
+            nw_parts, liq_parts, fired_list = [], [], []
+            with ProcessPoolExecutor(max_workers=len(slices), mp_context=_mc_context()) as ex:
+                futures = [
+                    ex.submit(_mc_worker, self._plan,
+                              all_mkt[s:e], all_inf[s:e], all_sg[s:e], years, _amort_cache)
+                    for (s, e) in slices
+                ]
+                for f in futures:                       # gathered in submission order
+                    nw_c, liq_c, fired_c = f.result()
+                    nw_parts.append(nw_c); liq_parts.append(liq_c); fired_list.extend(fired_c)
+            nw_arr = np.vstack(nw_parts); liq_arr = np.vstack(liq_parts)
+        else:
+            nw_arr, liq_arr, fired_list = self._run_sim_rows(
+                all_mkt, all_inf, all_sg, years, _amort_cache)
+
         failsafe_counts: dict[str, int] = {fs.name: 0 for fs in self._plan.failsafes}
-        for sim_idx in range(n_simulations):
+        for fired in fired_list:
+            for name in fired:
+                failsafe_counts[name] += 1
+        failsafe_fire_rates = {name: c / n_simulations for name, c in failsafe_counts.items()}
+
+        # Per-year percentiles / stats, vectorised across sims (axis 0).
+        p_nw = np.percentile(nw_arr, [10, 25, 50, 75, 90], axis=0)
+        p_liq = np.percentile(liq_arr, [10, 50, 90], axis=0)
+        yr10 = nw_arr[:, 9] if nw_arr.shape[1] >= 10 else None
+
+        return MonteCarloResult(
+            years=years,
+            p10_net_worth=[float(x) for x in p_nw[0]],
+            p25_net_worth=[float(x) for x in p_nw[1]],
+            p50_net_worth=[float(x) for x in p_nw[2]],
+            p75_net_worth=[float(x) for x in p_nw[3]],
+            p90_net_worth=[float(x) for x in p_nw[4]],
+            mean_net_worth=[float(x) for x in nw_arr.mean(axis=0)],
+            prob_negative_liquid=[float(x) for x in (liq_arr < 0).mean(axis=0)],
+            p10_liquid=[float(x) for x in p_liq[0]],
+            p50_liquid=[float(x) for x in p_liq[1]],
+            p90_liquid=[float(x) for x in p_liq[2]],
+            prob_millionaire_10yr=(
+                float((yr10 >= 1_000_000).mean()) if yr10 is not None else 0.0
+            ),
+            num_simulations=n_simulations,
+            use_historical_returns=use_historical_returns,
+            use_historical_inflation=use_historical_inflation,
+            market_return_std=market_return_std,
+            inflation_std=inflation_std,
+            salary_growth_std=salary_growth_std,
+            block_bootstrap=joint,
+            mean_block_years=mean_block_years,
+            failsafe_fire_rates=failsafe_fire_rates,
+        )
+
+    def _run_sim_rows(self, all_mkt, all_inf, all_sg, years, amort_cache):
+        """Run the per-sim projection loop over a batch of pre-drawn RNG rows.
+
+        Returns ``(nw, liq, fired_list)`` — net-worth and liquid (brokerage + cash
+        buffer) trajectories as ``(n_rows, n_years)`` float arrays, and the failsafe
+        names that fired on each path. Returning arrays (not nested lists) keeps the
+        cross-process transfer and the percentile aggregation cheap. This is the sole
+        per-sim loop; ``run_monte_carlo`` calls it directly (serial) or ships
+        row-slices to worker processes, with identical aggregation either way.
+        """
+        all_nw: list[list[float]] = []
+        all_liq: list[list[float]] = []
+        fired_list: list[list[str]] = []
+        for sim_idx in range(len(all_mkt)):
             mkt = all_mkt[sim_idx]
             inf = all_inf[sim_idx]
             sg  = all_sg[sim_idx]
@@ -878,7 +986,7 @@ class ProjectionEngine:
             sim_nw:  list[float] = []
             sim_liq: list[float] = []
             for i, year in enumerate(years):
-                self._apply_timeline_events(state, year, _amort_cache)
+                self._apply_timeline_events(state, year, amort_cache)
                 self._evaluate_failsafes(state, year)
                 snap = self._compute_year(
                     state, year,
@@ -896,48 +1004,8 @@ class ProjectionEngine:
                                     salary_growth=float(sg[i]))
             all_nw.append(sim_nw)
             all_liq.append(sim_liq)
-            for name in state.fired_failsafes:
-                failsafe_counts[name] += 1
-
-        failsafe_fire_rates = {name: c / n_simulations for name, c in failsafe_counts.items()}
-        by_year_nw  = list(zip(*all_nw))
-        by_year_liq = list(zip(*all_liq))
-
-        def pct(arr, p): return float(np.percentile(arr, p))
-
-        yr10 = list(by_year_nw[9]) if len(by_year_nw) >= 10 else []
-
-        # Probability of negative liquid assets in each year
-        prob_neg = [
-            sum(1 for v in yr if v < 0) / n_simulations
-            for yr in by_year_liq
-        ]
-
-        return MonteCarloResult(
-            years=years,
-            p10_net_worth=[pct(yr, 10) for yr in by_year_nw],
-            p25_net_worth=[pct(yr, 25) for yr in by_year_nw],
-            p50_net_worth=[pct(yr, 50) for yr in by_year_nw],
-            p75_net_worth=[pct(yr, 75) for yr in by_year_nw],
-            p90_net_worth=[pct(yr, 90) for yr in by_year_nw],
-            mean_net_worth=[float(np.mean(yr)) for yr in by_year_nw],
-            prob_negative_liquid=prob_neg,
-            p10_liquid=[pct(yr, 10) for yr in by_year_liq],
-            p50_liquid=[pct(yr, 50) for yr in by_year_liq],
-            p90_liquid=[pct(yr, 90) for yr in by_year_liq],
-            prob_millionaire_10yr=(
-                sum(1 for nw in yr10 if nw >= 1_000_000) / n_simulations if yr10 else 0.0
-            ),
-            num_simulations=n_simulations,
-            use_historical_returns=use_historical_returns,
-            use_historical_inflation=use_historical_inflation,
-            market_return_std=market_return_std,
-            inflation_std=inflation_std,
-            salary_growth_std=salary_growth_std,
-            block_bootstrap=joint,
-            mean_block_years=mean_block_years,
-            failsafe_fire_rates=failsafe_fire_rates,
-        )
+            fired_list.append(list(state.fired_failsafes))
+        return np.array(all_nw), np.array(all_liq), fired_list
 
     def compute_retirement_readiness(
         self,
@@ -1318,7 +1386,15 @@ class ProjectionEngine:
         (fixed) healthcare-inflation rate, not by market returns, so no simulation
         is needed. Uses baseline costs — it ignores any failsafe medical cut, so
         the trigger reflects the un-mitigated burden that would justify the move.
+
+        The result depends only on ``year`` and the deterministic state inputs
+        below (the healthcare-inflation factor is a fixed function of the year),
+        so it is memoised and shared across every simulation path.
         """
+        key = (year, state.is_working, state.is_married, state.num_children)
+        cached = self._pv_medical_cache.get(key)
+        if cached is not None:
+            return cached
         inv = self._plan.investments
         rp = self._plan.retirement
         discount = rp.expected_post_retirement_return if rp else inv.annual_market_return
@@ -1332,6 +1408,7 @@ class ProjectionEngine:
             cost_t = self._annual_medical_forecast(t, hc_f_t, state.is_married,
                                                    state.num_children, working_t)
             total += cost_t / (1 + discount) ** (t - year)
+        self._pv_medical_cache[key] = total
         return total
 
     def _failsafe_triggered(self, state: EngineState, year: int, fs: Failsafe) -> bool:
@@ -2052,6 +2129,12 @@ class ProjectionEngine:
         to the IRMAA bracket widths. Below Medicare age it short-circuits with no
         iteration.
         """
+        rp = self._plan.retirement
+        age = self._age_in_year(year)
+        if rp is None or age is None or age < rp.medicare_start_age:
+            # Below Medicare eligibility the cost is $0 regardless of MAGI, so skip
+            # the MAGI/withdrawal machinery entirely (the common pre-65 years).
+            return 0.0, 0.0
         if not self._is_retired(year) and self._medicare(state, year, 0.0, inf_f, hc_f) == 0.0:
             # Not old enough for Medicare and not tapping the 401k → no feedback.
             return self._medicare(state, year, self._magi_for_irmaa(state, biz_net), inf_f, hc_f), 0.0

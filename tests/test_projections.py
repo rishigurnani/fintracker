@@ -228,6 +228,31 @@ class TestMonteCarlo:
         mc2 = engine.run_monte_carlo(n_simulations=100, seed=99)
         assert mc1.p50_net_worth == mc2.p50_net_worth
 
+    def test_parallel_matches_serial_bit_identical(self, basic_plan):
+        """The process-parallel path must reproduce the serial path exactly —
+        same seed, same RNG matrices, independent sims → identical aggregates."""
+        import fintracker.projections as P
+        orig = P._MC_PARALLEL_MIN_SIMS
+        try:
+            P._MC_PARALLEL_MIN_SIMS = 10 ** 9          # force serial
+            s = ProjectionEngine(basic_plan).run_monte_carlo(n_simulations=1200, seed=42)
+            P._MC_PARALLEL_MIN_SIMS = 1                # force parallel (many chunks)
+            p = ProjectionEngine(basic_plan).run_monte_carlo(n_simulations=1200, seed=42)
+        finally:
+            P._MC_PARALLEL_MIN_SIMS = orig
+        assert s.p10_net_worth == p.p10_net_worth
+        assert s.p25_net_worth == p.p25_net_worth
+        assert s.p50_net_worth == p.p50_net_worth
+        assert s.p75_net_worth == p.p75_net_worth
+        assert s.p90_net_worth == p.p90_net_worth
+        assert s.mean_net_worth == p.mean_net_worth
+        assert s.prob_negative_liquid == p.prob_negative_liquid
+        assert s.p10_liquid == p.p10_liquid
+        assert s.p50_liquid == p.p50_liquid
+        assert s.p90_liquid == p.p90_liquid
+        assert s.prob_millionaire_10yr == p.prob_millionaire_10yr
+        assert s.failsafe_fire_rates == p.failsafe_fire_rates
+
     def test_median_positive_for_reasonable_income(self, basic_plan):
         engine = ProjectionEngine(basic_plan)
         mc = engine.run_monte_carlo(n_simulations=200, seed=42)
