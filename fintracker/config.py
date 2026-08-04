@@ -298,6 +298,7 @@ _FAILSAFE_ACTION_SPEC = [
     ("present_value", bool, True),
     ("suspend_retirement_contributions", bool, False),
     ("annual_vacation", _opt(float), None),
+    ("medical_cost_multiplier", _opt(float), None),
 ]
 _FAILSAFE_SPEC = [
     ("name", str, "failsafe"),

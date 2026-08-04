@@ -1007,7 +1007,8 @@ def _events_section(defaults) -> 'list[TimelineEvent]':
 
 
 _FS_METRICS = ["brokerage_balance", "liquid_assets", "investable_assets",
-               "retirement_balance", "home_equity", "net_worth"]
+               "retirement_balance", "home_equity", "net_worth",
+               "medical_burden_ratio"]
 _FS_COMPARATORS = ["below", "above"]
 _FS_MATCH = ["any", "all"]
 
@@ -1025,12 +1026,22 @@ def _failsafe_condition_inputs(i, j, cond_def) -> 'FailsafeCondition':
         index=_FS_COMPARATORS.index(cond_def.comparator) if (cond_def and cond_def.comparator in _FS_COMPARATORS) else 0,
         key=f"fs_cc_{i}_{j}",
     )
-    threshold = st.number_input(
-        "Threshold ($)", min_value=0, max_value=100_000_000, step=10_000,
-        value=int(cond_def.threshold) if cond_def else 100_000, key=f"fs_ct_{i}_{j}",
-    )
+    is_ratio = metric == "medical_burden_ratio"
+    if is_ratio:
+        # Unit-free ratio (PV of future medical bills ÷ net worth), e.g. 0.5.
+        threshold = st.number_input(
+            "Threshold (× net worth)", min_value=0.0, max_value=10.0, step=0.05,
+            value=float(cond_def.threshold) if cond_def else 0.5, key=f"fs_ct_{i}_{j}",
+        )
+    else:
+        threshold = float(st.number_input(
+            "Threshold ($)", min_value=0, max_value=100_000_000, step=10_000,
+            value=int(cond_def.threshold) if cond_def else 100_000, key=f"fs_ct_{i}_{j}",
+        ))
     p1, p2, p3 = st.columns(3)
-    present_value = p1.checkbox("Today's $", value=_wd(cond_def, "present_value", True), key=f"fs_cpv_{i}_{j}")
+    present_value = p1.checkbox("Today's $", value=_wd(cond_def, "present_value", True),
+                                key=f"fs_cpv_{i}_{j}", disabled=is_ratio,
+                                help="Ignored for ratio metrics (already unit-free).")
     start_year = p2.number_input("Start yr", min_value=1, max_value=60,
                                  value=_wd(cond_def, "start_year", 1, int), key=f"fs_cs_{i}_{j}")
     end_year = p3.number_input(
@@ -1072,6 +1083,17 @@ def _failsafe_action_inputs(i, act_def) -> 'FailsafeAction':
             value=int(act_def.annual_vacation) if (act_def and act_def.annual_vacation is not None) else 4_000,
             key=f"fs_avac_{i}",
         ))
+    cut_med = st.checkbox(
+        "Reduce medical bills", value=(act_def is not None and act_def.medical_cost_multiplier is not None),
+        key=f"fs_acutmed_{i}", help="Scale all healthcare costs (OOP, premiums, self-LTC, Medicare) while active, "
+                                    "e.g. 50% for 'move abroad'.",
+    )
+    medical_cost_multiplier = None
+    if cut_med:
+        pct = st.slider("Medical bills while active (% of normal)", 0, 100,
+                        value=int(round((act_def.medical_cost_multiplier if (act_def and act_def.medical_cost_multiplier is not None) else 0.5) * 100)),
+                        step=5, key=f"fs_amed_{i}")
+        medical_cost_multiplier = pct / 100.0
     a1, a2 = st.columns(2)
     one_time_income = a1.number_input("One-time income ($)", min_value=0, max_value=5_000_000, step=5_000,
                                       value=_wd(act_def, "one_time_income", 0, int), key=f"fs_aoti_{i}")
@@ -1085,6 +1107,7 @@ def _failsafe_action_inputs(i, act_def) -> 'FailsafeAction':
         present_value=present_value,
         suspend_retirement_contributions=suspend,
         annual_vacation=annual_vacation,
+        medical_cost_multiplier=medical_cost_multiplier,
     )
 
 

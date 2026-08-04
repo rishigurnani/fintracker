@@ -813,7 +813,8 @@ class FailsafeCondition:
     ``net_worth``. ``comparator`` is ``below`` or ``above``. When
     ``present_value`` is true the metric is deflated to today's dollars before
     the comparison, so ``threshold`` is read in today's dollars. The condition
-    is only armed within ``[start_year, end_year]`` (``end_year`` None = horizon).
+    is only armed within ``[start_year, end_year]`` (``end_year`` None **or 0** =
+    to the horizon).
     """
     metric: str
     comparator: str                    # 'below' | 'above'
@@ -846,6 +847,9 @@ class FailsafeAction:
     # Override the annual vacation budget while active (honours ``present_value``,
     # so a value of 4000 means $4k in today's dollars that year). None leaves it.
     annual_vacation: Optional[float] = None
+    # Multiplier applied to all healthcare costs (OOP, health premium, self-LTC,
+    # Medicare) while active, e.g. 0.5 to halve them ("move abroad"). None leaves.
+    medical_cost_multiplier: Optional[float] = None
 
 
 @dataclass
@@ -855,8 +859,9 @@ class Failsafe:
     ``match`` = ``any`` fires when any condition is true, ``all`` requires all.
     ``delay_years`` is the lag between the trigger firing and the action taking
     effect (e.g. a job hunt). ``duration_years`` is how long a sustained action
-    lasts (None = permanent). With ``once`` true the failsafe fires at most once
-    per simulation path.
+    lasts; ``None`` **or ``0``** (any non-positive value) means permanent — only a
+    value >= 1 bounds the window. With ``once`` true the failsafe fires at most
+    once per simulation path.
     """
     name: str
     conditions: list[FailsafeCondition]

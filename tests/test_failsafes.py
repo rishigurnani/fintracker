@@ -295,6 +295,161 @@ class TestRecurringActions:
         assert first_pv - last_pv == pytest.approx(16_000, abs=1_500)
 
 
+class TestDurationSemantics:
+    def test_duration_zero_is_permanent_like_none(self):
+        # Regression: duration_years=0 ("permanent" per the UI/YAML convention)
+        # must NOT produce an empty [start, start-1] window. 0 behaves like None.
+        from fintracker.models import LifestyleProfile
+        base = make_plan(
+            lifestyle=LifestyleProfile(annual_medical_oop=10_000, medical_auto_scale=False),
+            projection_years=10)
+
+        def medical(dur):
+            p = copy.deepcopy(base)
+            p.failsafes = [Failsafe(
+                name="cut", match="any", delay_years=0, duration_years=dur, once=True,
+                conditions=[FailsafeCondition("net_worth", "above", 0, present_value=False)],
+                action=FailsafeAction(medical_cost_multiplier=0.5))]
+            return [s.annual_medical_oop for s in ProjectionEngine(p).run_deterministic()]
+
+        base_run = [s.annual_medical_oop for s in ProjectionEngine(base).run_deterministic()]
+        none_run, zero_run = medical(None), medical(0)
+        assert zero_run == none_run            # 0 and None are the same thing
+        for m0, mz in zip(base_run, zero_run):  # and both actually halve every year
+            assert mz == pytest.approx(m0 * 0.5)
+        assert base_run[-1] > 0                 # guard: there was something to cut
+
+    def test_end_year_zero_means_to_horizon(self):
+        # Same sentinel class as duration: end_year=0 must mean "to horizon",
+        # not literal year 0 (which would make the window empty).
+        from fintracker.models import LifestyleProfile
+        base = make_plan(
+            lifestyle=LifestyleProfile(annual_medical_oop=10_000, medical_auto_scale=False),
+            projection_years=10)
+
+        def medical(end_year):
+            p = copy.deepcopy(base)
+            p.failsafes = [Failsafe(
+                name="cut", delay_years=0, duration_years=None, once=True,
+                conditions=[FailsafeCondition("net_worth", "above", 0, present_value=False,
+                                              start_year=1, end_year=end_year)],
+                action=FailsafeAction(medical_cost_multiplier=0.5))]
+            return [s.annual_medical_oop for s in ProjectionEngine(p).run_deterministic()]
+
+        assert medical(0) == medical(None)      # 0 and None both mean "to horizon"
+        base_run = [s.annual_medical_oop for s in ProjectionEngine(base).run_deterministic()]
+        for m0, mz in zip(base_run, medical(0)):
+            assert mz == pytest.approx(m0 * 0.5)  # actually fires, not an empty window
+
+
+class TestMedicalMultiplier:
+    def test_halves_medical_costs_while_active(self):
+        from fintracker.models import LifestyleProfile
+        # A retiree with real medical OOP so the cut is visible; permanent action.
+        from fintracker.models import RetirementProfile
+        lif = LifestyleProfile(annual_vacation=0, monthly_other_recurring=0,
+                               annual_medical_oop=12_000, medical_auto_scale=False,
+                               annual_self_ltc_cost=0)
+        base = make_plan(lifestyle=lif, projection_years=8,
+                         retirement=RetirementProfile(current_age=60, retirement_age=62))
+        withfs = copy.deepcopy(base)
+        withfs.failsafes = [make_failsafe(name="move abroad", delay_years=0, duration_years=None,
+            conditions=[FailsafeCondition("net_worth", "above", 0, True)],  # always true
+            action=FailsafeAction(medical_cost_multiplier=0.5))]
+
+        b = ProjectionEngine(base).run_deterministic()
+        f = ProjectionEngine(withfs).run_deterministic()
+        # Medical OOP is halved every year the failsafe is active.
+        for sb, sf in zip(b, f):
+            assert sf.annual_medical_oop == pytest.approx(sb.annual_medical_oop * 0.5)
+        assert b[0].annual_medical_oop > 0  # guard: there was something to halve
+
+    def test_multiplier_absent_leaves_costs_unchanged(self):
+        from fintracker.models import LifestyleProfile
+        plan = make_plan(lifestyle=LifestyleProfile(annual_medical_oop=8_000, medical_auto_scale=False),
+                         projection_years=5)
+        plan.failsafes = [make_failsafe(action=FailsafeAction(partner_income=50_000))]
+        # No medical multiplier on this action -> medical costs untouched.
+        snaps = ProjectionEngine(plan).run_deterministic()
+        assert all(s.annual_medical_oop > 0 for s in snaps)
+
+
+class TestMedicalBurdenRatio:
+    def _burden_plan(self, **overrides):
+        from fintracker.models import LifestyleProfile, RetirementProfile
+        return make_plan(
+            income=IncomeProfile(120_000, FilingStatus.SINGLE, State.TEXAS),
+            lifestyle=LifestyleProfile(annual_medical_oop=18_000, medical_auto_scale=False,
+                                       annual_self_ltc_cost=90_000, self_ltc_start_age=75,
+                                       annual_health_insurance_premium=9_000),
+            investments=investments(current_liquid_cash=120_000, current_retirement_balance=150_000,
+                                    annual_market_return=0.05, annual_inflation_rate=0.03,
+                                    annual_healthcare_inflation_rate=0.05),
+            retirement=RetirementProfile(current_age=30, retirement_age=60,
+                                         expected_post_retirement_return=0.04),
+            projection_years=55, **overrides,
+        )
+
+    def test_pv_future_medical_positive_and_deterministic(self):
+        plan = self._burden_plan()
+        eng = ProjectionEngine(plan)
+        st = eng._initial_state()
+        a = eng._pv_future_medical(st, 35)
+        b = eng._pv_future_medical(st, 35)
+        assert a == b and a > 0  # deterministic, positive
+
+    def test_ratio_metric_is_pv_over_net_worth(self):
+        plan = self._burden_plan()
+        eng = ProjectionEngine(plan)
+        st = eng._initial_state()
+        for y in (35, 45):
+            pv = eng._pv_future_medical(st, y)
+            nw = eng._failsafe_metric(st, "net_worth", y)
+            assert eng._failsafe_metric(st, "medical_burden_ratio", y) == pytest.approx(pv / nw)
+
+    def test_move_abroad_triggers_and_halves_medical(self):
+        base = self._burden_plan()
+        withfs = copy.deepcopy(base)
+        withfs.failsafes = [Failsafe(
+            name="move abroad", match="any", delay_years=0, duration_years=None, once=True,
+            conditions=[FailsafeCondition("medical_burden_ratio", "above", 0.5,
+                                          present_value=False, start_year=35, end_year=45)],
+            action=FailsafeAction(medical_cost_multiplier=0.5))]
+        b = ProjectionEngine(base).run_deterministic()
+        f = ProjectionEngine(withfs).run_deterministic()
+        # Before the window it can't fire; medical is identical.
+        assert f[33].annual_medical_oop == pytest.approx(b[33].annual_medical_oop)
+        # From year 35 on (ratio ~1.7 > 0.5), medical OOP is halved.
+        for yr in (35, 40, 50):
+            assert f[yr - 1].annual_medical_oop == pytest.approx(b[yr - 1].annual_medical_oop * 0.5)
+
+    def test_high_threshold_never_triggers(self):
+        base = self._burden_plan()
+        withfs = copy.deepcopy(base)
+        withfs.failsafes = [Failsafe(
+            name="move abroad", delay_years=0, duration_years=None, once=True,
+            conditions=[FailsafeCondition("medical_burden_ratio", "above", 100.0,
+                                          present_value=False, start_year=35, end_year=45)],
+            action=FailsafeAction(medical_cost_multiplier=0.5))]
+        b = ProjectionEngine(base).run_deterministic()
+        f = ProjectionEngine(withfs).run_deterministic()
+        for sb, sf in zip(b, f):
+            assert sf.annual_medical_oop == pytest.approx(sb.annual_medical_oop)
+
+    def test_present_value_flag_ignored_for_ratio(self):
+        # The ratio is unit-free, so present_value must not deflate it: True/False
+        # produce the same trigger behaviour.
+        def run(pv_flag):
+            plan = self._burden_plan()
+            plan.failsafes = [Failsafe(
+                name="x", delay_years=0, duration_years=None, once=True,
+                conditions=[FailsafeCondition("medical_burden_ratio", "above", 0.5,
+                                              present_value=pv_flag, start_year=35, end_year=45)],
+                action=FailsafeAction(medical_cost_multiplier=0.5))]
+            return [s.annual_medical_oop for s in ProjectionEngine(plan).run_deterministic()]
+        assert run(True) == run(False)
+
+
 class TestConfigRoundTrip:
     def test_yaml_roundtrip_preserves_failsafe(self):
         plan = declining_plan()
@@ -325,6 +480,19 @@ class TestConfigRoundTrip:
         assert fs.once is False and fs.duration_years == 1
         assert fs.action.suspend_retirement_contributions is True
         assert fs.action.annual_vacation == 4_000
+
+    def test_roundtrip_preserves_medical_burden_ratio_failsafe(self):
+        plan = declining_plan()
+        plan.failsafes = [Failsafe(
+            name="move abroad", delay_years=0, duration_years=None, once=True,
+            conditions=[FailsafeCondition("medical_burden_ratio", "above", 0.5,
+                                          present_value=False, start_year=35, end_year=45)],
+            action=FailsafeAction(medical_cost_multiplier=0.5))]
+        fs = _dict_to_plan(_plan_to_dict(plan)).failsafes[0]
+        assert fs.conditions[0].metric == "medical_burden_ratio"
+        assert fs.conditions[0].threshold == 0.5
+        assert fs.conditions[0].start_year == 35 and fs.conditions[0].end_year == 45
+        assert fs.action.medical_cost_multiplier == 0.5
 
     def test_absent_failsafes_key_when_none(self):
         plan = declining_plan()

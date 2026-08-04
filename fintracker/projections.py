@@ -254,6 +254,10 @@ _US_HISTORICAL_INFLATION: tuple[float, ...] = (
 # (-26.5% equity, +12.3% inflation), so stagflation is sampled as a unit rather
 # than as the product of two marginals.
 # ---------------------------------------------------------------------------
+# Failsafe metrics that are unitless ratios (not dollar amounts), so the
+# present-value deflation applied to dollar metrics must be skipped for them.
+_FS_RATIO_METRICS = frozenset({"medical_burden_ratio"})
+
 _ALIGNED_START_YEAR = 1929
 _ALIGNED_END_YEAR = 2024
 _N_ALIGNED = _ALIGNED_END_YEAR - _ALIGNED_START_YEAR + 1   # 96 years
@@ -468,6 +472,9 @@ class EngineState:
     suspend_retirement_contributions: bool = False
     # Nominal vacation budget forced by a failsafe this year (None = use profile).
     vacation_override: Optional[float] = None
+    # Multiplier applied to healthcare costs (OOP, health premium, self-LTC,
+    # Medicare) this year; 1.0 = unchanged. A failsafe may cut it (e.g. 0.5).
+    medical_cost_multiplier: float = 1.0
 
     @property
     def gross_income(self) -> float:
@@ -1244,16 +1251,21 @@ class ProjectionEngine:
     # Failsafes — conditional events checked against live state each year  #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _failsafe_metric(state: EngineState, metric: str) -> float:
-        """Start-of-year value of a failsafe trigger metric, from live state.
+    def _failsafe_metric(self, state: EngineState, metric: str, year: int) -> float:
+        """Value of a failsafe trigger metric, from live start-of-year state.
 
-        These read the balances carried into the year (end of the prior year),
-        which is the natural quantity for a threshold like "brokerage falls
-        below $100k". ``net_worth`` mirrors the snapshot's composition.
+        Balance metrics read what's carried into the year (end of the prior
+        year), the natural quantity for a threshold like "brokerage below $100k".
+        ``net_worth`` mirrors the snapshot's composition. ``medical_burden_ratio``
+        is a forward-looking, unitless ratio (see ``_pv_future_medical``) — set
+        ``present_value: false`` on its condition since it is already unit-free.
         """
         home_equity = state.home_value - state.mortgage_balance
         cash = state.uninvested_cash + state.cash_buffer
+        net_worth = (state.retirement_balance + state.hsa_balance
+                     + state.college_529_balance + state.roth_ira_balance
+                     + state.brokerage_balance + home_equity + cash
+                     + state.business_equity)
         if metric == "brokerage_balance":
             return state.brokerage_balance
         if metric == "liquid_assets":
@@ -1266,21 +1278,75 @@ class ProjectionEngine:
         if metric == "home_equity":
             return home_equity
         if metric == "net_worth":
-            return (state.retirement_balance + state.hsa_balance
-                    + state.college_529_balance + state.roth_ira_balance
-                    + state.brokerage_balance + home_equity + cash
-                    + state.business_equity)
+            return net_worth
+        if metric == "medical_burden_ratio":
+            # PV of anticipated future medical bills as a fraction of net worth.
+            # Non-positive net worth => any positive burden is "infinitely" large.
+            if net_worth <= 0:
+                return float("inf")
+            return self._pv_future_medical(state, year) / net_worth
         raise ValueError(f"Unknown failsafe metric: {metric!r}")
+
+    def _annual_medical_forecast(self, year: int, hc_f: float, is_married: bool,
+                                 num_children: int, working: bool) -> float:
+        """Anticipated healthcare cost for one future year (baseline, no cut).
+
+        OOP + health premium (while working, pre-Medicare) + self-LTC (age-gated)
+        + base Medicare (65+; IRMAA excluded as it is MAGI/path-dependent), all in
+        year-``year`` nominal dollars via the healthcare factor ``hc_f``.
+        """
+        lif = self._plan.lifestyle
+        rp = self._plan.retirement
+        age = self._age_in_year(year)
+        medicare_age = rp.medicare_start_age if rp else 65
+        medical = lif.scaled_medical_oop(is_married, num_children) * hc_f
+        health = (lif.annual_health_insurance_premium * hc_f
+                  if working and (age is None or age < medicare_age) else 0.0)
+        self_ltc = (lif.annual_self_ltc_cost * hc_f
+                    if age is not None and age >= lif.self_ltc_start_age else 0.0)
+        medicare = 0.0
+        if rp and age is not None and age >= rp.medicare_start_age:
+            enrolled = 2 if is_married else 1
+            medicare = rp.annual_medicare_premium * hc_f * enrolled
+        return medical + health + self_ltc + medicare
+
+    def _pv_future_medical(self, state: EngineState, year: int) -> float:
+        """Present value (at ``year``) of anticipated medical bills from ``year``
+        through the horizon ("until death"), discounted at the expected return.
+
+        A deterministic forecast: healthcare costs are driven by age and the
+        (fixed) healthcare-inflation rate, not by market returns, so no simulation
+        is needed. Uses baseline costs — it ignores any failsafe medical cut, so
+        the trigger reflects the un-mitigated burden that would justify the move.
+        """
+        inv = self._plan.investments
+        rp = self._plan.retirement
+        discount = rp.expected_post_retirement_return if rp else inv.annual_market_return
+        hc_rate = inv.annual_healthcare_inflation_rate
+        retire_age = rp.retirement_age if rp else None
+        total = 0.0
+        for t in range(year, self._horizon() + 1):
+            hc_f_t = state.cumulative_healthcare_inflation * (1 + hc_rate) ** (t - year)
+            age_t = self._age_in_year(t)
+            working_t = state.is_working and (retire_age is None or age_t is None or age_t < retire_age)
+            cost_t = self._annual_medical_forecast(t, hc_f_t, state.is_married,
+                                                   state.num_children, working_t)
+            total += cost_t / (1 + discount) ** (t - year)
+        return total
 
     def _failsafe_triggered(self, state: EngineState, year: int, fs: Failsafe) -> bool:
         results = []
         for c in fs.conditions:
-            end = c.end_year if c.end_year is not None else self._horizon()
+            # end_year of None OR 0 (non-positive) means "to the horizon" — same
+            # sentinel convention the UI uses (it sends 0 for "end"). Only a value
+            # >= 1 bounds the window.
+            end = c.end_year if (c.end_year and c.end_year >= 1) else self._horizon()
             if not (c.start_year <= year <= end):
                 results.append(False)
                 continue
-            value = self._failsafe_metric(state, c.metric)
-            if c.present_value and state.cumulative_inflation:
+            value = self._failsafe_metric(state, c.metric, year)
+            # Ratio metrics are already unit-free; only deflate dollar metrics.
+            if c.present_value and c.metric not in _FS_RATIO_METRICS and state.cumulative_inflation:
                 value = value / state.cumulative_inflation
             if c.comparator == "below":
                 results.append(value < c.threshold)
@@ -1306,13 +1372,19 @@ class ProjectionEngine:
         # override only holds in years the trigger is actually active.
         state.suspend_retirement_contributions = False
         state.vacation_override = None
+        state.medical_cost_multiplier = 1.0
         for fs in self._plan.failsafes:
             if fs.once and fs.name in state.fired_failsafes:
                 continue
             if self._failsafe_triggered(state, year, fs):
                 state.fired_failsafes.add(fs.name)
                 start = year + fs.delay_years
-                end = None if fs.duration_years is None else start + fs.duration_years - 1
+                # duration_years of None OR 0 (or any non-positive) means
+                # "permanent" — a single convention shared by the YAML, the UI
+                # (which sends 0 as "permanent"), and the engine. Only a value
+                # >= 1 bounds the window; otherwise it runs to the horizon.
+                end = (start + fs.duration_years - 1
+                       if fs.duration_years and fs.duration_years >= 1 else None)
                 state.active_failsafes.append(
                     _ActiveFailsafe(action=fs.action, start_year=start, end_year=end))
         self._apply_active_failsafes(state, year)
@@ -1351,6 +1423,8 @@ class ProjectionEngine:
                     state.suspend_retirement_contributions = True
                 if a.annual_vacation is not None:
                     state.vacation_override = a.annual_vacation * infl
+                if a.medical_cost_multiplier is not None:
+                    state.medical_cost_multiplier = a.medical_cost_multiplier
             elif af.activated:
                 # Window ended: restore the saved earned-income baseline, once.
                 if a.partner_income is not None:
@@ -1509,6 +1583,10 @@ class ProjectionEngine:
             k401 + biz_solo_401k + employer_match, partner_k401, brokerage_inflow,
             hsa_remaining,
         )
+        # Medicare is a healthcare cost too, so a medical-cost failsafe cuts it.
+        # Keep the HSA-funded slice consistent — it can't exceed the reduced bill.
+        medicare_cost *= state.medical_cost_multiplier
+        hsa_for_medicare = min(hsa_for_medicare, medicare_cost)
         lifestyle_cost  = lifestyle_base + medicare_cost
         # The HSA-funded slice of Medicare is added back (paid from the HSA, not cash).
         breathing_room  = base_breathing_room - medicare_cost + hsa_for_medicare
@@ -1870,8 +1948,9 @@ class ProjectionEngine:
         insurance premium, and your own long-term care.
         """
         lif = self._plan.lifestyle
+        med_mult = state.medical_cost_multiplier   # failsafe may cut healthcare costs
 
-        medical     = lif.scaled_medical_oop(state.is_married, state.num_children) * hc_f
+        medical     = lif.scaled_medical_oop(state.is_married, state.num_children) * hc_f * med_mult
         pets        = state.num_pets * lif.annual_pet_cost * inf_f
         vacation    = (state.vacation_override if state.vacation_override is not None
                        else lif.annual_vacation * inf_f)
@@ -1886,13 +1965,13 @@ class ProjectionEngine:
         # the general rate.
         age          = self._age_in_year(year)
         medicare_age = self._plan.retirement.medicare_start_age if self._plan.retirement else 65
-        health       = (lif.annual_health_insurance_premium * hc_f
+        health       = (lif.annual_health_insurance_premium * hc_f * med_mult
                         if state.is_working and (age is None or age < medicare_age) else 0.0)
         disability   = (lif.annual_disability_insurance_premium if state.is_working else 0.0) * inf_f
         premiums     = health + disability + lif.annual_life_insurance_premium * inf_f
 
         # Your own long-term care — age-gated, needs a RetirementProfile for age.
-        self_ltc = (lif.annual_self_ltc_cost * hc_f
+        self_ltc = (lif.annual_self_ltc_cost * hc_f * med_mult
                     if age is not None and age >= lif.self_ltc_start_age else 0.0)
 
         # Childcare: age-bracketed profile takes priority over flat monthly_childcare.
