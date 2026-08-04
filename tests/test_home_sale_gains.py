@@ -53,8 +53,9 @@ class TestHomeSaleCapGains:
 
     def test_married_exclusion_is_double_the_single(self):
         """Married shelters $500k vs $250k. With high income the whole gain sits in
-        the 20% LTCG band, so the single filer pays exactly (500k − 250k) × 20% more
-        — the extra $250k of exclusion at the top marginal rate."""
+        the 20% LTCG band AND clears the NIIT threshold, so the single filer pays
+        exactly (500k − 250k) × (20% + 3.8% NIIT) more — the extra $250k of exclusion
+        at the top marginal rate plus the Net Investment Income Tax on it."""
         single = _sale_year_tax(_home_sale_plan(FilingStatus.SINGLE, 0.15, income=1_000_000))
         married = _sale_year_tax(_home_sale_plan(FilingStatus.MARRIED_FILING_JOINTLY, 0.15, income=1_000_000))
-        assert single - married == pytest.approx((500_000 - 250_000) * 0.20, rel=1e-4)
+        assert single - married == pytest.approx((500_000 - 250_000) * (0.20 + 0.038), rel=1e-4)

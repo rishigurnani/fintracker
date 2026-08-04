@@ -19,12 +19,18 @@ from fintracker.models import (
 
 
 def investments(**kw) -> InvestmentProfile:
-    """InvestmentProfile with market/inflation/salary-growth pinned to 0 by default."""
+    """InvestmentProfile with market/inflation/salary-growth pinned to 0 by default.
+
+    The taxable-dividend drag is also pinned off by default so tests that isolate a
+    single accounting mechanic aren't perturbed by a balance-proportional tax; tests
+    exercising the drag opt in with ``taxable_dividend_yield=...``.
+    """
     return InvestmentProfile(**{
         "annual_market_return": 0.0,
         "annual_inflation_rate": 0.0,
         "annual_healthcare_inflation_rate": 0.0,
         "annual_salary_growth_rate": 0.0,
+        "taxable_dividend_yield": 0.0,
         **kw,
     })
 

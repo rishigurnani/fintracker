@@ -43,6 +43,25 @@ ROTH_IRA_LIMIT = 7_000                     # per person, per year
 ROTH_PHASEOUT_SINGLE = (146_000, 161_000)  # MAGI phase-out (single/HoH)
 ROTH_PHASEOUT_MFJ = (230_000, 240_000)     # MAGI phase-out (married filing jointly)
 
+# --- Social Security wage base (2024) ---
+# The 12.4% Social Security portion of FICA / self-employment tax stops at this
+# wage base; the 2.9% Medicare portion continues on every dollar above it. Rises
+# with average wages each year in reality, so callers inflation-index it.
+SS_WAGE_BASE = 168_600
+
+# --- SALT deduction cap ---
+# State-and-local-tax itemized deduction is capped at $10,000 (fixed nominal since
+# 2018, NOT inflation-indexed — its real value erodes over a long projection).
+SALT_DEDUCTION_CAP = 10_000
+
+# --- Net Investment Income Tax (NIIT) ---
+# 3.8% on the lesser of net investment income and the amount of MAGI above the
+# threshold. Thresholds are statutory and NOT inflation-indexed (like the
+# Additional Medicare Tax threshold).
+NIIT_RATE = 0.038
+NIIT_THRESHOLD_SINGLE = 200_000
+NIIT_THRESHOLD_MFJ = 250_000
+
 
 # --- Medicare IRMAA (2024) ---
 # Income-Related Monthly Adjustment Amount: a MAGI-tiered surcharge added on top

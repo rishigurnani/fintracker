@@ -974,6 +974,7 @@ class TestBuyerClosingCosts:
             investments=InvestmentProfile(
                 current_liquid_cash=liquid, annual_market_return=0.0,
                 annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                taxable_dividend_yield=0.0,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             timeline_events=[TimelineEvent(
@@ -1020,6 +1021,7 @@ class TestSellerClosingCosts:
             investments=InvestmentProfile(
                 current_liquid_cash=200_000, annual_market_return=0.0,
                 annual_inflation_rate=0.0, annual_salary_growth_rate=0.0,
+                taxable_dividend_yield=0.0,
             ),
             strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
             timeline_events=[TimelineEvent(

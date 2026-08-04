@@ -3,9 +3,20 @@ Tax calculation engine.
 
 Covers:
   - 2024/2025 Federal income tax (progressive brackets)
+  - Standard vs itemized deduction (mortgage interest + SALT, capped) — max of the two
   - FICA (Social Security + Medicare, including Additional Medicare Tax)
+  - Net Investment Income Tax (3.8% NIIT) — see net_investment_income_tax()
   - State income tax for supported states
   - HSA, 401k, and 529 deduction effects
+  - Long-term capital gains via the 0/15/20% brackets
+
+Known omissions (intentionally not modeled):
+  - Alternative Minimum Tax (AMT). Post-2018 exemptions are high enough that it
+    rarely binds, and a faithful parallel-tax calc would add substantial complexity
+    for little accuracy; deliberately left out. Revisit if the exemption sunsets.
+  - The QBI W-2-wage / UBIA-property limits (the deduction's phase-out is modeled
+    in projections._business, but those employer-level caps need inputs the model
+    doesn't collect).
 
 All bracket amounts are for the *tax year* embedded in each bracket table.
 Brackets should be updated annually; the year is noted in each table name.
@@ -14,6 +25,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fintracker.finance_math import progressive_tax, marginal_rate_at
+from fintracker.constants import (
+    SS_WAGE_BASE, SALT_DEDUCTION_CAP,
+    NIIT_RATE, NIIT_THRESHOLD_SINGLE, NIIT_THRESHOLD_MFJ,
+)
 from fintracker.models import (
     FilingStatus, IncomeProfile, InvestmentProfile, StrategyToggles, State,
     by_filing_status,
@@ -72,7 +87,7 @@ _LTCG_BREAKPOINTS_2024: dict[FilingStatus, tuple[float, float]] = {
 }
 
 # FICA constants (2024)
-_SS_WAGE_BASE_2024 = 168_600
+_SS_WAGE_BASE_2024 = SS_WAGE_BASE   # single source of truth in constants.py
 _SS_RATE = 0.062
 _MEDICARE_RATE = 0.0145
 _ADDITIONAL_MEDICARE_RATE = 0.009
@@ -197,6 +212,20 @@ def state_display_name(state: State) -> str:
 
 
 @dataclass
+class DeductionInputs:
+    """Itemizable deductions weighed against the standard deduction for one year.
+
+    ``mortgage_interest`` is the year's deductible home-loan interest; ``property_tax``
+    the year's real-estate tax. State/local income tax is added to property tax and
+    the sum capped at the SALT limit inside the engine (the engine computes state
+    income tax itself, so callers don't pass it). When itemizing beats the standard
+    deduction the larger figure is used; otherwise nothing changes.
+    """
+    mortgage_interest: float = 0.0
+    property_tax: float = 0.0
+
+
+@dataclass
 class TaxResult:
     """Full annual tax breakdown."""
     federal_income_tax: float
@@ -246,26 +275,53 @@ def _scale_brackets(brackets: list[tuple[float, float]], factor: float) -> list[
     return [(bound * factor, rate) for bound, rate in brackets]
 
 
+def _standard_deduction(filing_status: FilingStatus, inflation_factor: float = 1.0) -> float:
+    """Inflation-indexed federal standard deduction for the filing status."""
+    return _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600) * inflation_factor
+
+
+def _federal_deduction(filing_status: FilingStatus, state_income_tax: float,
+                       deductions: DeductionInputs | None,
+                       inflation_factor: float = 1.0) -> float:
+    """The deduction a taxpayer actually takes: max(standard, itemized).
+
+    Itemized = deductible mortgage interest + SALT, where SALT is state/local income
+    tax plus property tax capped at the (non-indexed, nominal) $10k limit. With no
+    itemizable deductions supplied this is just the standard deduction — unchanged
+    from the standard-only model.
+    """
+    std = _standard_deduction(filing_status, inflation_factor)
+    if deductions is None:
+        return std
+    salt = min(SALT_DEDUCTION_CAP, state_income_tax + deductions.property_tax)
+    itemized = deductions.mortgage_interest + salt
+    return max(std, itemized)
+
+
 def _federal_taxable_income(gross: float, filing_status: FilingStatus,
                             k401_deduction: float, hsa_deduction: float,
-                            inflation_factor: float = 1.0) -> float:
+                            inflation_factor: float = 1.0,
+                            deduction: float | None = None) -> float:
     """Ordinary federal taxable income: gross less pre-tax 401k/HSA and the
-    (inflation-indexed) standard deduction. This is the base a long-term capital
-    gain stacks on top of."""
-    std_deduction = _STANDARD_DEDUCTIONS_2024.get(filing_status, 14_600) * inflation_factor
-    return max(0.0, gross - k401_deduction - hsa_deduction - std_deduction)
+    deduction (standard by default, or the itemized figure when ``deduction`` is
+    supplied). This is the base a long-term capital gain stacks on top of."""
+    if deduction is None:
+        deduction = _standard_deduction(filing_status, inflation_factor)
+    return max(0.0, gross - k401_deduction - hsa_deduction - deduction)
 
 
 def _federal_income_tax(gross: float, filing_status: FilingStatus,
                         k401_deduction: float, hsa_deduction: float,
-                        inflation_factor: float = 1.0) -> float:
-    """Federal income tax after pre-tax 401k/HSA and the standard deduction.
+                        inflation_factor: float = 1.0,
+                        deduction: float | None = None) -> float:
+    """Federal income tax after pre-tax 401k/HSA and the standard/itemized deduction.
 
     Brackets and the standard deduction are inflation-indexed by inflation_factor
-    (1.0 = the base tax year).
+    (1.0 = the base tax year). ``deduction`` overrides the standard deduction with
+    an already-resolved itemized figure when itemizing wins.
     """
     fed_taxable = _federal_taxable_income(gross, filing_status, k401_deduction,
-                                          hsa_deduction, inflation_factor)
+                                          hsa_deduction, inflation_factor, deduction)
     brackets = _FEDERAL_BRACKETS_2024.get(filing_status, _FEDERAL_BRACKETS_2024[FilingStatus.SINGLE])
     return _apply_brackets(fed_taxable, _scale_brackets(brackets, inflation_factor))
 
@@ -373,6 +429,7 @@ class TaxEngine:
         filing_status_override: FilingStatus | None = None,
         gross_income_override: float | None = None,
         inflation_factor: float = 1.0,
+        deductions: DeductionInputs | None = None,
     ) -> TaxResult:
         """Calculate full annual tax liability.
 
@@ -388,6 +445,9 @@ class TaxEngine:
                 income in a future projection year is taxed against inflation-
                 indexed thresholds (1.0 = base year; the default keeps single-year
                 callers unchanged).
+            deductions: Itemizable deductions (mortgage interest, property tax). When
+                supplied and larger than the standard deduction, the federal tax
+                itemizes; ``None`` (default) keeps the standard-deduction-only model.
         """
         filing_status = filing_status_override or income.filing_status
         gross = gross_income_override if gross_income_override is not None else income.total_gross_income
@@ -396,14 +456,17 @@ class TaxEngine:
         hsa_deduction = investments.annual_hsa_contribution if strategies.maximize_hsa else 0.0
         k401_deduction = investments.annual_401k_contribution if strategies.maximize_401k else 0.0
 
-        federal_tax = _federal_income_tax(gross, filing_status, k401_deduction, hsa_deduction,
-                                          inflation_factor)
-        ss_tax, medicare_tax, add_medicare_tax = _fica_taxes(gross, hsa_deduction, filing_status,
-                                                             inflation_factor)
+        # State tax first: it feeds the SALT component of the federal itemized
+        # deduction (state income tax + property tax, capped at the SALT limit).
         state_tax, state_529_deduction = _state_income_tax(
             income, filing_status, gross, k401_deduction, hsa_deduction,
             strategies, investments, num_children, inflation_factor,
         )
+        fed_deduction = _federal_deduction(filing_status, state_tax, deductions, inflation_factor)
+        federal_tax = _federal_income_tax(gross, filing_status, k401_deduction, hsa_deduction,
+                                          inflation_factor, deduction=fed_deduction)
+        ss_tax, medicare_tax, add_medicare_tax = _fica_taxes(gross, hsa_deduction, filing_status,
+                                                             inflation_factor)
 
         return TaxResult(
             federal_income_tax=federal_tax,
@@ -426,6 +489,7 @@ class TaxEngine:
         filing_status_override: FilingStatus | None = None,
         gross_income_override: float | None = None,
         inflation_factor: float = 1.0,
+        deductions: DeductionInputs | None = None,
     ) -> float:
         """Long-term capital-gains tax on ``gain``.
 
@@ -443,21 +507,42 @@ class TaxEngine:
         hsa_deduction = investments.annual_hsa_contribution if strategies.maximize_hsa else 0.0
         k401_deduction = investments.annual_401k_contribution if strategies.maximize_401k else 0.0
 
-        fed_ordinary = _federal_taxable_income(gross, filing_status, k401_deduction,
-                                               hsa_deduction, inflation_factor)
-        federal = _federal_ltcg_tax(gain, fed_ordinary, filing_status, inflation_factor)
-
         # State treats the gain as ordinary income: marginal tax = state tax on
         # (ordinary + gain) minus state tax on ordinary alone (the 529 deduction and
-        # everything else cancel in the difference).
+        # everything else cancel in the difference). State tax on ordinary income also
+        # feeds the SALT slice of the federal itemized deduction used for stacking.
         state_base, _ = _state_income_tax(income, filing_status, gross, k401_deduction,
                                           hsa_deduction, strategies, investments,
                                           num_children, inflation_factor)
+        fed_deduction = _federal_deduction(filing_status, state_base, deductions, inflation_factor)
+        fed_ordinary = _federal_taxable_income(gross, filing_status, k401_deduction,
+                                               hsa_deduction, inflation_factor,
+                                               deduction=fed_deduction)
+        federal = _federal_ltcg_tax(gain, fed_ordinary, filing_status, inflation_factor)
         state_with_gain, _ = _state_income_tax(income, filing_status, gross + gain, k401_deduction,
                                                hsa_deduction, strategies, investments,
                                                num_children, inflation_factor)
         state = max(0.0, state_with_gain - state_base)
         return federal + state
+
+    def net_investment_income_tax(
+        self,
+        magi: float,
+        net_investment_income: float,
+        filing_status: FilingStatus,
+    ) -> float:
+        """3.8% Net Investment Income Tax (IRC §1411).
+
+        Charged on the *lesser* of net investment income (realized gains, dividends,
+        interest) and the amount of MAGI above the filing-status threshold. The
+        thresholds are statutory and NOT inflation-indexed (same treatment as the
+        Additional Medicare Tax threshold), so no ``inflation_factor`` is taken.
+        """
+        if net_investment_income <= 0:
+            return 0.0
+        threshold = by_filing_status(filing_status, NIIT_THRESHOLD_SINGLE, NIIT_THRESHOLD_MFJ)
+        excess = max(0.0, magi - threshold)
+        return NIIT_RATE * min(net_investment_income, excess)
 
     def marginal_rate(
         self,

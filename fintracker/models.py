@@ -435,6 +435,14 @@ class InvestmentProfile:
     # Falls back to RetirementProfile.capital_gains_tax_rate when left at 0.
     capital_gains_tax_rate: float = 0.0
 
+    # Annual dividend/distribution yield on the taxable brokerage. Unlike a 401k,
+    # a taxable account throws off dividends every year that are taxed as they are
+    # paid (a real drag on compounding). The model reinvests the dividend — it is
+    # part of annual_market_return — and only leaks the *tax* on it each year, at
+    # the qualified-dividend (LTCG) rate + state. ~2% is a typical broad-market
+    # yield; set to 0 to disable the drag.
+    taxable_dividend_yield: float = 0.02
+
     # Effective cap-gains rate applied to the *remaining unrealized* gains in the
     # retirement-readiness haircut. SIMPLIFIED ASSUMPTION: a retiree draws the
     # brokerage down gradually and often lands in the 0%/15% LTCG bracket, so this

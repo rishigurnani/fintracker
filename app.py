@@ -1726,6 +1726,25 @@ def _liquidity_warnings(plan, snapshots) -> None:
             f"Consider building a larger emergency buffer."
         )
 
+    # Brokerage-specific insolvency: the taxable account can go negative even when
+    # age-aware liquid assets (which count a 59½+ retiree's 401k/Roth) stay positive.
+    # A negative brokerage is an implicit margin loan the model keeps compounding at
+    # the market rate rather than a real borrowing cost — an optimistic simplification
+    # worth flagging honestly so the projected net worth isn't taken at face value.
+    brokerage_negative = [s for s in snapshots if s.brokerage_balance < 0]
+    if brokerage_negative:
+        first = brokerage_negative[0]
+        worst = min(brokerage_negative, key=lambda s: s.brokerage_balance)
+        st.warning(
+            f"⚠️ **Taxable brokerage goes negative in Year {first.year}** "
+            f"(worst: **{fmt_dollar(worst.brokerage_balance)}** in Year {worst.year}). "
+            "This means a purchase or shortfall was funded by implicitly borrowing against "
+            "the account. The model keeps compounding that negative balance at the market "
+            "return instead of charging a real loan rate, so the projected net worth in and "
+            "after these years is optimistic — treat it as a signal to hold more cash or "
+            "spread out large outflows."
+        )
+
 
 def _retirement_readiness_panel(plan, snapshots, projection_engine) -> None:
     """Withdrawal-tax controls + retirement readiness metrics (no-op if unconfigured)."""

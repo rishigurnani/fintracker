@@ -40,6 +40,7 @@ _MC_PARALLEL_MIN_SIMS = 1000
 
 from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
+    ROTH_PHASEOUT_SINGLE, ROTH_PHASEOUT_MFJ, SS_WAGE_BASE,
     HOME_SALE_EXCLUSION_SINGLE, HOME_SALE_EXCLUSION_MFJ,
     irmaa_annual_surcharge, limit_401k,
 )
@@ -50,7 +51,7 @@ from fintracker.models import (
     RetirementProfile, StrategyToggles, by_filing_status,
     Failsafe, FailsafeAction,
 )
-from fintracker.tax_engine import TaxEngine, TaxResult
+from fintracker.tax_engine import TaxEngine, TaxResult, DeductionInputs
 from fintracker.mortgage import MortgageCalculator
 
 
@@ -58,8 +59,13 @@ from fintracker.mortgage import MortgageCalculator
 # IRS / tax constants
 # ---------------------------------------------------------------------------
 
-_SE_TAX_RATE              = 0.1530
+_SE_TAX_RATE              = 0.1530   # 12.4% SS + 2.9% Medicare (uncapped combined rate)
+_SE_SS_RATE               = 0.1240   # Social Security portion — stops at the wage base
+_SE_MEDICARE_RATE         = 0.0290   # Medicare portion — continues on every dollar
 _SE_TAX_DEDUCTIBLE_SHARE  = 0.9235
+# Max share of a Social Security benefit that is taxable as ordinary income
+# (IRC §86). Retirees with meaningful other income hit this 85% ceiling.
+_SS_TAXABLE_FRACTION      = 0.85
 _QBI_PHASEOUT_SINGLE      = 191_950
 _QBI_PHASEOUT_MFJ         = 383_900
 _AOTC_MAX_CREDIT          = 2_500
@@ -1069,10 +1075,17 @@ class ProjectionEngine:
         # retirement (housing + lifestyle + car each year), net of Social Security,
         # discounted back to the retirement year at the post-retirement return.
         r, g, n = rp.expected_post_retirement_return, inflation, rp.years_in_retirement
+        # Social Security benefits are partly taxable: up to 85% of the benefit is
+        # ordinary income for a retiree with other income. The old calc treated SS as
+        # tax-free, overstating the offset. Haircut the benefit by tax on its taxable
+        # share at the retirement ordinary rate (r401k_tax); with r401k_tax=0 this is
+        # a no-op, preserving the previous behaviour when no rates are set.
+        ss_after_tax_factor = 1.0 - _SS_TAXABLE_FRACTION * r401k_tax
         retirement_snaps = [s for s in snapshots if s.year > years_to_ret]
         required = 0.0
         for s in retirement_snaps:
-            ss_t     = rp.estimated_social_security_annual * (1 + inflation) ** (s.year - 1)
+            ss_t     = (rp.estimated_social_security_annual
+                        * (1 + inflation) ** (s.year - 1) * ss_after_tax_factor)
             cost_t   = (s.annual_housing_cost + s.annual_lifestyle_cost
                         + s.annual_car_operating_cost)
             net_need = max(0.0, cost_t - ss_t)
@@ -1083,7 +1096,8 @@ class ProjectionEngine:
         annual_cost_at_retirement = (first_ret.annual_housing_cost
                                      + first_ret.annual_lifestyle_cost
                                      + first_ret.annual_car_operating_cost)
-        ss_nominal = rp.estimated_social_security_annual * (1 + inflation) ** years_to_ret
+        ss_nominal = (rp.estimated_social_security_annual
+                      * (1 + inflation) ** years_to_ret * ss_after_tax_factor)
 
         funded_pct  = projected / required if required > 0 else math.inf
         balance_gap = projected - required
@@ -1581,16 +1595,31 @@ class ProjectionEngine:
 
         # --- Contributions & tax ---
         hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
-        biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year)
-        tax, aotc, tax_breakdown = self._tax_and_credits(state, year, hsa, k401, r529, inf_f)
+        biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year, inf_f)
+        # Itemizable deductions (mortgage interest + SALT) — the engine takes the
+        # larger of these and the standard deduction. Shared by the income-tax and
+        # capital-gains calls so both see the same deduction.
+        deductions = self._itemized_deductions(state, year, inf_f)
+        tax, aotc, tax_breakdown = self._tax_and_credits(state, year, hsa, k401, r529, inf_f, deductions)
 
-        # Backdoor Roth IRA contribution (post-tax — no deduction, reduces net income).
-        # Limit: $7,000/person × (2 if married), always fixed nominal dollars.
-        if self._plan.strategies.use_backdoor_roth:
-            roth_limit   = ROTH_IRA_LIMIT * (2 if state.is_married else 1)
-            roth_contrib = min(inv.roth_contribution_for_year(year), roth_limit)
-        else:
+        # Roth IRA contribution (post-tax — no deduction, reduces net income).
+        # Limit: $7,000/person × (2 if married), fixed nominal dollars. A *direct*
+        # contribution is available whenever an amount is configured — independent of
+        # the backdoor toggle — but it phases out over the MAGI income limit (the
+        # inflation-indexed Roth phase-out band). use_backdoor_roth is the high-earner
+        # route: it bypasses the income limit and contributes the full amount. (The
+        # earlier code contributed $0 unless the backdoor toggle was on, silently
+        # dropping an ordinary under-the-limit Roth contribution.)
+        roth_limit   = ROTH_IRA_LIMIT * (2 if state.is_married else 1)
+        roth_desired = min(inv.roth_contribution_for_year(year), roth_limit)
+        if roth_desired <= 0:
             roth_contrib = 0.0
+        elif self._plan.strategies.use_backdoor_roth:
+            roth_contrib = roth_desired
+        else:
+            lo, hi = by_filing_status(state.filing_status, ROTH_PHASEOUT_SINGLE, ROTH_PHASEOUT_MFJ)
+            magi = self._magi_for_irmaa(state, biz_net)
+            roth_contrib = roth_desired * linear_phaseout(magi, lo * inf_f, hi * inf_f)
 
         net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k - roth_contrib
 
@@ -1612,9 +1641,33 @@ class ProjectionEngine:
         # reaches 20% automatically — no hand-set flat rate. (The flat
         # capital_gains_tax_rate now only feeds the retirement-readiness haircut.)
         tmp_inc, tmp_inv = self._tax_profiles(state, hsa, k401, r529)
-        cap_gains_tax = self._tax.capital_gains_tax(
+        realized_gains_tax = self._tax.capital_gains_tax(
             state.realized_gains_ytd, tmp_inc, tmp_inv, p.strategies,
-            num_children=state.num_children, inflation_factor=inf_f)
+            num_children=state.num_children, inflation_factor=inf_f, deductions=deductions)
+
+        # Brokerage tax drag: a taxable account throws off dividends every year that
+        # are taxed as paid — unlike a 401k. Model a dividend yield on the start-of-
+        # year balance, taxed at the same preferential 0/15/20 federal rate as LTCG
+        # (+ state ordinary). The dividend itself is reinvested (it is part of the
+        # total market return), so only the tax leaks out — the real drag on taxable
+        # compounding the old model missed (brokerage grew tax-free like a 401k).
+        annual_dividend = max(0.0, state.brokerage_balance) * inv.taxable_dividend_yield
+        dividend_tax = self._tax.capital_gains_tax(
+            annual_dividend, tmp_inc, tmp_inv, p.strategies,
+            num_children=state.num_children, inflation_factor=inf_f, deductions=deductions)
+
+        # Net Investment Income Tax (3.8%): realized gains + dividends are net
+        # investment income, taxed where MAGI clears the statutory threshold. Uses
+        # the same MAGI the IRMAA calc builds (earned + business + realized gains),
+        # plus this year's dividends.
+        nii  = max(0.0, state.realized_gains_ytd) + annual_dividend
+        magi = self._magi_for_irmaa(state, biz_net) + annual_dividend
+        niit = self._tax.net_investment_income_tax(magi, nii, state.filing_status)
+
+        # Total investment tax that leaks from cash flow this year: realized-gains
+        # LTCG + annual dividend drag + NIIT. (Reported together on the cap-gains
+        # line — all are investment taxes.)
+        cap_gains_tax = realized_gains_tax + dividend_tax + niit
 
         # HSA pays qualified medical expenses tax-free, which the model previously
         # ignored (the HSA only ever grew, ballooning absurdly). We spend it in
@@ -1950,6 +2003,40 @@ class ProjectionEngine:
         )
         return tmp_inc, tmp_inv
 
+    def _mortgage_interest_for_year(self, state: EngineState, year: int) -> float:
+        """Deductible mortgage interest for the current projection year.
+
+        Derived exactly from the amortization schedule already held in state: annual
+        P&I payment less the principal actually paid down this year (begin balance −
+        end balance). Zero when renting, owned outright, or the loan term is over.
+        """
+        mc = state.mortgage_calc
+        if mc is None or state.is_renting:
+            return 0.0
+        mortgage_yr = year - state.mortgage_year_offset
+        if mortgage_yr < 1 or mortgage_yr > mc._p.loan_term_years:
+            return 0.0
+        begin = state.mortgage_balance
+        end   = state.amort_lookup.get(mortgage_yr, begin)
+        principal_paid = max(0.0, begin - end)
+        annual_pi = mc.monthly_pi_payment() * 12
+        return max(0.0, annual_pi - principal_paid)
+
+    def _itemized_deductions(self, state: EngineState, year: int, inf_f: float) -> DeductionInputs:
+        """Year's itemizable federal deductions: mortgage interest + property tax.
+
+        The tax engine adds state income tax to property tax, caps the SALT sum, and
+        takes max(standard, itemized). Renters have neither, so the standard
+        deduction always wins for them (unchanged behaviour).
+        """
+        if state.is_renting:
+            return DeductionInputs()
+        property_tax = state.home_price_ref * self._plan.housing.annual_property_tax_rate * inf_f
+        return DeductionInputs(
+            mortgage_interest=self._mortgage_interest_for_year(state, year),
+            property_tax=property_tax,
+        )
+
     def _tax_and_credits(
         self,
         state: EngineState,
@@ -1958,6 +2045,7 @@ class ProjectionEngine:
         k401: float,
         r529: float,
         inf_f: float,
+        deductions: Optional[DeductionInputs] = None,
     ) -> tuple[float, float, TaxResult]:
         """Returns (effective_tax, aotc_credit, tax_breakdown)."""
         p = self._plan
@@ -1966,7 +2054,8 @@ class ProjectionEngine:
         # year, mirroring the IRS's annual indexing (prevents nominal bracket creep).
         breakdown = self._tax.calculate(tmp_inc, tmp_inv, p.strategies,
                                         num_children=state.num_children,
-                                        inflation_factor=inf_f)
+                                        inflation_factor=inf_f,
+                                        deductions=deductions)
         aotc     = self._aotc_credit(state, year, state.gross_income, state.is_married, inf_f)
         eff_tax  = max(0.0, breakdown.total_annual_tax - aotc)
         return eff_tax, aotc, breakdown
@@ -2245,6 +2334,7 @@ class ProjectionEngine:
         self,
         state: EngineState,
         year: int,
+        inf_f: float = 1.0,
     ) -> tuple[float, float, float, float]:
         """
         Returns (net_income, se_tax, business_equity, solo_401k_contribution).
@@ -2277,10 +2367,17 @@ class ProjectionEngine:
         net_profit = revenue * (1.0 - biz.expense_ratio) * biz.ownership_pct
 
         # --- Self-employment tax ---
-        # SE tax is 15.3% on 92.35% of net profit.
-        # The employer half (7.65%) is deductible from AGI — reduces taxable income.
+        # SE tax = 12.4% Social Security + 2.9% Medicare on 92.35% of net profit.
+        # The Social Security portion stops at the (inflation-indexed) wage base, and
+        # coordinates with the owner's W-2 wages, which have already consumed part of
+        # the base for the year; the Medicare portion continues on every dollar. The
+        # employer half is deductible from AGI. Charging the full 15.3% on all profit
+        # (the old behaviour) overstated SE tax for any earner above the wage base.
         se_base     = net_profit * _SE_TAX_DEDUCTIBLE_SHARE
-        se_tax      = se_base * _SE_TAX_RATE
+        wage_base   = SS_WAGE_BASE * inf_f
+        w2_ss_wages = min(max(0.0, state.income_primary), wage_base)
+        ss_taxable  = max(0.0, min(se_base, wage_base - w2_ss_wages))
+        se_tax      = ss_taxable * _SE_SS_RATE + se_base * _SE_MEDICARE_RATE
         employer_half_deduction = se_tax / 2.0
 
         # --- Health insurance deduction ---

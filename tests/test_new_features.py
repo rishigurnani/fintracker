@@ -1038,7 +1038,7 @@ class TestCarPurchases:
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
             housing=HousingProfile(0,0,0.0,is_renting=True,monthly_rent=0),
             lifestyle=LifestyleProfile(annual_vacation=0,monthly_other_recurring=0,annual_medical_oop=0,medical_auto_scale=False),
-            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0),
+            investments=InvestmentProfile(current_liquid_cash=300_000,annual_market_return=0.0,annual_inflation_rate=0.0,annual_salary_growth_rate=0.0,taxable_dividend_yield=0.0),
             strategies=StrategyToggles(maximize_hsa=False,maximize_401k=False),
             projection_years=1,
         )
