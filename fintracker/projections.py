@@ -24,19 +24,10 @@ Internally, each year is processed as:
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
-import os
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-
-# Monte Carlo runs the independent per-simulation loop across processes once the
-# batch is large enough to amortise process-startup overhead; below this it stays
-# serial (small runs and the test suite skip the pool). Output is identical
-# either way — the sims are independent and the RNG is pre-drawn.
-_MC_PARALLEL_MIN_SIMS = 1000
 
 from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
@@ -49,10 +40,14 @@ from fintracker.models import (
     BusinessProfile, CarProfile, ChildcarePhase, ChildcareProfile, RothContributionPhase, EmployerMatch, KidCarProfile, MatchTier, CollegeProfile, FilingStatus, FinancialPlan,
     HousingProfile, IncomeProfile, InvestmentProfile,
     RetirementProfile, StrategyToggles, by_filing_status,
-    Failsafe, FailsafeAction,
 )
 from fintracker.tax_engine import TaxEngine, TaxResult, DeductionInputs
 from fintracker.mortgage import MortgageCalculator
+# The Monte Carlo sampling/aggregation harness and the failsafe subsystem live in
+# their own modules; the engine keeps thin delegators to them. MonteCarloResult is
+# re-exported here so existing importers of fintracker.projections keep working.
+from fintracker.montecarlo import MonteCarloResult, MonteCarloSimulator
+from fintracker.failsafes import FailsafeController
 
 
 # ---------------------------------------------------------------------------
@@ -213,141 +208,6 @@ def _fund_deficit(available: dict, order, net_deficit: float, wd_tax_rate: float
     return reductions, taxable_withdrawal, withdrawal_tax, remaining
 
 
-# ---------------------------------------------------------------------------
-# Historical S&P 500 annual total returns (1926–2025)
-# Source: provided by user; used for bootstrap sampling in Monte Carlo.
-# Bootstrap preserves the true empirical distribution — fat tails, skew,
-# and crash years — rather than assuming normality.
-# ---------------------------------------------------------------------------
-_SP500_HISTORICAL_RETURNS: tuple[float, ...] = (
-    # (year, return) — only returns stored, sorted newest-first for readability
-    0.1788, 0.2502, 0.2629, -0.1811, 0.2871, 0.1840, 0.3149, -0.0438,
-    0.2183, 0.1196, 0.0138, 0.1369, 0.3239, 0.1600, 0.0211, 0.1506,
-    0.2646, -0.3700, 0.0549, 0.1579, 0.0491, 0.1088, 0.2868, -0.2210,
-    -0.1189, -0.0910, 0.2104, 0.2858, 0.3336, 0.2296, 0.3758, 0.0132,
-    0.1008, 0.0762, 0.3047, -0.0310, 0.3169, 0.1661, 0.0525, 0.1867,
-    0.3173, 0.0627, 0.2256, 0.2155, -0.0491, 0.3242, 0.1844, 0.0656,
-    -0.0718, 0.2384, 0.3720, -0.2647, -0.1466, 0.1898, 0.1431, 0.0401,
-    -0.0850, 0.1106, 0.2398, -0.1006, 0.1245, 0.1648, 0.2280, -0.0873,
-    0.2689, 0.0047, 0.1196, 0.4336, -0.1078, 0.0656, 0.3156, 0.5262,
-    -0.0099, 0.1837, 0.2402, 0.3171, 0.1879, 0.0550, 0.0571, -0.0807,
-    0.3644, 0.1975, 0.2590, 0.2034, -0.1159, -0.0978, -0.0041, 0.3112,
-    -0.3503, 0.3392, 0.4767, -0.0144, 0.5399, -0.0819, -0.4334, -0.2490,
-    -0.0842, 0.4361, 0.3749, 0.1162,
-)
-
-
-# ---------------------------------------------------------------------------
-# Historical US CPI annual inflation rates (1929–2024), 96 years.
-# Source: US Bureau of Labor Statistics. Used for bootstrap Monte Carlo sampling.
-# Fat tails: deflation (Great Depression), 1970s stagflation (13.3%),
-# post-WWII spike (18.1%), 2021-22 surge (7%). Normal(3%, 1.5%) misses all of these.
-_US_HISTORICAL_INFLATION: tuple[float, ...] = (
-     0.0060, -0.0640, -0.0930, -0.1030,  0.0080,  0.0150,  0.0300,  0.0140,
-     0.0290, -0.0280,  0.0000,  0.0070,  0.0990,  0.0900,  0.0300,  0.0230,
-     0.0220,  0.1810,  0.0880,  0.0300, -0.0210,  0.0590,  0.0600,  0.0080,
-     0.0070, -0.0070,  0.0040,  0.0300,  0.0290,  0.0180,  0.0170,  0.0140,
-     0.0070,  0.0130,  0.0160,  0.0100,  0.0190,  0.0350,  0.0300,  0.0470,
-     0.0620,  0.0560,  0.0330,  0.0340,  0.0870,  0.1230,  0.0690,  0.0490,
-     0.0670,  0.0900,  0.1330,  0.1250,  0.0890,  0.0380,  0.0380,  0.0390,
-     0.0380,  0.0110,  0.0440,  0.0440,  0.0460,  0.0610,  0.0310,  0.0290,
-     0.0270,  0.0270,  0.0250,  0.0330,  0.0170,  0.0160,  0.0270,  0.0340,
-     0.0160,  0.0240,  0.0190,  0.0330,  0.0340,  0.0250,  0.0410,  0.0010,
-     0.0270,  0.0150,  0.0300,  0.0170,  0.0150,  0.0080,  0.0070,  0.0210,
-     0.0210,  0.0190,  0.0230,  0.0140,  0.0700,  0.0650,  0.0340,  0.0290,
-)
-
-# ---------------------------------------------------------------------------
-# Calendar-year-aligned equity + inflation history (for the joint block
-# bootstrap). The two series above are stored in OPPOSITE orders over DIFFERENT
-# windows: S&P returns are newest-first over 1926-2025 (index 0 = 2025), CPI
-# inflation is oldest-first over 1929-2024 (index 0 = 1929). To sample the two
-# jointly we realign them onto their common window, 1929-2024 (96 years), so
-# that row i carries the equity return AND the inflation rate from the SAME
-# calendar year. This preserves the contemporaneous co-movement that
-# independent per-series draws destroy -- e.g. 1974 stays bundled as
-# (-26.5% equity, +12.3% inflation), so stagflation is sampled as a unit rather
-# than as the product of two marginals.
-# ---------------------------------------------------------------------------
-# Failsafe metrics that are unitless ratios (not dollar amounts), so the
-# present-value deflation applied to dollar metrics must be skipped for them.
-_FS_RATIO_METRICS = frozenset({"medical_burden_ratio"})
-
-_ALIGNED_START_YEAR = 1929
-_ALIGNED_END_YEAR = 2024
-_N_ALIGNED = _ALIGNED_END_YEAR - _ALIGNED_START_YEAR + 1   # 96 years
-
-
-def _build_aligned_history() -> tuple[np.ndarray, np.ndarray]:
-    """Realign the equity and inflation series onto their common 1929-2024 window.
-
-    Equity is newest-first (index 0 = 2025), so calendar year Y sits at index
-    ``2025 - Y``; inflation is oldest-first (index 0 = 1929), so year Y sits at
-    index ``Y - 1929``. Returns ``(equity, inflation)`` arrays of length 96,
-    both ordered oldest-first (1929 -> 2024) and index-aligned by calendar year.
-    """
-    equity = np.array([
-        _SP500_HISTORICAL_RETURNS[2025 - y]
-        for y in range(_ALIGNED_START_YEAR, _ALIGNED_END_YEAR + 1)
-    ])
-    inflation = np.array([
-        _US_HISTORICAL_INFLATION[y - _ALIGNED_START_YEAR]
-        for y in range(_ALIGNED_START_YEAR, _ALIGNED_END_YEAR + 1)
-    ])
-    return equity, inflation
-
-
-_ALIGNED_EQUITY, _ALIGNED_INFLATION = _build_aligned_history()
-
-
-def _stationary_block_indices(
-    rng: np.random.Generator,
-    n_sims: int,
-    n_years: int,
-    n_history: int,
-    mean_block_years: float,
-) -> np.ndarray:
-    """Politis-Romano stationary-bootstrap indices into a circular history.
-
-    Returns an ``(n_sims, n_years)`` int array. Each simulation's path starts at
-    a uniformly random year; each subsequent year either continues the current
-    block (advance one year, wrapping around the end of the history) or, with
-    probability ``1 / mean_block_years``, jumps to a fresh uniformly random year.
-    The geometric block length (mean = ``mean_block_years``) preserves multi-year
-    runs and mean reversion while keeping the sampler stationary -- unlike a
-    fixed-length block bootstrap, there are no artificial seams at block
-    boundaries.
-    """
-    p = 1.0 / max(mean_block_years, 1e-9)
-    idx = np.empty((n_sims, n_years), dtype=np.int64)
-    cur = rng.integers(0, n_history, size=n_sims)
-    idx[:, 0] = cur
-    for t in range(1, n_years):
-        start_new = rng.random(n_sims) < p
-        fresh = rng.integers(0, n_history, size=n_sims)
-        cur = np.where(start_new, fresh, (cur + 1) % n_history)
-        idx[:, t] = cur
-    return idx
-
-
-def _coupled_salary_growth(
-    rng: np.random.Generator,
-    inflation: np.ndarray,
-    real_premium: float,
-    std: float,
-) -> np.ndarray:
-    """Nominal salary growth tied to the sampled inflation.
-
-    ``nominal = inflation + real_premium`` where ``real_premium ~ N(mean, std)``
-    is small and far less volatile than inflation. In a high-inflation block
-    nominal pay rises but real pay stagnates -- the wage-lags-inflation effect
-    that an independent salary draw misses. Clipped to the same bounds the legacy
-    independent draw used.
-    """
-    return np.clip(
-        inflation + rng.normal(real_premium, std, inflation.shape), -0.10, 0.20)
-
-
 from typing import NamedTuple
 
 class _Growth(NamedTuple):
@@ -365,25 +225,6 @@ class _Growth(NamedTuple):
     withdrawal_tax:     float = 0.0  # ordinary-income tax on that withdrawal
     brokerage_withdrawal: float = 0.0  # brokerage drawn to fund a deficit this year
     roth_withdrawal:      float = 0.0  # Roth (basis + qualified earnings) drawn this year
-
-@dataclass
-class _ActiveFailsafe:
-    """A triggered failsafe's in-flight action within one simulation path.
-
-    ``start_year``/``end_year`` bound the active window (already offset by the
-    failsafe's delay). The ``saved_*`` fields hold the earned-income baseline to
-    restore when the window ends; ``activated``/``closed`` track the lifecycle.
-    """
-    action: FailsafeAction
-    start_year: int
-    end_year: Optional[int]
-    saved_partner_income: float = 0.0
-    saved_partner_working: bool = False
-    saved_primary_income: float = 0.0
-    saved_primary_working: bool = True
-    activated: bool = False
-    closed: bool = False
-
 
 # ---------------------------------------------------------------------------
 # Engine state — typed, explicit, no loose dicts
@@ -659,46 +500,8 @@ class RetirementReadiness:
     social_security_offset: float
 
 
-@dataclass
-class MonteCarloResult:
-    """Result of N Monte Carlo simulation runs."""
-    years: list[int]
-
-    # Net worth percentile bands
-    p10_net_worth: list[float]
-    p25_net_worth: list[float]
-    p50_net_worth: list[float]
-    p75_net_worth: list[float]
-    p90_net_worth: list[float]
-    mean_net_worth: list[float]
-
-    # Liquidity risk: per-year probability that liquid assets (brokerage) go
-    # negative in that simulation year.  Values in [0, 1].
-    prob_negative_liquid: list[float]
-
-    # Brokerage balance percentiles (same pool as liquid assets chart)
-    p10_liquid: list[float]
-    p50_liquid: list[float]
-    p90_liquid: list[float]
-
-    # Summary statistics
-    prob_millionaire_10yr: float = 0.0
-    num_simulations: int = 1_000
-
-    # Simulation parameters (stored for display)
-    use_historical_returns: bool = True
-    use_historical_inflation: bool = True
-    market_return_std: float = 0.15
-    inflation_std: float = 0.015
-    salary_growth_std: float = 0.02
-    # Joint block bootstrap (equity+inflation sampled as aligned contiguous
-    # blocks; salary tied to sampled inflation). True only when it was actually
-    # used, i.e. block_bootstrap requested AND both historical series in play.
-    block_bootstrap: bool = True
-    mean_block_years: float = 5.0
-    # Fraction of simulations in which each failsafe fired at least once,
-    # keyed by failsafe name. Empty when the plan has no failsafes.
-    failsafe_fire_rates: dict = field(default_factory=dict)
+# MonteCarloResult is defined in fintracker.montecarlo (imported at top of this
+# module and re-exported for backward compatibility).
 
 
 # ---------------------------------------------------------------------------
@@ -750,33 +553,6 @@ def _pay_loan_year(loan: dict, annual_rate: float, term_years: int) -> float:
     return annual_pmt
 
 
-def _mc_context():
-    """Start method for Monte Carlo worker processes.
-
-    macOS/Windows default to ``spawn``, which bootstraps each worker by
-    re-importing the parent's ``__main__`` — under ``streamlit run`` that is the
-    whole app, so every worker re-runs app.py's module-level Streamlit calls
-    (with no runtime → warnings) and re-imports its heavy deps, which wrecks the
-    speedup. ``fork`` inherits the parent's memory instead: no re-import, no app
-    code re-run. The workers here are pure compute (no logging / inherited-lock
-    use), so the usual fork-in-a-threaded-process hazard does not apply. Fall
-    back to ``spawn`` only where ``fork`` is unavailable (e.g. Windows).
-    """
-    if "fork" in mp.get_all_start_methods():
-        return mp.get_context("fork")
-    return mp.get_context("spawn")
-
-
-def _mc_worker(plan, all_mkt, all_inf, all_sg, years, amort_cache):
-    """Top-level (picklable) entry point for a Monte Carlo worker process.
-
-    Rebuilds a fresh engine from the (picklable) plan and runs the ordinary
-    per-sim loop over its slice of the pre-drawn RNG matrices. Kept module-level
-    so it survives the ``spawn`` start method used on macOS.
-    """
-    return ProjectionEngine(plan)._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache)
-
-
 class ProjectionEngine:
     """
     Runs deterministic and Monte Carlo projections for a FinancialPlan.
@@ -792,10 +568,11 @@ class ProjectionEngine:
     def __init__(self, plan: FinancialPlan) -> None:
         self._plan = plan
         self._tax = TaxEngine()
-        # Memoises the (path-independent) present value of future medical bills
-        # by year + the deterministic state inputs it depends on, so the medical-
-        # burden failsafe forecast is computed once instead of once per sim/year.
-        self._pv_medical_cache: dict = {}
+        # The failsafe subsystem (trigger evaluation + action application) is a
+        # focused collaborator holding a back-reference to this engine. Built once
+        # per engine so its path-independent medical-forecast memo is shared across
+        # every simulation path.
+        self._failsafes = FailsafeController(self)
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -812,164 +589,18 @@ class ProjectionEngine:
             self._advance_state(state, snap)
         return snapshots
 
-    def run_monte_carlo(
-        self,
-        n_simulations: int = 1_000,
-        seed: Optional[int] = None,
-        market_return_std: float = 0.15,
-        inflation_std: float = 0.015,
-        salary_growth_std: float = 0.02,
-        use_historical_returns: bool = True,
-        use_historical_inflation: bool = True,
-        block_bootstrap: bool = True,
-        mean_block_years: float = 5.0,
-    ) -> MonteCarloResult:
+    def run_monte_carlo(self, *args, **kwargs) -> MonteCarloResult:
+        """Run N Monte Carlo simulations with randomized economic parameters.
+
+        Thin delegator to :class:`fintracker.montecarlo.MonteCarloSimulator`,
+        which owns the sampling, parallelism, and aggregation; see its ``run``
+        method for the full parameter list (``n_simulations``, ``seed``,
+        ``use_historical_returns``/``use_historical_inflation``, ``block_bootstrap``,
+        ``mean_block_years``, and the normal-mode ``*_std`` knobs). Args are
+        forwarded verbatim so callers keep using
+        ``ProjectionEngine(plan).run_monte_carlo(...)`` positionally or by keyword.
         """
-        Run N Monte Carlo simulations with randomized economic parameters.
-
-        Parameters
-        ----------
-        n_simulations         : number of simulation runs
-        seed                  : RNG seed for reproducibility (None = random)
-        use_historical_returns: if True (default), sample market returns by
-                                bootstrap from the historical S&P 500 dataset
-                                (1926–2025).  This preserves the true empirical
-                                distribution — fat tails, skewness, -43% crashes,
-                                +54% booms — rather than assuming normality.
-                                If False, draws from N(mean, market_return_std).
-        market_return_std     : std dev used only when use_historical_returns=False
-        inflation_std         : std dev of annual inflation (always normal)
-        salary_growth_std     : std dev of annual salary growth (always normal)
-
-        block_bootstrap       : if True (default) and both historical series are
-                                in use, sample equity and inflation JOINTLY as
-                                calendar-year-aligned pairs drawn in contiguous
-                                blocks (Politis-Romano stationary bootstrap). This
-                                preserves both the cross-series co-movement
-                                (stagflation stays bundled) and the serial
-                                correlation / mean reversion that independent
-                                per-year draws erase. Salary growth is then tied
-                                to the sampled inflation plus a small real premium.
-                                If False, falls back to independent per-year draws.
-        mean_block_years      : expected block length for the stationary bootstrap
-                                (geometric, mean ~5 yrs).
-
-        Outside the joint block-bootstrap path, inflation and salary growth remain
-        normally distributed since those datasets are smaller and more symmetric.
-        """
-        rng = np.random.default_rng(seed)
-        inv = self._plan.investments
-        years = list(range(1, self._horizon() + 1))
-
-        hist = np.array(_SP500_HISTORICAL_RETURNS)
-
-        # Pre-compute mortgage amortization lookups — identical every simulation.
-        _amort_cache: dict = {}
-        for _ev in self._plan.timeline_events:
-            if _ev.buy_home and _ev.new_home_price and _ev.new_home_interest_rate:
-                _p = _ev.new_home_price
-                _d = _ev.new_home_down_payment or _p * 0.20
-                _r = _ev.new_home_interest_rate
-                _t = self._plan.housing.loan_term_years
-                _k = (_p, _d, _r, _t)
-                if _k not in _amort_cache:
-                    _hp_tmp = HousingProfile(home_price=_p, down_payment=_d,
-                                             interest_rate=_r, loan_term_years=_t)
-                    _mc_tmp = MortgageCalculator(_hp_tmp, self._plan.investments.annual_home_appreciation_rate)
-                    _amort_cache[_k] = self._amort_lookup(_mc_tmp)
-
-        # Pre-draw all random matrices (n_simulations × n_years) at once.
-        # Eliminates per-simulation RNG call overhead.
-        n_years = len(years)
-        # Joint block bootstrap: sample (equity, inflation) as calendar-year-
-        # aligned pairs in contiguous blocks. Requires both historical series --
-        # the alignment is what keeps stagflation years bundled. When either
-        # series is normal-mode, fall back to the independent per-year draws.
-        joint = block_bootstrap and use_historical_returns and use_historical_inflation
-        if joint:
-            idx = _stationary_block_indices(
-                rng, n_simulations, n_years, _N_ALIGNED, mean_block_years)
-            all_mkt = _ALIGNED_EQUITY[idx]
-            all_inf = np.clip(_ALIGNED_INFLATION[idx], -0.15, 0.20)
-            # Salary growth tracks the sampled inflation plus a small, less-
-            # volatile real premium (the configured salary growth net of
-            # configured inflation). In a high-inflation block nominal pay rises
-            # but real pay stagnates -- the wage-lags-inflation stagflation
-            # effect an independent salary draw misses entirely.
-            real_premium = inv.annual_salary_growth_rate - inv.annual_inflation_rate
-            all_sg = _coupled_salary_growth(rng, all_inf, real_premium, salary_growth_std)
-        else:
-            if use_historical_returns:
-                all_mkt = rng.choice(hist, size=(n_simulations, n_years), replace=True)
-            else:
-                all_mkt = rng.normal(inv.annual_market_return, market_return_std, (n_simulations, n_years))
-            if use_historical_inflation:
-                all_inf = np.clip(rng.choice(np.array(_US_HISTORICAL_INFLATION),
-                                             size=(n_simulations, n_years), replace=True), -0.15, 0.20)
-            else:
-                all_inf = np.clip(rng.normal(inv.annual_inflation_rate, inflation_std,
-                                              (n_simulations, n_years)), 0, 0.15)
-            all_sg = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std,
-                                         (n_simulations, n_years)), -0.10, 0.20)
-
-        # Run the independent per-sim loop. For large batches, fan the sims out
-        # across processes (they are independent and the RNG is pre-drawn, so the
-        # combined result is identical to the serial path); otherwise stay serial.
-        n_cpu = os.cpu_count() or 1
-        if n_simulations >= _MC_PARALLEL_MIN_SIMS and n_cpu > 1:
-            bounds = [(k * n_simulations) // n_cpu for k in range(n_cpu + 1)]
-            slices = [(bounds[k], bounds[k + 1]) for k in range(n_cpu) if bounds[k] < bounds[k + 1]]
-            nw_parts, liq_parts, fired_list = [], [], []
-            with ProcessPoolExecutor(max_workers=len(slices), mp_context=_mc_context()) as ex:
-                futures = [
-                    ex.submit(_mc_worker, self._plan,
-                              all_mkt[s:e], all_inf[s:e], all_sg[s:e], years, _amort_cache)
-                    for (s, e) in slices
-                ]
-                for f in futures:                       # gathered in submission order
-                    nw_c, liq_c, fired_c = f.result()
-                    nw_parts.append(nw_c); liq_parts.append(liq_c); fired_list.extend(fired_c)
-            nw_arr = np.vstack(nw_parts); liq_arr = np.vstack(liq_parts)
-        else:
-            nw_arr, liq_arr, fired_list = self._run_sim_rows(
-                all_mkt, all_inf, all_sg, years, _amort_cache)
-
-        failsafe_counts: dict[str, int] = {fs.name: 0 for fs in self._plan.failsafes}
-        for fired in fired_list:
-            for name in fired:
-                failsafe_counts[name] += 1
-        failsafe_fire_rates = {name: c / n_simulations for name, c in failsafe_counts.items()}
-
-        # Per-year percentiles / stats, vectorised across sims (axis 0).
-        p_nw = np.percentile(nw_arr, [10, 25, 50, 75, 90], axis=0)
-        p_liq = np.percentile(liq_arr, [10, 50, 90], axis=0)
-        yr10 = nw_arr[:, 9] if nw_arr.shape[1] >= 10 else None
-
-        return MonteCarloResult(
-            years=years,
-            p10_net_worth=[float(x) for x in p_nw[0]],
-            p25_net_worth=[float(x) for x in p_nw[1]],
-            p50_net_worth=[float(x) for x in p_nw[2]],
-            p75_net_worth=[float(x) for x in p_nw[3]],
-            p90_net_worth=[float(x) for x in p_nw[4]],
-            mean_net_worth=[float(x) for x in nw_arr.mean(axis=0)],
-            prob_negative_liquid=[float(x) for x in (liq_arr < 0).mean(axis=0)],
-            p10_liquid=[float(x) for x in p_liq[0]],
-            p50_liquid=[float(x) for x in p_liq[1]],
-            p90_liquid=[float(x) for x in p_liq[2]],
-            prob_millionaire_10yr=(
-                float((yr10 >= 1_000_000).mean()) if yr10 is not None else 0.0
-            ),
-            num_simulations=n_simulations,
-            use_historical_returns=use_historical_returns,
-            use_historical_inflation=use_historical_inflation,
-            market_return_std=market_return_std,
-            inflation_std=inflation_std,
-            salary_growth_std=salary_growth_std,
-            block_bootstrap=joint,
-            mean_block_years=mean_block_years,
-            failsafe_fire_rates=failsafe_fire_rates,
-        )
+        return MonteCarloSimulator(self._plan).run(*args, **kwargs)
 
     def _run_sim_rows(self, all_mkt, all_inf, all_sg, years, amort_cache):
         """Run the per-sim projection loop over a batch of pre-drawn RNG rows.
@@ -1333,198 +964,23 @@ class ProjectionEngine:
     # Failsafes — conditional events checked against live state each year  #
     # ------------------------------------------------------------------ #
 
-    def _failsafe_metric(self, state: EngineState, metric: str, year: int) -> float:
-        """Value of a failsafe trigger metric, from live start-of-year state.
-
-        Balance metrics read what's carried into the year (end of the prior
-        year), the natural quantity for a threshold like "brokerage below $100k".
-        ``net_worth`` mirrors the snapshot's composition. ``medical_burden_ratio``
-        is a forward-looking, unitless ratio (see ``_pv_future_medical``) — set
-        ``present_value: false`` on its condition since it is already unit-free.
-        """
-        home_equity = state.home_value - state.mortgage_balance
-        cash = state.uninvested_cash + state.cash_buffer
-        net_worth = (state.retirement_balance + state.hsa_balance
-                     + state.college_529_balance + state.roth_ira_balance
-                     + state.brokerage_balance + home_equity + cash
-                     + state.business_equity)
-        if metric == "brokerage_balance":
-            return state.brokerage_balance
-        if metric == "liquid_assets":
-            return state.brokerage_balance + cash
-        if metric == "investable_assets":
-            return (state.retirement_balance + state.hsa_balance
-                    + state.roth_ira_balance + state.brokerage_balance + cash)
-        if metric == "retirement_balance":
-            return state.retirement_balance
-        if metric == "home_equity":
-            return home_equity
-        if metric == "net_worth":
-            return net_worth
-        if metric == "medical_burden_ratio":
-            # PV of anticipated future medical bills as a fraction of net worth.
-            # Non-positive net worth => any positive burden is "infinitely" large.
-            if net_worth <= 0:
-                return float("inf")
-            return self._pv_future_medical(state, year) / net_worth
-        raise ValueError(f"Unknown failsafe metric: {metric!r}")
-
-    def _annual_medical_forecast(self, year: int, hc_f: float, is_married: bool,
-                                 num_children: int, working: bool) -> float:
-        """Anticipated healthcare cost for one future year (baseline, no cut).
-
-        OOP + health premium (while working, pre-Medicare) + self-LTC (age-gated)
-        + base Medicare (65+; IRMAA excluded as it is MAGI/path-dependent), all in
-        year-``year`` nominal dollars via the healthcare factor ``hc_f``.
-        """
-        lif = self._plan.lifestyle
-        rp = self._plan.retirement
-        age = self._age_in_year(year)
-        medicare_age = rp.medicare_start_age if rp else 65
-        medical = lif.scaled_medical_oop(is_married, num_children) * hc_f
-        health = (lif.annual_health_insurance_premium * hc_f
-                  if working and (age is None or age < medicare_age) else 0.0)
-        self_ltc = (lif.annual_self_ltc_cost * hc_f
-                    if age is not None and age >= lif.self_ltc_start_age else 0.0)
-        medicare = 0.0
-        if rp and age is not None and age >= rp.medicare_start_age:
-            enrolled = 2 if is_married else 1
-            medicare = rp.annual_medicare_premium * hc_f * enrolled
-        return medical + health + self_ltc + medicare
-
-    def _pv_future_medical(self, state: EngineState, year: int) -> float:
-        """Present value (at ``year``) of anticipated medical bills from ``year``
-        through the horizon ("until death"), discounted at the expected return.
-
-        A deterministic forecast: healthcare costs are driven by age and the
-        (fixed) healthcare-inflation rate, not by market returns, so no simulation
-        is needed. Uses baseline costs — it ignores any failsafe medical cut, so
-        the trigger reflects the un-mitigated burden that would justify the move.
-
-        The result depends only on ``year`` and the deterministic state inputs
-        below (the healthcare-inflation factor is a fixed function of the year),
-        so it is memoised and shared across every simulation path.
-        """
-        key = (year, state.is_working, state.is_married, state.num_children)
-        cached = self._pv_medical_cache.get(key)
-        if cached is not None:
-            return cached
-        inv = self._plan.investments
-        rp = self._plan.retirement
-        discount = rp.expected_post_retirement_return if rp else inv.annual_market_return
-        hc_rate = inv.annual_healthcare_inflation_rate
-        retire_age = rp.retirement_age if rp else None
-        total = 0.0
-        for t in range(year, self._horizon() + 1):
-            hc_f_t = state.cumulative_healthcare_inflation * (1 + hc_rate) ** (t - year)
-            age_t = self._age_in_year(t)
-            working_t = state.is_working and (retire_age is None or age_t is None or age_t < retire_age)
-            cost_t = self._annual_medical_forecast(t, hc_f_t, state.is_married,
-                                                   state.num_children, working_t)
-            total += cost_t / (1 + discount) ** (t - year)
-        self._pv_medical_cache[key] = total
-        return total
-
-    def _failsafe_triggered(self, state: EngineState, year: int, fs: Failsafe) -> bool:
-        results = []
-        for c in fs.conditions:
-            # end_year of None OR 0 (non-positive) means "to the horizon" — same
-            # sentinel convention the UI uses (it sends 0 for "end"). Only a value
-            # >= 1 bounds the window.
-            end = c.end_year if (c.end_year and c.end_year >= 1) else self._horizon()
-            if not (c.start_year <= year <= end):
-                results.append(False)
-                continue
-            value = self._failsafe_metric(state, c.metric, year)
-            # Ratio metrics are already unit-free; only deflate dollar metrics.
-            if c.present_value and c.metric not in _FS_RATIO_METRICS and state.cumulative_inflation:
-                value = value / state.cumulative_inflation
-            if c.comparator == "below":
-                results.append(value < c.threshold)
-            elif c.comparator == "above":
-                results.append(value > c.threshold)
-            else:
-                raise ValueError(f"Unknown failsafe comparator: {c.comparator!r}")
-        if not results:
-            return False
-        return any(results) if fs.match == "any" else all(results)
+    # ------------------------------------------------------------------ #
+    # Failsafes — evaluation + application live in FailsafeController; these  #
+    # thin delegators keep the engine's internal call sites (and existing     #
+    # tests that reach for them) working unchanged.                           #
+    # ------------------------------------------------------------------ #
 
     def _evaluate_failsafes(self, state: EngineState, year: int) -> None:
-        """Arm any newly-triggered failsafes, then apply all active ones.
+        """Arm newly-triggered failsafes and apply active ones (see FailsafeController)."""
+        self._failsafes.evaluate(state, year)
 
-        Runs after ``_apply_timeline_events`` (so scripted events set the year's
-        baseline first) and before ``_compute_year`` (so income overrides are
-        taxed correctly). A triggered failsafe schedules its action to start at
-        ``year + delay_years`` and, if ``duration_years`` is set, end after it.
-        """
-        if not self._plan.failsafes:
-            return
-        # Year-scoped action flags reset before re-evaluation so a suspension /
-        # override only holds in years the trigger is actually active.
-        state.suspend_retirement_contributions = False
-        state.vacation_override = None
-        state.medical_cost_multiplier = 1.0
-        for fs in self._plan.failsafes:
-            if fs.once and fs.name in state.fired_failsafes:
-                continue
-            if self._failsafe_triggered(state, year, fs):
-                state.fired_failsafes.add(fs.name)
-                start = year + fs.delay_years
-                # duration_years of None OR 0 (or any non-positive) means
-                # "permanent" — a single convention shared by the YAML, the UI
-                # (which sends 0 as "permanent"), and the engine. Only a value
-                # >= 1 bounds the window; otherwise it runs to the horizon.
-                end = (start + fs.duration_years - 1
-                       if fs.duration_years and fs.duration_years >= 1 else None)
-                state.active_failsafes.append(
-                    _ActiveFailsafe(action=fs.action, start_year=start, end_year=end))
-        self._apply_active_failsafes(state, year)
+    def _failsafe_metric(self, state: EngineState, metric: str, year: int) -> float:
+        """Value of a failsafe trigger metric from live start-of-year state."""
+        return self._failsafes.metric(state, metric, year)
 
-    def _apply_active_failsafes(self, state: EngineState, year: int) -> None:
-        """Apply, refresh, or close each in-flight failsafe action for this year.
-
-        Sustained income is re-derived from present value every active year so it
-        stays inflation-indexed, and *replaces* the target's earned income (the
-        pre-failsafe value is saved and restored when the window ends).
-        """
-        for af in state.active_failsafes:
-            if af.closed:
-                continue
-            active_now = af.start_year <= year and (af.end_year is None or year <= af.end_year)
-            a = af.action
-            if active_now:
-                infl = state.cumulative_inflation if a.present_value else 1.0
-                if not af.activated:
-                    af.saved_partner_income = state.income_partner
-                    af.saved_partner_working = state.is_partner_working
-                    af.saved_primary_income = state.income_primary
-                    af.saved_primary_working = state.is_working
-                    af.activated = True
-                    if a.one_time_income:
-                        state.brokerage_balance += a.one_time_income * infl
-                    if a.one_time_expense:
-                        self._fund_purchase(state, a.one_time_expense * infl, year)
-                if a.partner_income is not None:
-                    state.income_partner = a.partner_income * infl
-                    state.is_partner_working = True
-                if a.primary_income is not None:
-                    state.income_primary = a.primary_income * infl
-                    state.is_working = True
-                if a.suspend_retirement_contributions:
-                    state.suspend_retirement_contributions = True
-                if a.annual_vacation is not None:
-                    state.vacation_override = a.annual_vacation * infl
-                if a.medical_cost_multiplier is not None:
-                    state.medical_cost_multiplier = a.medical_cost_multiplier
-            elif af.activated:
-                # Window ended: restore the saved earned-income baseline, once.
-                if a.partner_income is not None:
-                    state.income_partner = af.saved_partner_income
-                    state.is_partner_working = af.saved_partner_working
-                if a.primary_income is not None:
-                    state.income_primary = af.saved_primary_income
-                    state.is_working = af.saved_primary_working
-                af.closed = True
+    def _pv_future_medical(self, state: EngineState, year: int) -> float:
+        """PV of anticipated future medical bills (memoised; see FailsafeController)."""
+        return self._failsafes.pv_future_medical(state, year)
 
     def _apply_home_purchase(self, state: EngineState, ev, _amort_cache: Optional[dict] = None) -> None:
         p          = self._plan

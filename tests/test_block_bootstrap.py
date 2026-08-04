@@ -14,9 +14,9 @@ Plus the salary-growth coupling that ties nominal wages to the sampled inflation
 import numpy as np
 import pytest
 
-from fintracker import projections as P
-from fintracker.projections import (
-    ProjectionEngine,
+from fintracker import montecarlo as MC
+from fintracker.projections import ProjectionEngine
+from fintracker.montecarlo import (
     _stationary_block_indices,
     _coupled_salary_growth,
     _ALIGNED_EQUITY,
@@ -43,7 +43,7 @@ class TestAlignedHistory:
         (2021,  0.2871, 0.0700),   # post-COVID boom + inflation surge
     ])
     def test_known_year_pairs_aligned(self, year, equity, inflation):
-        i = year - P._ALIGNED_START_YEAR
+        i = year - MC._ALIGNED_START_YEAR
         assert _ALIGNED_EQUITY[i] == pytest.approx(equity)
         assert _ALIGNED_INFLATION[i] == pytest.approx(inflation)
 

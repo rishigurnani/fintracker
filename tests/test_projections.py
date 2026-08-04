@@ -231,15 +231,15 @@ class TestMonteCarlo:
     def test_parallel_matches_serial_bit_identical(self, basic_plan):
         """The process-parallel path must reproduce the serial path exactly —
         same seed, same RNG matrices, independent sims → identical aggregates."""
-        import fintracker.projections as P
-        orig = P._MC_PARALLEL_MIN_SIMS
+        import fintracker.montecarlo as MC
+        orig = MC._MC_PARALLEL_MIN_SIMS
         try:
-            P._MC_PARALLEL_MIN_SIMS = 10 ** 9          # force serial
+            MC._MC_PARALLEL_MIN_SIMS = 10 ** 9          # force serial
             s = ProjectionEngine(basic_plan).run_monte_carlo(n_simulations=1200, seed=42)
-            P._MC_PARALLEL_MIN_SIMS = 1                # force parallel (many chunks)
+            MC._MC_PARALLEL_MIN_SIMS = 1                # force parallel (many chunks)
             p = ProjectionEngine(basic_plan).run_monte_carlo(n_simulations=1200, seed=42)
         finally:
-            P._MC_PARALLEL_MIN_SIMS = orig
+            MC._MC_PARALLEL_MIN_SIMS = orig
         assert s.p10_net_worth == p.p10_net_worth
         assert s.p25_net_worth == p.p25_net_worth
         assert s.p50_net_worth == p.p50_net_worth

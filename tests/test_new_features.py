@@ -2413,17 +2413,17 @@ class TestHistoricalBootstrap:
 
     def test_historical_inflation_dataset_has_96_years(self):
         """Sanity-check the embedded constant."""
-        from fintracker.projections import _US_HISTORICAL_INFLATION
+        from fintracker.montecarlo import _US_HISTORICAL_INFLATION
         assert len(_US_HISTORICAL_INFLATION) == 96
 
     def test_historical_inflation_includes_stagflation(self):
         """Dataset must include at least one year above 10% (1946, 1974, 1979–80)."""
-        from fintracker.projections import _US_HISTORICAL_INFLATION
+        from fintracker.montecarlo import _US_HISTORICAL_INFLATION
         assert max(_US_HISTORICAL_INFLATION) > 0.10
 
     def test_historical_inflation_includes_deflation(self):
         """Dataset must include deflation years (1930s Great Depression)."""
-        from fintracker.projections import _US_HISTORICAL_INFLATION
+        from fintracker.montecarlo import _US_HISTORICAL_INFLATION
         assert min(_US_HISTORICAL_INFLATION) < 0.0
 
 
