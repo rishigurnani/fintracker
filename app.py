@@ -236,7 +236,7 @@ def _income_section(defaults) -> IncomeProfile:
     )
     other_rate = 0.05
     if state_val == "OTHER":
-        other_rate = st.sidebar.slider("State Flat Tax Rate (%)", 0.0, 15.0, 5.0, 0.1) / 100
+        other_rate = st.sidebar.slider("State Flat Tax Rate (%)", 0.0, 15.0, _wd(d_inc, "other_state_flat_rate", 5.0, lambda v: v * 100), 0.1) / 100
 
     income = IncomeProfile(
         gross_annual_income=float(gross),
@@ -547,8 +547,8 @@ def _investments_section(defaults) -> InvestmentProfile:
         partner_annual_401k_contribution=float(partner_k401),
         annual_hsa_contribution=float(hsa),
         annual_529_contribution=float(c529),
-        annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, 8.0, 0.5)) / 100,
-        annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, 3.0, 0.25)) / 100,
+        annual_market_return=float(st.sidebar.slider("Market Return (%)", 0.0, 15.0, _wd(d_inv, "annual_market_return", 8.0, lambda v: v * 100), 0.5)) / 100,
+        annual_inflation_rate=float(st.sidebar.slider("Inflation (%)", 0.0, 10.0, _wd(d_inv, "annual_inflation_rate", 3.0, lambda v: v * 100), 0.25)) / 100,
         annual_healthcare_inflation_rate=float(st.sidebar.slider(
             "Healthcare Inflation (%)", 0.0, 12.0,
             _wd(d_inv, "annual_healthcare_inflation_rate", 5.0, lambda v: v * 100), 0.25,
@@ -559,7 +559,7 @@ def _investments_section(defaults) -> InvestmentProfile:
         partner_salary_growth_rate=float(st.sidebar.slider("Partner Salary Growth (%)", 0.0, 15.0,
             _wd(d_inv, "partner_salary_growth_rate", 4.0, lambda v: v * 100), 0.5)) / 100
             if spouse > 0 else 0.04,
-        annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, 3.5, 0.5)) / 100,
+        annual_home_appreciation_rate=float(st.sidebar.slider("Home Appreciation (%)", 0.0, 10.0, _wd(d_inv, "annual_home_appreciation_rate", 3.5, lambda v: v * 100), 0.5)) / 100,
         auto_invest_surplus=st.sidebar.toggle(
             "Auto-Invest Surplus",
             value=_wd(d_inv, "auto_invest_surplus", True),
