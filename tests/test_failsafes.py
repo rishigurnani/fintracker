@@ -380,13 +380,15 @@ class TestMedicalBurdenRatio:
         return make_plan(
             income=IncomeProfile(120_000, FilingStatus.SINGLE, State.TEXAS),
             lifestyle=LifestyleProfile(annual_medical_oop=18_000, medical_auto_scale=False,
-                                       annual_self_ltc_cost=90_000, self_ltc_start_age=75,
+                                       annual_self_ltc_cost=90_000, self_ltc_years_before_death=10,
                                        annual_health_insurance_premium=9_000),
             investments=investments(current_liquid_cash=120_000, current_retirement_balance=150_000,
                                     annual_market_return=0.05, annual_inflation_rate=0.03,
                                     annual_healthcare_inflation_rate=0.05),
+            # Death at 84 (projection year 55); LTC over the final 10 years = ages 75-84.
             retirement=RetirementProfile(current_age=30, retirement_age=60,
-                                         expected_post_retirement_return=0.04),
+                                         expected_post_retirement_return=0.04,
+                                         life_expectancy_age=84),
             projection_years=55, **overrides,
         )
 

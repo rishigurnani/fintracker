@@ -94,27 +94,53 @@ class TestInsurancePremiums:
 
 class TestSelfLongTermCare:
 
-    def _plan(self, current_age, start_age, cost, years):
+    def _plan(self, current_age, years_before_death, cost, life_expectancy_age):
         return make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            lifestyle=zero_lifestyle(annual_self_ltc_cost=cost, self_ltc_start_age=start_age),
+            lifestyle=zero_lifestyle(annual_self_ltc_cost=cost,
+                                     self_ltc_years_before_death=years_before_death),
             investments=investments(current_liquid_cash=2_000_000),
-            retirement=_retirement(current_age, auto_retire=False),
-            projection_years=years,
+            retirement=_retirement(current_age, auto_retire=False,
+                                   life_expectancy_age=life_expectancy_age),
+            # horizon is governed by life_expectancy_age when set (death year = 4 here)
+            projection_years=4,
         )
 
-    def test_applies_only_from_start_age(self):
-        # current_age 78, start 80 → yr1 age 78 (off), yr3 age 80 (on).
-        snaps = _project(self._plan(current_age=78, start_age=80, cost=90_000, years=4))
-        assert snaps[0].annual_self_ltc_cost == 0.0            # age 78
-        assert snaps[1].annual_self_ltc_cost == 0.0            # age 79
+    def test_applies_only_in_final_years_of_life(self):
+        # age 78 now, dies at 81 (projection year 4). years_before_death=3 → the
+        # final three years through death (years 2,3,4 = ages 79,80,81); year 1 off.
+        snaps = _project(self._plan(current_age=78, years_before_death=3,
+                                    cost=90_000, life_expectancy_age=81))
+        assert snaps[0].annual_self_ltc_cost == 0.0                    # age 78
+        assert snaps[1].annual_self_ltc_cost == pytest.approx(90_000)  # age 79
         assert snaps[2].annual_self_ltc_cost == pytest.approx(90_000)  # age 80
-        assert snaps[3].annual_self_ltc_cost == pytest.approx(90_000)  # age 81
+        assert snaps[3].annual_self_ltc_cost == pytest.approx(90_000)  # age 81 (death)
+
+    def test_window_of_one_charges_death_year_only(self):
+        # years_before_death=1 → only the death year (age 81, year 4) is charged.
+        snaps = _project(self._plan(current_age=78, years_before_death=1,
+                                    cost=90_000, life_expectancy_age=81))
+        costs = [s.annual_self_ltc_cost for s in snaps]
+        assert costs == [0.0, 0.0, 0.0, pytest.approx(90_000)]
+
+    def test_never_applies_without_death_year(self):
+        # A RetirementProfile without life_expectancy_age has no modeled death, so
+        # self-LTC (which anchors to the end of life) never triggers.
+        plan = make_plan(
+            income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
+            lifestyle=zero_lifestyle(annual_self_ltc_cost=90_000,
+                                     self_ltc_years_before_death=5),
+            investments=investments(current_liquid_cash=2_000_000),
+            retirement=_retirement(70, auto_retire=False),   # no life_expectancy_age
+            projection_years=6,
+        )
+        assert all(s.annual_self_ltc_cost == 0.0 for s in _project(plan))
 
     def test_never_applies_without_retirement_profile(self):
-        # No RetirementProfile → no age → self-LTC never triggers.
+        # No RetirementProfile → no death year → self-LTC never triggers.
         plan = make_plan(
-            lifestyle=zero_lifestyle(annual_self_ltc_cost=50_000, self_ltc_start_age=40),
+            lifestyle=zero_lifestyle(annual_self_ltc_cost=50_000,
+                                     self_ltc_years_before_death=5),
             investments=investments(current_liquid_cash=500_000),
             projection_years=3,
         )
@@ -328,11 +354,12 @@ class TestHealthcareInflation:
         assert snaps[2].annual_medical_oop == pytest.approx(4_840)          # ×1.10²
 
     def test_self_ltc_compounds_at_healthcare_rate(self):
+        # Death at 82 (projection year 3); LTC over the final 3 years = ages 80-82.
         plan = make_plan(
             income=IncomeProfile(150_000, FilingStatus.SINGLE, State.TEXAS),
-            lifestyle=zero_lifestyle(annual_self_ltc_cost=100_000, self_ltc_start_age=80),
+            lifestyle=zero_lifestyle(annual_self_ltc_cost=100_000, self_ltc_years_before_death=3),
             investments=self._inv(),
-            retirement=_retirement(80, auto_retire=False),
+            retirement=_retirement(80, auto_retire=False, life_expectancy_age=82),
             projection_years=3,
         )
         snaps = _project(plan)
@@ -401,14 +428,14 @@ class TestLifeExpectancy:
         assert snaps[-1].year == 16
 
     def test_self_ltc_bounded_by_death(self):
-        # current_age 80, death at 84 → yr5 is the death year. LTC from age 82
-        # (yr3) runs only through the death year: ages 82, 83, 84 → yrs 3, 4, 5.
-        # Without the death cap it would keep charging out to projection_years=20.
+        # current_age 80, death at 84 → yr5 is the death year. LTC over the final 3
+        # years of life = ages 82, 83, 84 → yrs 3, 4, 5. It is anchored to death, so
+        # it never charges out to the 20-year projection horizon.
         snaps = _project(self._plan(current_age=80, life_expectancy_age=84, projection_years=20,
-                                    annual_self_ltc_cost=100_000, self_ltc_start_age=82))
+                                    annual_self_ltc_cost=100_000, self_ltc_years_before_death=3))
         assert len(snaps) == 5
         ltc_years = [s.year for s in snaps if s.annual_self_ltc_cost > 0]
-        assert ltc_years == [3, 4, 5]        # bounded by death, not the 20-year horizon
+        assert ltc_years == [3, 4, 5]        # the final 3 years, bounded by death
 
     def test_death_benefit_pays_into_estate_in_final_year(self):
         with_benefit = _project(self._plan(current_age=80, life_expectancy_age=83, projection_years=20,

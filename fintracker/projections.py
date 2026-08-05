@@ -1297,6 +1297,22 @@ class ProjectionEngine:
     def _is_death_year(self, year: int) -> bool:
         return year == self._death_year()
 
+    def _self_ltc_active(self, year: int) -> bool:
+        """Whether self-funded long-term care applies in this projection year.
+
+        Modeled as the final ``self_ltc_years_before_death`` years of life, through
+        the death year inclusive (N=1 is the death year alone; N=3 the death year
+        plus the two before it). Requires a modeled death year (life_expectancy_age);
+        with none — or a non-positive window — LTC never applies. Single source of
+        truth for the gate, shared by ``_lifestyle`` and the failsafe medical
+        forecast so the two cannot drift.
+        """
+        n = self._plan.lifestyle.self_ltc_years_before_death
+        death = self._death_year()
+        if n <= 0 or death is None:
+            return False
+        return 0 <= death - year < n
+
     def _is_retired(self, year: int) -> bool:
         """True once the primary reaches retirement_age (needs a RetirementProfile).
 
@@ -1592,9 +1608,10 @@ class ProjectionEngine:
         disability   = (lif.annual_disability_insurance_premium if state.is_working else 0.0) * inf_f
         premiums     = health + disability + lif.annual_life_insurance_premium * inf_f
 
-        # Your own long-term care — age-gated, needs a RetirementProfile for age.
+        # Your own long-term care — the final N years of life (see _self_ltc_active);
+        # a failsafe may scale it down via med_mult.
         self_ltc = (lif.annual_self_ltc_cost * hc_f * med_mult
-                    if age is not None and age >= lif.self_ltc_start_age else 0.0)
+                    if self._self_ltc_active(year) else 0.0)
 
         # Childcare: age-bracketed profile takes priority over flat monthly_childcare.
         # Each child's age is computed from their birth year for accurate per-child costs.

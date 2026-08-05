@@ -53,10 +53,11 @@ lifestyle:
   # Fixed nominal (level term — NOT inflated); zero it if the policy lapses first.
   annual_life_insurance_death_benefit: 0
   # Your own long-term / end-of-life care (parents are annual_parent_care_cost).
-  # Applies once the primary reaches self_ltc_start_age (needs a retirement: block
-  # for age). Today's dollars, inflated.
+  # Applies over the final self_ltc_years_before_death years of life, through the
+  # death year inclusive (needs retirement.life_expectancy_age set). Today's
+  # dollars, inflated.
   annual_self_ltc_cost: 0
-  self_ltc_start_age: 80
+  self_ltc_years_before_death: 3
   annual_vacation: 5000
   monthly_other_recurring: 500
   # Parent care: annual cost of supporting aging parents (in-home care,

@@ -106,9 +106,9 @@ class FailsafeController:
                                  num_children: int, working: bool) -> float:
         """Anticipated healthcare cost for one future year (baseline, no cut).
 
-        OOP + health premium (while working, pre-Medicare) + self-LTC (age-gated)
-        + base Medicare (65+; IRMAA excluded as it is MAGI/path-dependent), all in
-        year-``year`` nominal dollars via the healthcare factor ``hc_f``.
+        OOP + health premium (while working, pre-Medicare) + self-LTC (final years
+        of life) + base Medicare (65+; IRMAA excluded as it is MAGI/path-dependent),
+        all in year-``year`` nominal dollars via the healthcare factor ``hc_f``.
         """
         lif = self._plan.lifestyle
         rp = self._plan.retirement
@@ -118,7 +118,7 @@ class FailsafeController:
         health = (lif.annual_health_insurance_premium * hc_f
                   if working and (age is None or age < medicare_age) else 0.0)
         self_ltc = (lif.annual_self_ltc_cost * hc_f
-                    if age is not None and age >= lif.self_ltc_start_age else 0.0)
+                    if self._engine._self_ltc_active(year) else 0.0)
         medicare = 0.0
         if rp and age is not None and age >= rp.medicare_start_age:
             enrolled = 2 if is_married else 1

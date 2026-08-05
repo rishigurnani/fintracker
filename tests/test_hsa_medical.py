@@ -13,18 +13,21 @@ from tests.builders import make_plan, investments, renting_housing
 
 
 def _plan(current_age, retirement_age, hsa_start, medical_oop, ltc=0.0,
-          ltc_start_age=200, market=0.0, post_ret=0.0, years=3):
+          ltc_years_before_death=0, life_expectancy_age=None,
+          market=0.0, post_ret=0.0, years=3):
     plan = make_plan(
         income=IncomeProfile(0, FilingStatus.SINGLE, State.TEXAS),
         housing=renting_housing(monthly_rent=0),
         lifestyle=LifestyleProfile(annual_medical_oop=medical_oop, medical_auto_scale=False,
                                    annual_vacation=0, monthly_other_recurring=0,
-                                   annual_self_ltc_cost=ltc, self_ltc_start_age=ltc_start_age),
+                                   annual_self_ltc_cost=ltc,
+                                   self_ltc_years_before_death=ltc_years_before_death),
         investments=investments(current_liquid_cash=0, current_retirement_balance=5_000_000,
                                 annual_market_return=market, annual_hsa_contribution=0),
         retirement=RetirementProfile(current_age=current_age, retirement_age=retirement_age,
                                      medicare_start_age=200, expected_post_retirement_return=post_ret,
-                                     retirement_withdrawal_tax_rate=0.2),
+                                     retirement_withdrawal_tax_rate=0.2,
+                                     life_expectancy_age=life_expectancy_age),
         projection_years=years,
     )
     # Seed a starting HSA balance directly (no contribution path needed).
@@ -74,8 +77,10 @@ class TestHsaMedicalSpend:
 
     def test_hsa_covers_long_term_care(self):
         """Long-term care is HSA-qualified and is paid from the HSA in retirement."""
+        # Death in projection year 1 (age 66), LTC window of 1 → LTC active that year.
         plan, eng, hsa0 = _plan(current_age=66, retirement_age=65, hsa_start=100_000,
-                                medical_oop=0, ltc=30_000, ltc_start_age=66)
+                                medical_oop=0, ltc=30_000, ltc_years_before_death=1,
+                                life_expectancy_age=66)
         s = _run_with_hsa(plan, eng, hsa0)[0]
         assert s.annual_hsa_withdrawal == pytest.approx(30_000, rel=1e-6)
         assert s.hsa_balance == pytest.approx(70_000, rel=1e-6)

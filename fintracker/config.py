@@ -138,7 +138,7 @@ _LIFESTYLE_SPEC = [
     ("annual_life_insurance_premium", float, 0),
     ("annual_life_insurance_death_benefit", float, 0),
     ("annual_self_ltc_cost", float, 0),
-    ("self_ltc_start_age", int, 80),
+    ("self_ltc_years_before_death", int, 3),
     ("annual_vacation", float, 5_000),
     ("monthly_other_recurring", float, 500),
     ("annual_parent_care_cost", float, 0),

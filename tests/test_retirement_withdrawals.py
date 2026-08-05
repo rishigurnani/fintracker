@@ -29,7 +29,8 @@ from tests.builders import investments, zero_lifestyle
 # year 2 = age 59 (penalty-free), which is what the drawdown tests below exercise.
 def _ret_plan(rent_month=1_000, brokerage=0.0, retirement=0.0, liquid=0.0,
               wd_rate=0.0, order=None, current_age=58, married=False,
-              medicare_premium=0.0, self_ltc=0.0, years=3):
+              medicare_premium=0.0, self_ltc=0.0, self_ltc_years_before_death=0,
+              life_expectancy_age=None, years=3):
     return FinancialPlan(
         income=IncomeProfile(
             0.0,
@@ -37,7 +38,8 @@ def _ret_plan(rent_month=1_000, brokerage=0.0, retirement=0.0, liquid=0.0,
             State.TEXAS),
         housing=HousingProfile(0, 0, 0.0, is_renting=True, monthly_rent=rent_month,
                                annual_rent_increase_rate=0.0),
-        lifestyle=zero_lifestyle(annual_self_ltc_cost=self_ltc, self_ltc_start_age=66),
+        lifestyle=zero_lifestyle(annual_self_ltc_cost=self_ltc,
+                                 self_ltc_years_before_death=self_ltc_years_before_death),
         investments=investments(current_liquid_cash=liquid,
                                 current_brokerage_balance=brokerage,
                                 current_retirement_balance=retirement),
@@ -46,6 +48,7 @@ def _ret_plan(rent_month=1_000, brokerage=0.0, retirement=0.0, liquid=0.0,
         retirement=RetirementProfile(current_age=current_age, retirement_age=65,
                                      retirement_withdrawal_tax_rate=wd_rate,
                                      annual_medicare_premium=medicare_premium,
+                                     life_expectancy_age=life_expectancy_age,
                                      # isolate withdrawal mechanics from growth
                                      expected_post_retirement_return=0.0),
         projection_years=years,
@@ -166,12 +169,14 @@ class TestDefaultWithdrawalOrder:
 class TestWithdrawalDrivenIrmaaAndLiquidity:
 
     def test_irmaa_fires_on_large_withdrawal(self):
-        # A big self-LTC deficit at 66 forces a large 401k withdrawal → high MAGI
-        # → IRMAA on top of the base premium (married ⇒ base = 2 × premium).
+        # A big self-LTC deficit near end of life forces a large 401k withdrawal →
+        # high MAGI → IRMAA on top of the base premium (married ⇒ base = 2 × premium).
+        # Death at 67 (yr3), LTC over the final 2 years → active at ages 66 and 67.
         snaps = _project(_ret_plan(brokerage=0.0, retirement=5_000_000, liquid=0.0,
                                    married=True, medicare_premium=2_000,
-                                   self_ltc=300_000, current_age=65, years=3))
-        y3 = snaps[2]  # age 67 → self_ltc active (start age 66)
+                                   self_ltc=300_000, self_ltc_years_before_death=2,
+                                   life_expectancy_age=67, current_age=65, years=3))
+        y3 = snaps[2]  # age 67 (death year) → self_ltc active
         assert y3.annual_retirement_withdrawal > 300_000
         base_premium = 2_000 * 2 * y3.cumulative_inflation
         assert y3.annual_medicare_cost > base_premium + 1.0        # IRMAA surcharge present

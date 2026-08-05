@@ -223,11 +223,13 @@ class LifestyleProfile:
     annual_life_insurance_death_benefit: float = 0.0
 
     # Your own long-term / end-of-life care (parallel to annual_parent_care_cost,
-    # which covers your parents). Age-gated: applies once the primary reaches
-    # self_ltc_start_age. Needs a RetirementProfile for age; without one it is
-    # never applied. Today's dollars, inflated yearly.
+    # which covers your parents). Modeled as the final self_ltc_years_before_death
+    # years of life (through the death year inclusive) — care clusters at the end of
+    # life, not at a fixed age. Needs a modeled death year (RetirementProfile with
+    # life_expectancy_age); without one it is never applied. Today's dollars,
+    # inflated yearly.
     annual_self_ltc_cost: float = 0.0
-    self_ltc_start_age: int = 80
+    self_ltc_years_before_death: int = 3
 
     annual_vacation: float = 0.0
     monthly_other_recurring: float = 0.0

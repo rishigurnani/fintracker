@@ -363,12 +363,14 @@ def _lifestyle_section(defaults) -> LifestyleProfile:
             min_value=0, max_value=500_000,
             value=_wd(d_lif, "annual_self_ltc_cost", 0, int), step=1_000,
             help="Your end-of-life / LTC costs (parents are handled separately). "
-                 "Needs a retirement profile for age.",
+                 "Needs a Life expectancy age set (below) to anchor the end of life.",
         )
-        self_ltc_start_age = st.number_input(
-            "Long-term care starts at age",
-            min_value=50, max_value=110,
-            value=_wd(d_lif, "self_ltc_start_age", 80, int), step=1,
+        self_ltc_years_before_death = st.number_input(
+            "Long-term care: years before death",
+            min_value=0, max_value=30,
+            value=_wd(d_lif, "self_ltc_years_before_death", 3, int), step=1,
+            help="LTC applies over the final N years of life, through the death "
+                 "year inclusive (1 = death year only). Requires a Life expectancy age.",
         )
     vacation = st.sidebar.number_input(
         "Annual Vacation  (inflated yearly)", min_value=0, max_value=100_000,
@@ -392,7 +394,7 @@ def _lifestyle_section(defaults) -> LifestyleProfile:
         annual_life_insurance_premium=float(life_prem),
         annual_life_insurance_death_benefit=float(life_benefit),
         annual_self_ltc_cost=float(self_ltc),
-        self_ltc_start_age=int(self_ltc_start_age),
+        self_ltc_years_before_death=int(self_ltc_years_before_death),
         annual_vacation=float(vacation),
         monthly_other_recurring=float(other_monthly),
     )
