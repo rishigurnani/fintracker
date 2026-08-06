@@ -332,6 +332,13 @@ class EngineState:
     # Medicare) this year; 1.0 = unchanged. A failsafe may cut it (e.g. 0.5).
     medical_cost_multiplier: float = 1.0
 
+    # The primary's *realized* death year for this run (deterministic: the planning
+    # death from life_expectancy_age; Monte Carlo: a per-sim draw from the death-age
+    # range). Governs when actual end-of-life costs occur and the death benefit pays.
+    # None = no modeled death (runs the full horizon). Distinct from the planning
+    # death year used by forward-looking forecasts.
+    realized_death_year: Optional[int] = None
+
     @property
     def gross_income(self) -> float:
         return self.income_primary + self.income_partner
@@ -602,7 +609,7 @@ class ProjectionEngine:
         """
         return MonteCarloSimulator(self._plan).run(*args, **kwargs)
 
-    def _run_sim_rows(self, all_mkt, all_inf, all_sg, years, amort_cache):
+    def _run_sim_rows(self, all_mkt, all_inf, all_sg, years, amort_cache, all_death=None):
         """Run the per-sim projection loop over a batch of pre-drawn RNG rows.
 
         Returns ``(nw, liq, fired_list)`` — net-worth and liquid (brokerage + cash
@@ -611,18 +618,33 @@ class ProjectionEngine:
         cross-process transfer and the percentile aggregation cheap. This is the sole
         per-sim loop; ``run_monte_carlo`` calls it directly (serial) or ships
         row-slices to worker processes, with identical aggregation either way.
+
+        ``all_death`` (optional, one realized death year per row) makes each path end
+        at its own death: the years strictly after it are filled with NaN so the
+        aggregator can drop the dead (survivors-only). When None, every path runs the
+        full ``years`` span against the deterministic death — the pre-range behaviour.
         """
         all_nw: list[list[float]] = []
         all_liq: list[list[float]] = []
         fired_list: list[list[str]] = []
+        n_years = len(years)
         for sim_idx in range(len(all_mkt)):
             mkt = all_mkt[sim_idx]
             inf = all_inf[sim_idx]
             sg  = all_sg[sim_idx]
             state = self._initial_state()
+            if all_death is not None:
+                state.realized_death_year = int(all_death[sim_idx])
+            death = state.realized_death_year
             sim_nw:  list[float] = []
             sim_liq: list[float] = []
             for i, year in enumerate(years):
+                if death is not None and year > death:
+                    # Dead: pad the remaining years with NaN (survivors-only
+                    # aggregation drops them) and stop — no post-death cashflows.
+                    sim_nw.extend([float("nan")] * (n_years - i))
+                    sim_liq.extend([float("nan")] * (n_years - i))
+                    break
                 self._apply_timeline_events(state, year, amort_cache)
                 self._evaluate_failsafes(state, year)
                 snap = self._compute_year(
@@ -823,6 +845,8 @@ class ProjectionEngine:
             realized_gains_ytd=0.0,
             business_equity=0.0,
             business_revenue=(p.business.annual_revenue if p.business else 0.0),
+            # Default to the planning death; Monte Carlo overrides per simulation.
+            realized_death_year=self._death_year(),
         )
 
     @staticmethod
@@ -1191,7 +1215,7 @@ class ProjectionEngine:
         # Life-insurance death benefit: a fixed nominal payout into the estate in
         # the year the primary dies (the final projected year). Not inflated (level
         # term coverage) and not spendable income — it lands straight in net worth.
-        life_payout = p.lifestyle.annual_life_insurance_death_benefit if self._is_death_year(year) else 0.0
+        life_payout = p.lifestyle.annual_life_insurance_death_benefit if self._is_death_year(state, year) else 0.0
 
         nw = (g.retirement + g.hsa + g.col529 + g.roth_balance + g.brokerage + home_equity
               + g.uninvested + g.cash_buffer + biz_equity + life_payout)
@@ -1275,43 +1299,61 @@ class ProjectionEngine:
         return rp.current_age + (year - 1) if rp else None
 
     def _death_year(self) -> Optional[int]:
-        """Projection year the primary dies (age == life_expectancy_age), or None.
+        """The *planning* death year — projection year the primary reaches
+        life_expectancy_age — or None when unset.
 
-        None when no RetirementProfile or no life_expectancy_age is set. Otherwise
-        the death year *defines the projection endpoint*, whether that is earlier
-        or later than projection_years — so the year-by-year tables always run
-        right through death rather than stopping at an arbitrary horizon.
+        This is the horizon forward-looking decisions plan against (the deterministic
+        endpoint, and every forecast such as the medical-burden failsafe): you plan
+        to your life expectancy, not to the realized death you can't foresee. The
+        *realized* death (which may differ in Monte Carlo) lives on EngineState —
+        see ``_realized_death_year`` / ``_is_death_year``.
         """
         rp = self._plan.retirement
         if rp is None or rp.life_expectancy_age is None:
             return None
         return max(1, rp.life_expectancy_age - rp.current_age + 1)
 
+    def _mc_death_bounds(self) -> Optional[tuple[int, int]]:
+        """Realized-death-year range [min, max] for Monte Carlo, or None.
+
+        Active only when BOTH death_age_min and death_age_max are set on the
+        RetirementProfile; converts ages to projection years (floored at 1) and
+        orders them defensively. None → MC uses the deterministic planning death.
+        """
+        rp = self._plan.retirement
+        if rp is None or rp.death_age_min is None or rp.death_age_max is None:
+            return None
+        lo = max(1, rp.death_age_min - rp.current_age + 1)
+        hi = max(1, rp.death_age_max - rp.current_age + 1)
+        return (min(lo, hi), max(lo, hi))
+
     def _horizon(self) -> int:
-        """Number of years to actually project. When a life_expectancy_age is set it
-        governs the endpoint (extending past or truncating projection_years so the
-        projection ends the year the primary dies); otherwise projection_years."""
+        """Number of years the *deterministic* projection runs — through the planning
+        death year (extending past or truncating projection_years) when set, else
+        projection_years. Monte Carlo computes its own horizon from the death range;
+        see MonteCarloSimulator."""
         death = self._death_year()
         return death if death is not None else self._plan.projection_years
 
-    def _is_death_year(self, year: int) -> bool:
-        return year == self._death_year()
+    def _is_death_year(self, state: EngineState, year: int) -> bool:
+        """Whether ``year`` is the primary's *realized* death year for this run."""
+        return year == state.realized_death_year
 
-    def _self_ltc_active(self, year: int) -> bool:
-        """Whether self-funded long-term care applies in this projection year.
+    def _self_ltc_active(self, year: int, death_year: Optional[int]) -> bool:
+        """Whether self-funded long-term care applies in ``year``, relative to the
+        supplied ``death_year``.
 
         Modeled as the final ``self_ltc_years_before_death`` years of life, through
         the death year inclusive (N=1 is the death year alone; N=3 the death year
-        plus the two before it). Requires a modeled death year (life_expectancy_age);
-        with none — or a non-positive window — LTC never applies. Single source of
-        truth for the gate, shared by ``_lifestyle`` and the failsafe medical
-        forecast so the two cannot drift.
+        plus the two before it). ``death_year`` is the *realized* death for actual
+        costs (``_lifestyle``) but the *planning* death for forecasts (the failsafe
+        medical projection), so the caller passes whichever is right — the gate
+        logic stays in one place. None death year or a non-positive window → never.
         """
         n = self._plan.lifestyle.self_ltc_years_before_death
-        death = self._death_year()
-        if n <= 0 or death is None:
+        if n <= 0 or death_year is None:
             return False
-        return 0 <= death - year < n
+        return 0 <= death_year - year < n
 
     def _is_retired(self, year: int) -> bool:
         """True once the primary reaches retirement_age (needs a RetirementProfile).
@@ -1608,10 +1650,10 @@ class ProjectionEngine:
         disability   = (lif.annual_disability_insurance_premium if state.is_working else 0.0) * inf_f
         premiums     = health + disability + lif.annual_life_insurance_premium * inf_f
 
-        # Your own long-term care — the final N years of life (see _self_ltc_active);
-        # a failsafe may scale it down via med_mult.
+        # Your own long-term care — the final N years of life relative to the
+        # *realized* death (see _self_ltc_active); a failsafe may scale it via med_mult.
         self_ltc = (lif.annual_self_ltc_cost * hc_f * med_mult
-                    if self._self_ltc_active(year) else 0.0)
+                    if self._self_ltc_active(year, state.realized_death_year) else 0.0)
 
         # Childcare: age-bracketed profile takes priority over flat monthly_childcare.
         # Each child's age is computed from their birth year for accurate per-child costs.

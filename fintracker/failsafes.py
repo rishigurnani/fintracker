@@ -117,8 +117,10 @@ class FailsafeController:
         medical = lif.scaled_medical_oop(is_married, num_children) * hc_f
         health = (lif.annual_health_insurance_premium * hc_f
                   if working and (age is None or age < medicare_age) else 0.0)
+        # Forecast: gate LTC against the *planning* death (life expectancy), never a
+        # realized Monte Carlo draw — the forecaster can't foresee an early death.
         self_ltc = (lif.annual_self_ltc_cost * hc_f
-                    if self._engine._self_ltc_active(year) else 0.0)
+                    if self._engine._self_ltc_active(year, self._engine._death_year()) else 0.0)
         medicare = 0.0
         if rp and age is not None and age >= rp.medicare_start_age:
             enrolled = 2 if is_married else 1
@@ -136,7 +138,10 @@ class FailsafeController:
 
         The result depends only on ``year`` and the deterministic state inputs
         below (the healthcare-inflation factor is a fixed function of the year),
-        so it is memoised and shared across every simulation path.
+        so it is memoised and shared across every simulation path. The forecast
+        runs to the *planning* horizon (life expectancy), independent of any
+        realized Monte Carlo death — that is the whole point: at 75 you budget for
+        living to your planning age even in a path where you happen to die at 85.
         """
         key = (year, state.is_working, state.is_married, state.num_children)
         cached = self._pv_medical_cache.get(key)
@@ -147,7 +152,9 @@ class FailsafeController:
         discount = rp.expected_post_retirement_return if rp else inv.annual_market_return
         hc_rate = inv.annual_healthcare_inflation_rate
         retire_age = rp.retirement_age if rp else None
-        horizon = self._engine._horizon()
+        # Planning horizon; clamp to >= year so a path that outlives the planning
+        # death (realized > planning) still forecasts at least the current year.
+        horizon = max(self._engine._horizon(), year)
         total = 0.0
         for t in range(year, horizon + 1):
             hc_f_t = state.cumulative_healthcare_inflation * (1 + hc_rate) ** (t - year)
@@ -168,8 +175,10 @@ class FailsafeController:
         for c in fs.conditions:
             # end_year of None OR 0 (non-positive) means "to the horizon" — same
             # sentinel convention the UI uses (it sends 0 for "end"). Only a value
-            # >= 1 bounds the window.
-            end = c.end_year if (c.end_year and c.end_year >= 1) else self._engine._horizon()
+            # >= 1 bounds the window. Clamp the open-ended case to >= year so a path
+            # that outlives the planning horizon still evaluates its conditions.
+            end = (c.end_year if (c.end_year and c.end_year >= 1)
+                   else max(self._engine._horizon(), year))
             if not (c.start_year <= year <= end):
                 results.append(False)
                 continue

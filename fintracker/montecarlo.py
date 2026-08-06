@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -230,15 +231,15 @@ def _mc_context():
     return mp.get_context("spawn")
 
 
-def _mc_worker(plan, all_mkt, all_inf, all_sg, years, amort_cache):
+def _mc_worker(plan, all_mkt, all_inf, all_sg, years, amort_cache, all_death=None):
     """Top-level (picklable) entry point for a Monte Carlo worker process.
 
     Rebuilds a fresh engine from the (picklable) plan and runs the ordinary
-    per-sim loop over its slice of the pre-drawn RNG matrices. Kept module-level
-    so it survives the ``spawn`` start method used on macOS.
+    per-sim loop over its slice of the pre-drawn RNG matrices (and per-sim death
+    years). Kept module-level so it survives the ``spawn`` start method on macOS.
     """
     from fintracker.projections import ProjectionEngine
-    return ProjectionEngine(plan)._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache)
+    return ProjectionEngine(plan)._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache, all_death)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +306,13 @@ class MonteCarloSimulator:
         engine = ProjectionEngine(self._plan)
         rng = np.random.default_rng(seed)
         inv = self._plan.investments
-        years = list(range(1, engine._horizon() + 1))
+        # A realized death-age range (if configured) makes each sim end at its own
+        # drawn death year; the projection must span the longest possible life, so
+        # the horizon runs to the top of the range. With no range, the deterministic
+        # planning horizon governs — bit-identical to the pre-range behaviour.
+        death_bounds = engine._mc_death_bounds()
+        mc_horizon = death_bounds[1] if death_bounds else engine._horizon()
+        years = list(range(1, mc_horizon + 1))
 
         hist = np.array(_SP500_HISTORICAL_RETURNS)
 
@@ -345,8 +352,14 @@ class MonteCarloSimulator:
             all_sg = np.clip(rng.normal(inv.annual_salary_growth_rate, salary_growth_std,
                                          (n_simulations, n_years)), -0.10, 0.20)
 
+        # Realized death year per sim (uniform over the configured age range).
+        # Drawn after the economic matrices so the no-range path leaves the RNG
+        # stream — and thus every existing seeded result — untouched.
+        all_death = (rng.integers(death_bounds[0], death_bounds[1] + 1, size=n_simulations)
+                     if death_bounds else None)
+
         nw_arr, liq_arr, fired_list = self._run_paths(
-            engine, all_mkt, all_inf, all_sg, years, amort_cache, n_simulations)
+            engine, all_mkt, all_inf, all_sg, years, amort_cache, n_simulations, all_death)
 
         return self._aggregate(
             years, nw_arr, liq_arr, fired_list, n_simulations,
@@ -376,12 +389,13 @@ class MonteCarloSimulator:
         return amort_cache
 
     @staticmethod
-    def _run_paths(engine, all_mkt, all_inf, all_sg, years, amort_cache, n_simulations):
+    def _run_paths(engine, all_mkt, all_inf, all_sg, years, amort_cache, n_simulations, all_death=None):
         """Run every sampled path, fanning across processes for large batches.
 
         The sims are independent and the RNG is pre-drawn, so the parallel result
         is identical to the serial one; small batches (and the test suite) stay
-        serial to skip process-startup overhead.
+        serial to skip process-startup overhead. ``all_death`` (per-sim realized
+        death year, or None) is sliced alongside the economic rows.
         """
         n_cpu = os.cpu_count() or 1
         if n_simulations >= _MC_PARALLEL_MIN_SIMS and n_cpu > 1:
@@ -391,14 +405,15 @@ class MonteCarloSimulator:
             with ProcessPoolExecutor(max_workers=len(slices), mp_context=_mc_context()) as ex:
                 futures = [
                     ex.submit(_mc_worker, engine._plan,
-                              all_mkt[s:e], all_inf[s:e], all_sg[s:e], years, amort_cache)
+                              all_mkt[s:e], all_inf[s:e], all_sg[s:e], years, amort_cache,
+                              None if all_death is None else all_death[s:e])
                     for (s, e) in slices
                 ]
                 for f in futures:                       # gathered in submission order
                     nw_c, liq_c, fired_c = f.result()
                     nw_parts.append(nw_c); liq_parts.append(liq_c); fired_list.extend(fired_c)
             return np.vstack(nw_parts), np.vstack(liq_parts), fired_list
-        return engine._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache)
+        return engine._run_sim_rows(all_mkt, all_inf, all_sg, years, amort_cache, all_death)
 
     def _aggregate(
         self, years, nw_arr, liq_arr, fired_list, n_simulations,
@@ -413,26 +428,46 @@ class MonteCarloSimulator:
                 failsafe_counts[name] += 1
         failsafe_fire_rates = {name: c / n_simulations for name, c in failsafe_counts.items()}
 
-        # Per-year percentiles / stats, vectorised across sims (axis 0).
-        p_nw = np.percentile(nw_arr, [10, 25, 50, 75, 90], axis=0)
-        p_liq = np.percentile(liq_arr, [10, 50, 90], axis=0)
-        yr10 = nw_arr[:, 9] if nw_arr.shape[1] >= 10 else None
+        # Per-year percentiles / stats, vectorised across sims (axis 0). Post-death
+        # years are NaN (survivors-only): nan-aware reducers drop the dead so each
+        # year reflects only the sims still alive. With no death range there are no
+        # NaNs, so these collapse to the plain reducers — bit-identical to before.
+        n_years = nw_arr.shape[1]
+        alive = ~np.isnan(liq_arr)
+        alive_count = alive.sum(axis=0)
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)     # all-NaN tail years
+            p_nw = np.nanpercentile(nw_arr, [10, 25, 50, 75, 90], axis=0)
+            p_liq = np.nanpercentile(liq_arr, [10, 50, 90], axis=0)
+            mean_nw = np.nanmean(nw_arr, axis=0)
+            neg_count = ((liq_arr < 0) & alive).sum(axis=0)
+        # Liquidity risk conditional on being alive: negatives / survivors that year.
+        prob_neg = np.divide(neg_count, alive_count, out=np.zeros(n_years),
+                             where=alive_count > 0)
+        prob_millionaire = 0.0
+        if n_years >= 10:
+            yr10 = nw_arr[:, 9]
+            alive10 = ~np.isnan(yr10)
+            if alive10.any():
+                prob_millionaire = float((yr10[alive10] >= 1_000_000).mean())
+
+        def _clean(row):
+            # Replace any all-dead-year NaN with 0.0 so the result stays JSON/plot-safe.
+            return [float(x) if x == x else 0.0 for x in row]
 
         return MonteCarloResult(
             years=years,
-            p10_net_worth=[float(x) for x in p_nw[0]],
-            p25_net_worth=[float(x) for x in p_nw[1]],
-            p50_net_worth=[float(x) for x in p_nw[2]],
-            p75_net_worth=[float(x) for x in p_nw[3]],
-            p90_net_worth=[float(x) for x in p_nw[4]],
-            mean_net_worth=[float(x) for x in nw_arr.mean(axis=0)],
-            prob_negative_liquid=[float(x) for x in (liq_arr < 0).mean(axis=0)],
-            p10_liquid=[float(x) for x in p_liq[0]],
-            p50_liquid=[float(x) for x in p_liq[1]],
-            p90_liquid=[float(x) for x in p_liq[2]],
-            prob_millionaire_10yr=(
-                float((yr10 >= 1_000_000).mean()) if yr10 is not None else 0.0
-            ),
+            p10_net_worth=_clean(p_nw[0]),
+            p25_net_worth=_clean(p_nw[1]),
+            p50_net_worth=_clean(p_nw[2]),
+            p75_net_worth=_clean(p_nw[3]),
+            p90_net_worth=_clean(p_nw[4]),
+            mean_net_worth=_clean(mean_nw),
+            prob_negative_liquid=[float(x) for x in prob_neg],
+            p10_liquid=_clean(p_liq[0]),
+            p50_liquid=_clean(p_liq[1]),
+            p90_liquid=_clean(p_liq[2]),
+            prob_millionaire_10yr=prob_millionaire,
             num_simulations=n_simulations,
             use_historical_returns=use_historical_returns,
             use_historical_inflation=use_historical_inflation,

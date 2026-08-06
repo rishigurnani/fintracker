@@ -1981,8 +1981,13 @@ def _tab_projections(plan, snapshots, projection_engine) -> None:
 # ── TAB 2: Monte Carlo ───────────────────────────────────
 
 
-def _mc_simulation_params() -> dict:
-    """Render the Monte Carlo parameter controls; return run_monte_carlo kwargs."""
+def _mc_simulation_params(plan) -> dict:
+    """Render the Monte Carlo parameter controls.
+
+    Returns the run_monte_carlo kwargs plus the MC-only realized death-age range
+    (``death_age_min`` / ``death_age_max``, or None when the lifespan isn't
+    randomized) — the caller applies the latter to plan.retirement before running.
+    """
     with st.expander("⚙️ Simulation Parameters", expanded=False):
         col_t1, col_t2 = st.columns(2)
         use_hist = col_t1.toggle(
@@ -2043,10 +2048,49 @@ def _mc_simulation_params() -> dict:
             help="Year-to-year variation in salary growth.",
         ) / 100
         mc_seed = st.checkbox("Fix random seed (reproducible)", value=True)
+
+        # --- Randomized lifespan (realized death-age range) ---
+        # life_expectancy_age stays the PLANNING horizon (what forecasts budget to);
+        # this range is only the realized death each simulation actually draws.
+        st.markdown("---")
+        rp = plan.retirement
+        death_age_min = death_age_max = None
+        if rp is None:
+            st.caption("🎲 **Randomize death age:** add a retirement profile "
+                       "(with a current age) to enable a randomized lifespan.")
+        else:
+            default_le = rp.life_expectancy_age or 90
+            randomize = st.checkbox(
+                "🎲 Randomize death age (lifespan uncertainty)",
+                value=(rp.death_age_min is not None and rp.death_age_max is not None),
+                help="ON: each simulation draws the primary's ACTUAL death age uniformly "
+                     "from the range below and runs to that year; later-year bands then "
+                     "reflect only the simulations still alive (survivors-only). Your "
+                     "life_expectancy_age stays the PLANNING horizon that forward-looking "
+                     "decisions (e.g. the medical-burden failsafe) forecast against — at "
+                     "75 you can't foresee dying at 85. OFF: every sim dies at "
+                     "life_expectancy_age, as before.",
+            )
+            if randomize:
+                dc1, dc2 = st.columns(2)
+                cur = int(rp.current_age)
+                death_age_min = int(dc1.number_input(
+                    "Earliest death age", min_value=cur + 1, max_value=120,
+                    value=int(rp.death_age_min if rp.death_age_min is not None
+                              else max(cur + 1, default_le - 15)),
+                    step=1,
+                ))
+                death_age_max = int(dc2.number_input(
+                    "Latest death age", min_value=death_age_min, max_value=121,
+                    value=int(rp.death_age_max if rp.death_age_max is not None
+                              else max(death_age_min, default_le)),
+                    step=1,
+                ))
     return dict(
         n_sims=int(n_sims), use_hist=use_hist, use_hist_inf=use_hist_inf,
         mkt_std=mkt_std, inf_std=inf_std, sg_std=sg_std, mc_seed=mc_seed,
         block_bs=block_bs, mean_block=float(mean_block),
+        death_age_min=death_age_min, death_age_max=death_age_max,
     )
 
 
@@ -2147,7 +2191,21 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     )
 
     # ── Simulation parameters ────────────────────────────────
-    p = _mc_simulation_params()
+    p = _mc_simulation_params(plan)
+    # Apply the (MC-only) realized death-age range onto the plan before running.
+    # Deterministic views ignore these fields, so this doesn't affect other tabs;
+    # mutating the plan also keeps the cached-run key correct (it hashes the plan).
+    if plan.retirement is not None:
+        plan.retirement.death_age_min = p["death_age_min"]
+        plan.retirement.death_age_max = p["death_age_max"]
+        if p["death_age_min"] is not None and p["death_age_max"] is not None:
+            _plan_age = (f" · you plan (forecast) to age {plan.retirement.life_expectancy_age}"
+                         if plan.retirement.life_expectancy_age else "")
+            st.caption(
+                f"⚰️ **Randomized lifespan:** each simulation draws a death age uniformly "
+                f"from **{p['death_age_min']}–{p['death_age_max']}**{_plan_age}. Bands past the "
+                f"earliest deaths reflect only the simulations still alive that year (survivors-only)."
+            )
     n_sims = p["n_sims"]
     params = dict(
         n_simulations=n_sims, seed=42 if p["mc_seed"] else None,

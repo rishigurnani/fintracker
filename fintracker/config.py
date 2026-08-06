@@ -198,6 +198,8 @@ _RETIREMENT_SPEC = [
     ("annual_medicare_premium", float, 2_100),
     ("auto_retire", bool, True),
     ("life_expectancy_age", _opt(int), None),
+    ("death_age_min", _opt(int), None),
+    ("death_age_max", _opt(int), None),
     ("spending_smile_slowgo_age", int, 75),
     ("spending_smile_slowgo_factor", float, 0.90),
     ("spending_smile_nogo_age", int, 85),

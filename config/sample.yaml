@@ -152,6 +152,14 @@ retirement:
   # and drawdowns stop. Bounds end-of-life costs like self-LTC and triggers any
   # life-insurance death benefit. Omit / null to run exactly projection_years.
   # life_expectancy_age: 90
+  # Monte-Carlo-only realized death-age range. When BOTH are set, each simulation
+  # draws the primary's ACTUAL death age uniformly from [death_age_min, death_age_max]
+  # and runs to that year (survivors-only aggregation past it). life_expectancy_age
+  # stays the PLANNING horizon: forward-looking decisions (e.g. the medical-burden
+  # failsafe) still forecast to it, since at 75 you can't foresee an early death.
+  # Omit either to use the deterministic death (life_expectancy_age) in MC too.
+  # death_age_min: 80
+  # death_age_max: 100
   # Ordinary-income tax rate applied to 401k/IRA withdrawals that fund a
   # retirement deficit (grossed up so the net still covers spending). Also used
   # in the retirement-readiness after-tax haircut. Typical: 0.22–0.32.

@@ -592,6 +592,18 @@ class RetirementProfile:
     # behaviour: run exactly projection_years.
     life_expectancy_age: Optional[int] = None
 
+    # Monte-Carlo-only *realized* death-age range. When BOTH are set, each MC
+    # simulation draws the primary's actual death age uniformly from
+    # [death_age_min, death_age_max] and runs to that year (survivors-only
+    # aggregation past it). This is distinct from life_expectancy_age, which stays
+    # the *planning* horizon that forward-looking decisions forecast against (e.g.
+    # the medical-burden failsafe): at 75 you don't know your realized death, so you
+    # plan to life_expectancy_age even in a sim where you happen to die earlier.
+    # None (either unset) → MC uses the deterministic death (life_expectancy_age),
+    # exactly as before. Ignored by the deterministic projection.
+    death_age_min: Optional[int] = None
+    death_age_max: Optional[int] = None
+
     # Retirement "spending smile". Empirically, retirees' real discretionary
     # spending declines with age (the go-go / slow-go / no-go years). This scales
     # ONLY discretionary lifestyle (vacation, pets, monthly "other") by the
