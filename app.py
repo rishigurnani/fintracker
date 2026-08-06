@@ -1984,6 +1984,25 @@ def _tab_projections(plan, snapshots, projection_engine) -> None:
 # ── TAB 2: Monte Carlo ───────────────────────────────────
 
 
+def _series_sampling(col, *, noun, hist_help, std_label, std_range, std_default, hist_sigma):
+    """One empirical-vs-parametric sampling control for a Monte Carlo input series.
+
+    Renders a "Historical {noun}" toggle; the normal-distribution σ slider is
+    revealed only when the toggle is OFF, so an inapplicable control is never
+    shown greyed-out. Returns ``(use_historical, std_fraction)``. Generalises the
+    previously-duplicated returns and inflation control blocks into one place.
+    """
+    use_hist = col.toggle(f"Historical {noun}", value=True, help=hist_help)
+    if use_hist:
+        return True, std_default / 100          # σ unused by the engine in this mode
+    lo, hi, step = std_range
+    std = col.slider(std_label, lo, hi, std_default, step,
+                     help=f"Normal-distribution σ (used only in this mode; "
+                          f"historical σ ≈ {hist_sigma}).")
+    return False, std / 100
+
+
+
 def _mc_simulation_params(plan) -> dict:
     """Render the Monte Carlo parameter controls.
 
@@ -1992,65 +2011,57 @@ def _mc_simulation_params(plan) -> dict:
     randomized) — the caller applies the latter to plan.retirement before running.
     """
     with st.expander("⚙️ Simulation Parameters", expanded=False):
-        col_t1, col_t2 = st.columns(2)
-        use_hist = col_t1.toggle(
-            "Historical S&P 500 returns",
-            value=True,
-            help="ON (recommended): bootstrap from 100 years of actual S&P 500 data "
-                 "(1926–2025), capturing fat tails, -43% crashes, and +54% booms. "
-                 "OFF: draws from a normal distribution.",
+        # Returns and inflation share one control shape (empirical vs parametric),
+        # so a single helper renders both; each normal-fallback σ slider appears
+        # only when its series is parametric, not as a permanently-disabled knob.
+        col_r, col_i = st.columns(2)
+        use_hist, mkt_std = _series_sampling(
+            col_r, noun="S&P 500 returns", std_label="Market return σ (%)",
+            std_range=(1.0, 30.0, 1.0), std_default=15.0, hist_sigma="19.6%",
+            hist_help="ON (recommended): bootstrap from ~100 years of actual S&P 500 "
+                      "data (1926–2025) — fat tails, −43% crashes, +54% booms. "
+                      "OFF: draw returns from a normal distribution.",
         )
-        use_hist_inf = col_t2.toggle(
-            "Historical US inflation",
-            value=True,
-            help="ON (recommended): bootstrap from 96 years of actual CPI data "
-                 "(1929–2024), including deflation, 1970s stagflation (13.3%), "
-                 "and 2021–22 surge (7%). OFF: draws from a normal distribution.",
+        use_hist_inf, inf_std = _series_sampling(
+            col_i, noun="US inflation", std_label="Inflation σ (%)",
+            std_range=(0.0, 5.0, 0.25), std_default=1.5, hist_sigma="3.9%",
+            hist_help="ON (recommended): bootstrap from ~96 years of actual CPI data "
+                      "(1929–2024) — deflation, 1970s stagflation, 2021–22 surge. "
+                      "OFF: draw inflation from a normal distribution.",
         )
-        both_hist = use_hist and use_hist_inf
-        bcol1, bcol2 = st.columns(2)
-        block_bs = bcol1.toggle(
-            "Joint block bootstrap",
-            value=True,
-            disabled=not both_hist,
-            help="ON (recommended): sample equity and inflation JOINTLY as "
-                 "calendar-year-aligned pairs drawn in multi-year blocks, so "
-                 "stagflation (bad stocks + high inflation) stays bundled and "
-                 "multi-year regimes (sticky inflation, crash-then-recovery) are "
-                 "preserved. Salary growth is tied to the sampled inflation. "
-                 "OFF: draw each series independently, one year at a time. "
-                 "Requires both historical toggles ON.",
-        )
-        mean_block = bcol2.slider(
-            "Mean block length (yrs)", 1.0, 10.0, 2.0, 1.0,
-            disabled=not (both_hist and block_bs),
-            help="Average length of each contiguous historical run in the block "
-                 "bootstrap (stationary bootstrap; block lengths are random with "
-                 "this mean).",
-        )
-        mc_col1, mc_col2, mc_col3, mc_col4 = st.columns(4)
-        n_sims = mc_col1.number_input(
-            "Simulations", min_value=100, max_value=10_000,
-            value=5_000, step=100,
+
+        # Joint block bootstrap only means anything when BOTH series are historical,
+        # so it (and its block-length knob) appear only in that mode.
+        if use_hist and use_hist_inf:
+            block_bs = st.toggle(
+                "Joint block bootstrap", value=True,
+                help="ON (recommended): sample equity and inflation JOINTLY as "
+                     "calendar-aligned pairs in multi-year blocks, so stagflation "
+                     "stays bundled and multi-year regimes are preserved; salary "
+                     "growth tracks the sampled inflation. OFF: draw each series "
+                     "independently, one year at a time.",
+            )
+            mean_block = (
+                st.slider("Mean block length (yrs)", 1.0, 10.0, 2.0, 1.0,
+                          help="Average length of each contiguous historical run "
+                               "(stationary bootstrap; lengths random with this mean).")
+                if block_bs else 2.0
+            )
+        else:
+            block_bs, mean_block = False, 2.0
+
+        c1, c2, c3 = st.columns(3)
+        n_sims = c1.number_input(
+            "Simulations", min_value=100, max_value=10_000, value=5_000, step=100,
             help="More simulations = smoother percentile bands but slower.",
         )
-        mkt_std = mc_col2.slider(
-            "Market Return Std Dev (%)", 1.0, 30.0, 15.0, 1.0,
-            disabled=use_hist,
-            help="Only used when historical returns are OFF. "
-                 "Historical S&P 500 std dev is ~19.6%.",
-        ) / 100
-        inf_std = mc_col3.slider(
-            "Inflation Std Dev (%)", 0.0, 5.0, 1.5, 0.25,
-            disabled=use_hist_inf,
-            help="Only used when historical inflation is OFF. "
-                 "Historical CPI std dev is ~3.9%.",
-        ) / 100
-        sg_std = mc_col4.slider(
-            "Salary Growth Std Dev (%)", 0.0, 10.0, 2.0, 0.5,
+        sg_std = c2.slider(
+            "Salary growth σ (%)", 0.0, 10.0, 2.0, 0.5,
             help="Year-to-year variation in salary growth.",
         ) / 100
-        mc_seed = st.checkbox("Fix random seed (reproducible)", value=True)
+        with c3:
+            st.write("")  # nudge the checkbox down to align with the inputs above
+            mc_seed = st.checkbox("Fix random seed (reproducible)", value=True)
 
         # --- Randomized lifespan (realized death-age range) ---
         # life_expectancy_age stays the PLANNING horizon (what forecasts budget to);
@@ -2220,18 +2231,10 @@ def _loading_overlay(message: str):
 def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
     st.markdown(
-        "Runs N simulations with randomized annual shocks. "
-        "**p10 / p50 / p90** = the 10th, 50th (median), and 90th percentile outcomes — "
-        "p10 is a bad-luck scenario, p50 is the middle outcome, p90 is a good-luck scenario. "
-        "**Liquidity risk** = probability of brokerage + cash going negative in a given year "
-        "(having to liquidate retirement accounts or take on debt). "
-
-        "**Historical mode** (recommended): market returns and inflation are sampled from "
-        "~100 years of actuals (S&P 500 1926–2025, CPI 1929–2024) — preserving fat tails, "
-        "crash years, and boom years as they really happened. With **joint block bootstrap** "
-        "on, the two are drawn together in multi-year blocks so stagflation stays bundled and "
-        "multi-year regimes are preserved, and salary growth tracks the sampled inflation. "
-        "Shows the full range of outcomes including liquidity risk."
+        "Runs many randomized simulations to show the **range** of outcomes: "
+        "**p10 / p50 / p90** net worth (bad-luck / median / good-luck) and the "
+        "year-by-year chance of running out of liquid cash. Tune sampling in "
+        "**⚙️ Simulation Parameters** below; each chart is annotated as you go."
     )
 
     # ── Simulation parameters ────────────────────────────────
