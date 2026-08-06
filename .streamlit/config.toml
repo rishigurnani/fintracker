@@ -1,0 +1,16 @@
+# Streamlit Community Cloud / local server config.
+# The app injects its own detailed CSS; this just sets sensible base colors
+# so the pre-CSS flash and native widgets match the dark palette.
+[theme]
+base = "dark"
+primaryColor = "#4f8cff"
+backgroundColor = "#0f1117"
+secondaryBackgroundColor = "#16213e"
+textColor = "#e6e6e6"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,8 @@
+# Runtime dependencies for deploying app.py (Streamlit Community Cloud reads this).
+# (scipy is in pyproject but not actually imported, so it's omitted here for a
+#  leaner/faster cloud install.)
+streamlit>=1.35
+pandas>=2.1
+numpy>=1.26
+pyyaml>=6.0
+plotly>=5.20
