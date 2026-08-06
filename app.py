@@ -42,8 +42,11 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
+@import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css');
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.gh-link { color: #9aa4bf; text-decoration: none; font-size: 1.5rem; transition: color .15s ease; }
+.gh-link:hover { color: #e6e6e6; }
 h1, h2, h3 { font-family: 'DM Serif Display', serif; }
 
 .metric-card {
@@ -2173,6 +2176,47 @@ def _cached_monte_carlo(plan, **params):
     return ProjectionEngine(plan).run_monte_carlo(**params)
 
 
+def _loading_overlay(message: str):
+    """Show a full-screen opaque loading overlay and return its placeholder.
+
+    A blocking computation (e.g. the Monte Carlo run) freezes the script
+    mid-render, and Streamlit only prunes the *previous* view's leftover
+    elements at end-of-run — so without this the prior tab's charts sit visible
+    beneath the spinner the whole time it computes. The overlay is emitted (and
+    painted) *before* the blocking call, and being ``position:fixed`` it simply
+    covers whatever is behind it; the caller clears it (``.empty()``) once the
+    work is done. A 150 ms fade-in delay means instant (cache-hit) runs clear it
+    before it is ever visible, so there is no flash on fast reruns.
+    """
+    ph = st.empty()
+    ph.markdown(
+        f"""
+        <div class="fintracker-loading">
+          <div class="fintracker-spinner"></div>
+          <div class="fintracker-loading-msg">{message}</div>
+        </div>
+        <style>
+        .fintracker-loading {{
+            position: fixed; inset: 0; z-index: 9990; background: #0f1117;
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; gap: 1.1rem;
+            animation: fintracker-fadein .2s ease .15s both;
+        }}
+        .fintracker-spinner {{
+            width: 46px; height: 46px; border: 4px solid #23305e;
+            border-top-color: #4f8cff; border-radius: 50%;
+            animation: fintracker-spin .9s linear infinite;
+        }}
+        .fintracker-loading-msg {{ color: #9aa4bf; font-size: 1rem; }}
+        @keyframes fintracker-spin {{ to {{ transform: rotate(360deg); }} }}
+        @keyframes fintracker-fadein {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    return ph
+
+
 def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
     st.markdown(
@@ -2214,10 +2258,13 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
         salary_growth_std=p["sg_std"],
         block_bootstrap=p["block_bs"], mean_block_years=p["mean_block"],
     )
-    with st.spinner(f"Running {n_sims:,} simulations…"):
-        # Unseeded (non-reproducible) runs bypass the cache so each run reshuffles.
-        mc = (_cached_monte_carlo(plan, **params) if p["mc_seed"]
-              else ProjectionEngine(plan).run_monte_carlo(**params))
+    # An opaque overlay covers any prior view while the (blocking) sim runs, so
+    # the previous tab's charts don't linger beneath the loading state.
+    _overlay = _loading_overlay(f"Running {n_sims:,} simulations…")
+    # Unseeded (non-reproducible) runs bypass the cache so each run reshuffles.
+    mc = (_cached_monte_carlo(plan, **params) if p["mc_seed"]
+          else ProjectionEngine(plan).run_monte_carlo(**params))
+    _overlay.empty()
 
     # ── Summary KPIs ─────────────────────────────────────────
     mc1, mc2, mc3, mc4 = st.columns(4)
@@ -2385,6 +2432,12 @@ def render_dashboard(plan: FinancialPlan) -> None:
     # ── Header ───────────────────────────────────────────────
     st.markdown("# 📈 fintracker")
     st.markdown("*Personal long-term financial planning — tax-aware, scenario-driven, Monte Carlo enabled.*")
+    st.markdown(
+        '<a class="gh-link" href="https://github.com/rishigurnani/fintracker" '
+        'target="_blank" rel="noopener" title="View source on GitHub">'
+        '<i class="fa-brands fa-github"></i></a>',
+        unsafe_allow_html=True,
+    )
     st.divider()
 
     # ── Top KPIs ─────────────────────────────────────────────
@@ -2425,7 +2478,8 @@ def render_dashboard(plan: FinancialPlan) -> None:
         "🎯 Tax Strategies": lambda: _tab_tax(plan=plan, snapshots=snapshots, strategy_result=strategy_result, yr1=yr1, tax_result=tax_result, marginal_rate=marginal_rate),
     }
     labels = list(tab_renderers)
-    active = st.segmented_control("View", labels, default=labels[0], label_visibility="collapsed") or labels[0]
+    active = st.segmented_control("View", labels, default=labels[0],
+                                  label_visibility="collapsed", key="dashboard_tab") or labels[0]
     tab_renderers[active]()
 
 # ─────────────────────────────────────────────────────────────
