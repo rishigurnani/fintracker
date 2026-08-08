@@ -1,0 +1,27 @@
+name: Keep Streamlit Awake
+
+on:
+  schedule:
+    # Runs every 10 hours
+    - cron: '0 */10 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+
+permissions:
+  contents: write # Ensures the GITHUB_TOKEN has write access to commit code
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git Identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and Push Empty Commit
+        run: |
+          git commit --allow-empty -m "Chore: Automated keep-alive ping"
+          git push
