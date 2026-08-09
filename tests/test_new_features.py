@@ -1719,9 +1719,15 @@ class TestExportFidelity:
         """Deep field-by-field comparison with clear failure messages."""
         import dataclasses
 
+        # Auto-estimated on load from income + career + claim age + haircut, so
+        # deliberately not persisted — recomputed rather than round-tripped.
+        derived = {"estimated_social_security_annual", "partner_social_security_annual"}
+
         def cmp(a, b, path):
             if dataclasses.is_dataclass(a) and dataclasses.is_dataclass(b):
                 for f in dataclasses.fields(a):
+                    if f.name in derived:
+                        continue
                     cmp(getattr(a, f.name), getattr(b, f.name), f"{path}.{f.name}")
             elif isinstance(a, list) and isinstance(b, list):
                 assert len(a) == len(b), f"{context}{path}: list length {len(a)} vs {len(b)}"

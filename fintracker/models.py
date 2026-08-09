@@ -552,11 +552,20 @@ class RetirementProfile:
     after subtracting Social Security.
     """
     current_age: int = 35
+    work_start_age: int = 22   # first year of SS-covered work; sets years worked & credits
     retirement_age: int = 65
     desired_annual_income: float = 80_000     # today's dollars
     years_in_retirement: int = 30
     expected_post_retirement_return: float = 0.05
-    estimated_social_security_annual: float = 0.0  # today's dollars
+    # Social Security. The dollar benefits are AUTO-ESTIMATED at config load from
+    # income + career + claim age + haircut (see config._auto_estimate_ss); the
+    # YAML sets only the claim age(s) and the haircut, never a dollar amount.
+    estimated_social_security_annual: float = 0.0        # today's $ (auto-filled)
+    partner_social_security_annual: float = 0.0          # today's $ (auto-filled)
+    social_security_claim_age: Optional[int] = None      # None → retirement_age
+    partner_social_security_claim_age: Optional[int] = None
+    partner_current_age: Optional[int] = None            # None → current_age
+    social_security_haircut: float = 1.0                 # 1.0 = full scheduled benefit
 
     # Post-retirement withdrawal tax rates.
     # Set these to see Roth's genuine advantage over 401k/brokerage.

@@ -32,6 +32,7 @@ from fintracker.models import (
     InvestmentProfile, StrategyToggles, TimelineEvent, FinancialPlan,
     Failsafe, FailsafeCondition, FailsafeAction,
 )
+from fintracker.social_security import estimate_annual_benefit
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +188,18 @@ _STRATEGIES_SPEC = [
 
 _RETIREMENT_SPEC = [
     ("current_age", int, 35),
+    ("work_start_age", int, 22),
     ("retirement_age", int, 65),
     ("desired_annual_income", float, 80_000),
     ("years_in_retirement", int, 30),
     ("expected_post_retirement_return", float, 0.05),
-    ("estimated_social_security_annual", float, 0),
+    # NB: estimated_social_security_annual / partner_social_security_annual are NOT
+    # here — they're auto-estimated in _dict_to_plan from income + career + the
+    # fields below, so the YAML never carries a hand-entered dollar amount.
+    ("social_security_claim_age", _opt(int), None),
+    ("partner_social_security_claim_age", _opt(int), None),
+    ("partner_current_age", _opt(int), None),
+    ("social_security_haircut", float, 1.0),
     ("retirement_withdrawal_tax_rate", float, 0.0),
     ("capital_gains_tax_rate", float, 0.0),
     ("medicare_start_age", int, 65),
@@ -350,6 +358,27 @@ def load_plan_or_sample(path: str | Path = "config/personal.yaml") -> FinancialP
 # Deserialization
 # ---------------------------------------------------------------------------
 
+def _auto_estimate_ss(rp: RetirementProfile, income: IncomeProfile) -> None:
+    """Fill the (non-user-set) Social Security dollar benefits from income + career.
+
+    The YAML configures only claim age(s) and the haircut; the dollar figures are
+    derived here with the same estimator the app uses, so they never have to be
+    hand-entered. The partner's benefit uses the spouse's income and the partner's
+    own claim age, assuming the same career span (``work_start_age`` → retirement)
+    as the primary.
+    """
+    years = max(0, rp.retirement_age - rp.work_start_age)
+    credits = min(40, 4 * years)
+    rp.estimated_social_security_annual = estimate_annual_benefit(
+        income.gross_annual_income, years_worked=years,
+        claim_age=rp.social_security_claim_age or rp.retirement_age,
+        credits=credits, haircut=rp.social_security_haircut)
+    rp.partner_social_security_annual = estimate_annual_benefit(
+        income.spouse_gross_annual_income, years_worked=years,
+        claim_age=rp.partner_social_security_claim_age or rp.retirement_age,
+        credits=credits, haircut=rp.social_security_haircut)
+
+
 def _dict_to_plan(d: dict) -> FinancialPlan:
     income   = _build(IncomeProfile, d.get("income", {}), _INCOME_SPEC)
     housing  = _build(HousingProfile, d.get("housing", {}), _HOUSING_SPEC)
@@ -381,6 +410,10 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
     events = [_dict_to_event(e) for e in d.get("timeline_events", [])]
     failsafes = [_dict_to_failsafe(f) for f in d.get("failsafes", [])]
 
+    retirement = _build(RetirementProfile, d["retirement"], _RETIREMENT_SPEC) if "retirement" in d else None
+    if retirement is not None:
+        _auto_estimate_ss(retirement, income)
+
     return FinancialPlan(
         income=income,
         housing=housing,
@@ -390,7 +423,7 @@ def _dict_to_plan(d: dict) -> FinancialPlan:
         timeline_events=events,
         failsafes=failsafes,
         projection_years=int(d.get("projection_years", 30)),
-        retirement=_build(RetirementProfile, d["retirement"], _RETIREMENT_SPEC) if "retirement" in d else None,
+        retirement=retirement,
         college=_build(CollegeProfile, d["college"], _COLLEGE_SPEC) if "college" in d else None,
         car=_dict_to_car(d["car"]) if "car" in d else None,
         business=_build(BusinessProfile, d["business"], _BUSINESS_SPEC) if "business" in d else None,

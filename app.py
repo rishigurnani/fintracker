@@ -1785,6 +1785,7 @@ def _retirement_readiness_panel(plan, snapshots, projection_engine) -> None:
                 f"After-tax value: 401k/IRA discounted {_401k_tax:.0%}, "
                 f"brokerage discounted {_cg_tax:.0%}, Roth IRA untouched (tax-free)."
             )
+
     rr_panel = projection_engine.compute_retirement_readiness(
         snapshots,
         withdrawal_tax_rate=_401k_tax,
@@ -1814,7 +1815,10 @@ def _retirement_readiness_panel(plan, snapshots, projection_engine) -> None:
     st.caption(
         f"Retire at age {plan.retirement.retirement_age} (year {rr_panel.years_to_retirement}) · "
         f"First-year retirement cost: {fmt_dollar(rr_panel.annual_cost_at_retirement)}/yr (nominal) · "
-        + (f"SS offset: {fmt_dollar(rr_panel.social_security_offset)}/yr · " if rr_panel.social_security_offset > 0 else "")
+        + (f"SS offset: {fmt_dollar(rr_panel.social_security_offset)}/yr"
+           + (f" (incl. partner {fmt_dollar(rr_panel.partner_social_security_offset)})"
+              if rr_panel.partner_social_security_offset > 0 else "")
+           + " · " if rr_panel.social_security_offset > 0 else "")
         + f"Post-retirement return: {plan.retirement.expected_post_retirement_return:.0%}"
         + (f" · 401k tax {_401k_tax:.0%} · cap gains {_cg_tax:.0%}" if _tax_adjusted else "")
     )

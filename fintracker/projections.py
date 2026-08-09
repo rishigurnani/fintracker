@@ -504,7 +504,8 @@ class RetirementReadiness:
     funded_pct: float
     annual_surplus_or_gap: float
     annual_cost_at_retirement: float   # first retirement-year cost of living (nominal)
-    social_security_offset: float
+    social_security_offset: float                    # household (primary + partner)
+    partner_social_security_offset: float = 0.0      # partner's share of the above
 
 
 # MonteCarloResult is defined in fintracker.montecarlo (imported at top of this
@@ -533,6 +534,22 @@ def _after_tax_value(balance: float, taxable_base: float, rate: float) -> float:
     taxed only on its gains (base == gains, not the full balance).
     """
     return balance - taxable_base * rate
+
+
+def _social_security_income(annual_benefit: float, age, claim_age: int,
+                            inflation_factor: float, tax_rate: float) -> float:
+    """Nominal, after-tax Social Security for ONE person of ``age``.
+
+    Returns 0 before ``claim_age``; otherwise grows the today's-dollars
+    ``annual_benefit`` to nominal by ``inflation_factor`` and haircuts it by tax
+    on the taxable share (up to 85%; ``tax_rate`` 0 → untaxed). Person-agnostic so
+    the same primitive serves both the primary and the partner — the household
+    roll-up (and the shared use by the sim and the readiness gauge) lives in
+    :meth:`ProjectionEngine._social_security_for_year`.
+    """
+    if annual_benefit <= 0 or age is None or age < claim_age:
+        return 0.0
+    return annual_benefit * inflation_factor * (1.0 - _SS_TAXABLE_FRACTION * tax_rate)
 
 
 def _pay_loan_year(loan: dict, annual_rate: float, term_years: int) -> float:
@@ -728,17 +745,14 @@ class ProjectionEngine:
         # retirement (housing + lifestyle + car each year), net of Social Security,
         # discounted back to the retirement year at the post-retirement return.
         r, g, n = rp.expected_post_retirement_return, inflation, rp.years_in_retirement
-        # Social Security benefits are partly taxable: up to 85% of the benefit is
-        # ordinary income for a retiree with other income. The old calc treated SS as
-        # tax-free, overstating the offset. Haircut the benefit by tax on its taxable
-        # share at the retirement ordinary rate (r401k_tax); with r401k_tax=0 this is
-        # a no-op, preserving the previous behaviour when no rates are set.
-        ss_after_tax_factor = 1.0 - _SS_TAXABLE_FRACTION * r401k_tax
         retirement_snaps = [s for s in snapshots if s.year > years_to_ret]
         required = 0.0
         for s in retirement_snaps:
-            ss_t     = (rp.estimated_social_security_annual
-                        * (1 + inflation) ** (s.year - 1) * ss_after_tax_factor)
+            # Same SS definition the year-by-year sim uses (household, claim-age
+            # gated, inflation-grown, taxed on up to 85%) — one source of truth so
+            # the gauge and the projection/Monte Carlo can never disagree.
+            ss_t     = self._social_security_for_year(
+                s.year, (1 + inflation) ** (s.year - 1), r401k_tax)
             cost_t   = (s.annual_housing_cost + s.annual_lifestyle_cost
                         + s.annual_car_operating_cost)
             net_need = max(0.0, cost_t - ss_t)
@@ -749,8 +763,9 @@ class ProjectionEngine:
         annual_cost_at_retirement = (first_ret.annual_housing_cost
                                      + first_ret.annual_lifestyle_cost
                                      + first_ret.annual_car_operating_cost)
-        ss_nominal = (rp.estimated_social_security_annual
-                      * (1 + inflation) ** years_to_ret * ss_after_tax_factor)
+        ss_primary, ss_partner = self._ss_split_for_year(
+            years_to_ret + 1, (1 + inflation) ** years_to_ret, r401k_tax)
+        ss_nominal = ss_primary + ss_partner
 
         funded_pct  = projected / required if required > 0 else math.inf
         balance_gap = projected - required
@@ -775,6 +790,7 @@ class ProjectionEngine:
             annual_surplus_or_gap=annual_gap,
             annual_cost_at_retirement=annual_cost_at_retirement,
             social_security_offset=ss_nominal,
+            partner_social_security_offset=ss_partner,
         )
 
     # ------------------------------------------------------------------ #
@@ -1164,11 +1180,21 @@ class ProjectionEngine:
                             if retired else 0.0)
         hsa_remaining    = max(0.0, hsa_available - hsa_medical_paid) if retired else 0.0
 
+        # Social Security (primary + partner) is spendable retirement income
+        # (nominal, after-tax), so it reduces what the portfolio must cover — the
+        # same benefit the readiness gauge nets out, now flowing through the
+        # year-by-year sim (and thus the Monte Carlo), grown by the realized
+        # inflation path (its COLA).
+        rp_ss = self._plan.retirement
+        ss_income = self._social_security_for_year(
+            year, inf_f, rp_ss.retirement_withdrawal_tax_rate if rp_ss else 0.0)
+
         # Breathing room excluding Medicare (which depends on MAGI, resolved below).
         # The HSA-funded slice of medical is added back: it is paid from the HSA,
         # so it does not draw on income or the cash waterfall.
         base_breathing_room = (
             net_income
+            + ss_income
             - housing_cost
             - lifestyle_base
             + hsa_medical_paid
@@ -1297,6 +1323,30 @@ class ProjectionEngine:
         """
         rp = self._plan.retirement
         return rp.current_age + (year - 1) if rp else None
+
+    def _ss_split_for_year(self, year: int, inflation_factor: float, tax_rate: float) -> tuple[float, float]:
+        """``(primary, partner)`` nominal after-tax Social Security for ``year``.
+
+        Each person is gated by their own age and claim age (the partner's age
+        defaults to the primary's when ``partner_current_age`` is unset), then
+        grown/taxed by the shared :func:`_social_security_income`. The dollar
+        benefits are auto-estimated at config load (see ``config._auto_estimate_ss``).
+        """
+        rp = self._plan.retirement
+        if rp is None:
+            return 0.0, 0.0
+        primary = _social_security_income(
+            rp.estimated_social_security_annual, self._age_in_year(year),
+            rp.social_security_claim_age or rp.retirement_age, inflation_factor, tax_rate)
+        partner = _social_security_income(
+            rp.partner_social_security_annual, (rp.partner_current_age or rp.current_age) + (year - 1),
+            rp.partner_social_security_claim_age or rp.retirement_age, inflation_factor, tax_rate)
+        return primary, partner
+
+    def _social_security_for_year(self, year: int, inflation_factor: float, tax_rate: float) -> float:
+        """Household (primary + partner) SS — shared by the sim and the readiness gauge."""
+        primary, partner = self._ss_split_for_year(year, inflation_factor, tax_rate)
+        return primary + partner
 
     def _death_year(self) -> Optional[int]:
         """The *planning* death year — projection year the primary reaches

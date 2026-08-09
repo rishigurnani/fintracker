@@ -126,6 +126,9 @@ strategies:
 #      annual_surplus_or_gap (positive = surplus, negative = shortfall).
 retirement:
   current_age: 32
+  # First year of Social-Security-covered work. Drives the SS estimator's
+  # "years worked" and work-credits (4/yr, capped at 40). Defaults to 22.
+  work_start_age: 22
   retirement_age: 65
   # Desired annual spending in retirement, in TODAY'S dollars.
   # Automatically inflated to nominal dollars at retirement.
@@ -134,9 +137,16 @@ retirement:
   # Post-retirement portfolio return. Use a conservative number — portfolios
   # typically shift toward bonds as you approach and enter retirement.
   expected_post_retirement_return: 0.05
-  # Your estimated Social Security benefit in TODAY'S dollars.
-  # Use ssa.gov to get your personalised estimate. Set to 0 to be conservative.
-  estimated_social_security_annual: 0
+  # Social Security is AUTO-ESTIMATED (today's dollars) from your income,
+  # work_start_age, retirement_age, claim age, and the haircut below — you do NOT
+  # enter a dollar amount. It flows through the projection, Monte Carlo, and the
+  # Retirement Readiness gauge. Set only the two knobs:
+  social_security_haircut: 1.0            # 1.0 = full scheduled benefit; ~0.75 = official pessimistic case
+  # social_security_claim_age: 67         # when YOU claim (62–70); omit → retirement_age
+  # Partner/spouse SS (uses the spouse income above; career span assumed to match
+  # yours). Only a legal spouse — not an unmarried partner — draws off your record.
+  # partner_social_security_claim_age: 67
+  # partner_current_age: 62               # omit → same as current_age
   # Medicare — modelled as a healthcare cost from medicare_start_age onward.
   # annual_medicare_premium is the base Part B + Part D premium per enrolled
   # person (today's dollars); an income-tiered IRMAA surcharge is added on top.
