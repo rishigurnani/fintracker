@@ -2112,8 +2112,24 @@ def _mc_simulation_params(plan) -> dict:
     )
 
 
-def _mc_networth_fan_chart(mc, snapshots, n_sims) -> None:
-    """Net-worth percentile fan chart with the deterministic overlay."""
+def _rebase_networth(mc, rate):
+    """Copy of `mc` with net-worth bands deflated to today's dollars.
+
+    Divides each year's value by ``(1+rate)**year``; ``rate == 0`` is the
+    identity (nominal). Only net worth is rebased — liquidity stays nominal."""
+    f = lambda s: [v / (1 + rate) ** y for v, y in zip(s, mc.years)]
+    return dataclasses.replace(
+        mc, p10_net_worth=f(mc.p10_net_worth), p25_net_worth=f(mc.p25_net_worth),
+        p50_net_worth=f(mc.p50_net_worth), p75_net_worth=f(mc.p75_net_worth),
+        p90_net_worth=f(mc.p90_net_worth), mean_net_worth=f(mc.mean_net_worth))
+
+
+def _mc_networth_fan_chart(mc, snapshots, n_sims, basis_rate=0.0) -> None:
+    """Net-worth percentile fan chart with the deterministic overlay.
+
+    Bands come from `mc` (already rebased by the caller); the deterministic
+    snapshots are deflated here with the same `basis_rate` so the overlay stays
+    on the same basis. Log y-axis keeps all five percentiles readable."""
     years_mc = mc.years
     fig_mc = go.Figure()
     _add_band(fig_mc, years_mc, mc.p90_net_worth, mc.p10_net_worth, "rgba(59,130,246,0.1)", "p10–p90 band")
@@ -2121,7 +2137,8 @@ def _mc_networth_fan_chart(mc, snapshots, n_sims) -> None:
     _add_line(fig_mc, years_mc, mc.p50_net_worth, "Median (p50)", "#3b82f6", 2.5)
     _add_line(fig_mc, years_mc, mc.p90_net_worth, "Optimistic (p90)", "#4ade80", 1.5, "dot")
     _add_line(fig_mc, years_mc, mc.p10_net_worth, "Pessimistic (p10)", "#f87171", 1.5, "dot")
-    _add_line(fig_mc, [s.year for s in snapshots], [s.net_worth for s in snapshots],
+    _add_line(fig_mc, [s.year for s in snapshots],
+              [s.net_worth / (1 + basis_rate) ** s.year for s in snapshots],
               "Deterministic", "#f59e0b", 2, "dash")
     hist_parts = []
     if mc.use_historical_returns:   hist_parts.append("hist. returns")
@@ -2129,9 +2146,11 @@ def _mc_networth_fan_chart(mc, snapshots, n_sims) -> None:
     if mc.block_bootstrap:          hist_parts.append("block bootstrap")
     mode_label = (", ".join(hist_parts) if hist_parts
                   else f"Normal(σ_mkt={mc.market_return_std:.0%}, σ_inf={mc.inflation_std:.0%})")
+    basis = "today's $" if basis_rate else "nominal $"
     fig_mc.update_layout(
         title=f"Net Worth Distribution — {n_sims:,} Simulations ({mode_label})",
-        **PLOTLY_DARK, height=460, yaxis_title="Net Worth ($)", xaxis_title="Year",
+        **PLOTLY_DARK, height=460, xaxis_title="Year",
+        yaxis_title=f"Net Worth ({basis}, log)", yaxis_type="log",
     )
     st.plotly_chart(fig_mc, width='stretch')
 
@@ -2273,6 +2292,19 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
           else ProjectionEngine(plan).run_monte_carlo(**params))
     _overlay.empty()
 
+    # ── Dollar basis ─────────────────────────────────────────
+    # One toggle rebasens every net-worth display (KPI tiles, fan chart, final-
+    # year bar) into today's purchasing power by deflating at the assumed
+    # inflation rate. Nominal is the default; basis_rate 0.0 → identity rebase.
+    real_basis = st.toggle(
+        "Show net worth in today's dollars",
+        key="mc_real_basis",
+        help="Deflate every path by the assumed inflation rate so net worth reads "
+             "in today's purchasing power instead of far-future nominal dollars.",
+    )
+    basis_rate = plan.investments.annual_inflation_rate if real_basis else 0.0
+    mc = _rebase_networth(mc, basis_rate)
+
     # ── Summary KPIs ─────────────────────────────────────────
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("Median Net Worth (Final Year)", fmt_dollar(mc.p50_net_worth[-1]))
@@ -2291,7 +2323,7 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
 
     # ── Net worth fan chart ───────────────────────────────────
     years_mc = mc.years
-    _mc_networth_fan_chart(mc, snapshots, n_sims)
+    _mc_networth_fan_chart(mc, snapshots, n_sims, basis_rate)
 
     # ── Liquidity risk ────────────────────────────────────────
     st.markdown("#### Liquidity Risk — Probability of Negative Liquid Assets by Year")
@@ -2351,7 +2383,7 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
     st.plotly_chart(fig_liq_fan, width='stretch')
 
     # ── Final-year percentile bar ─────────────────────────────
-    st.markdown("#### Net Worth Percentiles at Final Year")
+    st.markdown(f"#### Net Worth Percentiles at Final Year")
     pct_labels = ["p10", "p25", "p50", "p75", "p90"]
     pct_values = [
         mc.p10_net_worth[-1], mc.p25_net_worth[-1],
@@ -2365,7 +2397,6 @@ def _tab_monte_carlo(plan, snapshots, projection_engine) -> None:
         textposition="outside",
     ))
     fig_hist.update_layout(
-        title=f"Net Worth Percentiles at Year {plan.projection_years}",
         **PLOTLY_DARK, height=300, yaxis_title="$", showlegend=False,
     )
     st.plotly_chart(fig_hist, width='stretch')
