@@ -156,3 +156,39 @@ class TestPayAsYouGoRealization:
         no_sale = ProjectionEngine(_sale_plan()).run_deterministic()
         assert snaps[1].brokerage_gains < no_sale[0].brokerage_gains + 6_000
         assert snaps[1].brokerage_gains >= 0.0
+
+
+class TestDividendAndGainShareOnePreferentialStack:
+    """Realized LTCG and qualified dividends occupy ONE 0/15/20% stack on top of
+    ordinary income — they must be taxed together, not in two separate calls that
+    each re-use the low brackets from the same floor (which under-taxes whenever
+    their sum straddles a bracket breakpoint)."""
+
+    @staticmethod
+    def _straddle_plan():
+        # Single filer, zero ordinary income → the full $47,025 (2024) 0% LTCG band
+        # is open. Brokerage of $300k grows 20% in year 1 (→ $60k of gains); a $120k
+        # expense in year 2 realizes exactly $20k of gain, and a 15% dividend yield
+        # on the $240k post-sale balance throws off $36k. Each item alone ($20k, $36k)
+        # stays under $47,025 (→ 0% taxed separately — the old bug's answer), but
+        # together ($56k) they cross the breakpoint, so the correct tax is positive.
+        return make_plan(
+            income=IncomeProfile(0, FilingStatus.SINGLE, State.TEXAS),
+            lifestyle=zero_lifestyle(),
+            investments=investments(current_liquid_cash=0, current_brokerage_balance=300_000,
+                                    annual_market_return=0.20, taxable_dividend_yield=0.15),
+            strategies=StrategyToggles(maximize_hsa=False, maximize_401k=False),
+            timeline_events=[TimelineEvent(year=2, description="Realize ~$20k of gain",
+                                           extra_one_time_expense=120_000)],
+            projection_years=2,
+        )
+
+    def test_combined_stack_is_taxed_when_each_part_alone_would_not_be(self):
+        snaps = ProjectionEngine(self._straddle_plan()).run_deterministic()
+        # Year 1: a $45k dividend, still under the $47,025 0% top, no realized gain → $0.
+        assert snaps[0].annual_capital_gains_tax == pytest.approx(0.0, abs=1)
+        # Year 2: $20k gain + $36k dividend straddle the 0% top together. The old
+        # split-call bug returned $0 here; the combined stack taxes the $8,975 above
+        # $47,025 at 15% → ~$1,346.
+        assert snaps[1].annual_capital_gains_tax > 0.0
+        assert snaps[1].annual_capital_gains_tax == pytest.approx(1_346.25, abs=5)

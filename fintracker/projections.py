@@ -1137,9 +1137,6 @@ class ProjectionEngine:
         # reaches 20% automatically — no hand-set flat rate. (The flat
         # capital_gains_tax_rate now only feeds the retirement-readiness haircut.)
         tmp_inc, tmp_inv = self._tax_profiles(state, hsa, k401, r529)
-        realized_gains_tax = self._tax.capital_gains_tax(
-            state.realized_gains_ytd, tmp_inc, tmp_inv, p.strategies,
-            num_children=state.num_children, inflation_factor=inf_f, deductions=deductions)
 
         # Brokerage tax drag: a taxable account throws off dividends every year that
         # are taxed as paid — unlike a 401k. Model a dividend yield on the start-of-
@@ -1148,8 +1145,17 @@ class ProjectionEngine:
         # total market return), so only the tax leaks out — the real drag on taxable
         # compounding the old model missed (brokerage grew tax-free like a 401k).
         annual_dividend = max(0.0, state.brokerage_balance) * inv.taxable_dividend_yield
-        dividend_tax = self._tax.capital_gains_tax(
-            annual_dividend, tmp_inc, tmp_inv, p.strategies,
+
+        # Realized LTCG and qualified dividends share ONE preferential-rate stack:
+        # they occupy a single 0%/15%/20% schedule sitting on top of this year's
+        # ordinary taxable income, so they must be taxed TOGETHER in one combined
+        # call. Taxing the gain and the dividend in two separate calls (the old
+        # behaviour) let each re-use the 0%/15% bands from the same ordinary-income
+        # floor, under-taxing whenever their sum straddles a bracket breakpoint
+        # (e.g. a low-income year with a sizeable gain plus the dividend yield).
+        preferential_income = max(0.0, state.realized_gains_ytd) + annual_dividend
+        preferential_tax = self._tax.capital_gains_tax(
+            preferential_income, tmp_inc, tmp_inv, p.strategies,
             num_children=state.num_children, inflation_factor=inf_f, deductions=deductions)
 
         # Net Investment Income Tax (3.8%): realized gains + dividends are net
@@ -1160,10 +1166,10 @@ class ProjectionEngine:
         magi = self._magi_for_irmaa(state, biz_net) + annual_dividend
         niit = self._tax.net_investment_income_tax(magi, nii, state.filing_status)
 
-        # Total investment tax that leaks from cash flow this year: realized-gains
-        # LTCG + annual dividend drag + NIIT. (Reported together on the cap-gains
-        # line — all are investment taxes.)
-        cap_gains_tax = realized_gains_tax + dividend_tax + niit
+        # Total investment tax that leaks from cash flow this year: the combined
+        # LTCG + qualified-dividend preferential-rate tax + NIIT. (Reported together
+        # on the cap-gains line — all are investment taxes.)
+        cap_gains_tax = preferential_tax + niit
 
         # HSA pays qualified medical expenses tax-free, which the model previously
         # ignored (the HSA only ever grew, ballooning absurdly). We spend it in
