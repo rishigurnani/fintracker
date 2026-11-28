@@ -33,6 +33,7 @@ from fintracker.constants import (
     HSA_LIMIT_SINGLE, HSA_LIMIT_FAMILY, LIMIT_SOLO_401K, ROTH_IRA_LIMIT,
     ROTH_PHASEOUT_SINGLE, ROTH_PHASEOUT_MFJ, SS_WAGE_BASE,
     HOME_SALE_EXCLUSION_SINGLE, HOME_SALE_EXCLUSION_MFJ,
+    EXCESS_BUSINESS_LOSS_LIMIT_SINGLE, EXCESS_BUSINESS_LOSS_LIMIT_MFJ,
     irmaa_annual_surcharge, limit_401k,
 )
 from fintracker.finance_math import linear_phaseout, monthly_amortized_payment
@@ -1091,12 +1092,14 @@ class ProjectionEngine:
 
         # --- Contributions & tax ---
         hsa, k401, partner_k401, r529, employer_match = self._contributions(state, year)
-        biz_net, biz_se_tax, biz_equity, biz_solo_401k = self._business(state, year, inf_f)
+        biz_net, biz_se_tax, biz_equity, biz_solo_401k, biz_taxable = self._business(state, year, inf_f)
         # Itemizable deductions (mortgage interest + SALT) — the engine takes the
         # larger of these and the standard deduction. Shared by the income-tax and
         # capital-gains calls so both see the same deduction.
         deductions = self._itemized_deductions(state, year, inf_f)
-        tax, aotc, tax_breakdown = self._tax_and_credits(state, year, hsa, k401, r529, inf_f, deductions)
+        tax, aotc, tax_breakdown = self._tax_and_credits(
+            state, year, hsa, k401, r529, inf_f, deductions,
+            business_taxable_income=biz_taxable)
 
         # Roth IRA contribution (post-tax — no deduction, reduces net income).
         # Limit: $7,000/person × (2 if married), fixed nominal dollars. A *direct*
@@ -1117,7 +1120,10 @@ class ProjectionEngine:
             magi = self._magi_for_irmaa(state, biz_net)
             roth_contrib = roth_desired * linear_phaseout(magi, lo * inf_f, hi * inf_f)
 
-        net_income = state.gross_income + biz_net - tax - biz_se_tax - hsa - k401 - partner_k401 - biz_solo_401k - roth_contrib
+        # SE tax and the solo-401k are already netted inside biz_net, and the income
+        # tax on business profit is folded into `tax` (see _tax_and_credits), so they
+        # must NOT be subtracted again here — the old line double-counted both.
+        net_income = state.gross_income + biz_net - tax - hsa - k401 - partner_k401 - roth_contrib
 
         # --- Expenses ---
         housing_cost, home_equity, home_value, eoy_mortgage = self._housing(state, year, inf_f)
@@ -1153,10 +1159,15 @@ class ProjectionEngine:
         # behaviour) let each re-use the 0%/15% bands from the same ordinary-income
         # floor, under-taxing whenever their sum straddles a bracket breakpoint
         # (e.g. a low-income year with a sizeable gain plus the dividend yield).
+        # Business profit is ordinary income, so it lifts the floor the preferential
+        # stack sits on (a gain stacks on W-2 *and* business taxable income). Passing
+        # gross_income_override here is safe — capital_gains_tax computes no FICA, so
+        # business income is not double-charged payroll tax (unlike the income-tax call).
         preferential_income = max(0.0, state.realized_gains_ytd) + annual_dividend
         preferential_tax = self._tax.capital_gains_tax(
             preferential_income, tmp_inc, tmp_inv, p.strategies,
-            num_children=state.num_children, inflation_factor=inf_f, deductions=deductions)
+            num_children=state.num_children, inflation_factor=inf_f, deductions=deductions,
+            gross_income_override=state.gross_income + biz_taxable)
 
         # Net Investment Income Tax (3.8%): realized gains + dividends are net
         # investment income, taxed where MAGI clears the statutory threshold. Uses
@@ -1616,8 +1627,16 @@ class ProjectionEngine:
         r529: float,
         inf_f: float,
         deductions: Optional[DeductionInputs] = None,
+        business_taxable_income: float = 0.0,
     ) -> tuple[float, float, TaxResult]:
-        """Returns (effective_tax, aotc_credit, tax_breakdown)."""
+        """Returns (effective_tax, aotc_credit, tax_breakdown).
+
+        ``business_taxable_income`` is pass-through profit (net of its deductions;
+        negative for a loss) that is ordinary income on top of W-2 wages. It is
+        folded into the federal/state income tax but NOT into FICA — business income
+        pays self-employment tax separately, so charging it payroll FICA here too
+        would double-tax it.
+        """
         p = self._plan
         tmp_inc, tmp_inv = self._tax_profiles(state, hsa, k401, r529)
         # inf_f inflation-indexes the tax brackets/deductions to this projection
@@ -1626,6 +1645,19 @@ class ProjectionEngine:
                                         num_children=state.num_children,
                                         inflation_factor=inf_f,
                                         deductions=deductions)
+        if business_taxable_income:
+            # Re-run the income tax with business profit layered onto W-2 wages and
+            # adopt ITS federal + state figures (the marginal income tax on the
+            # business income, bracket-climbing included). FICA stays the W-2-only
+            # result above — business income is not subject to payroll FICA here. A
+            # loss lowers the override below W-2, so federal/state tax falls: the loss
+            # offsets W-2 income (already capped at the §461(l) limit in _business).
+            with_biz = self._tax.calculate(
+                tmp_inc, tmp_inv, p.strategies, num_children=state.num_children,
+                inflation_factor=inf_f, deductions=deductions,
+                gross_income_override=state.gross_income + business_taxable_income)
+            breakdown.federal_income_tax = with_biz.federal_income_tax
+            breakdown.state_income_tax = with_biz.state_income_tax
         aotc     = self._aotc_credit(state, year, state.gross_income, state.is_married, inf_f)
         eff_tax  = max(0.0, breakdown.total_annual_tax - aotc)
         return eff_tax, aotc, breakdown
@@ -1906,22 +1938,26 @@ class ProjectionEngine:
         state: EngineState,
         year: int,
         inf_f: float = 1.0,
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         """
-        Returns (net_income, se_tax, business_equity, solo_401k_contribution).
+        Returns (net_income, se_tax, business_equity, solo_401k_contribution,
+                 taxable_business_income).
 
-        net_income   — owner's draw after SE tax, QBI deduction, and health
-                       insurance deduction; flows into breathing room
+        net_income   — owner's take-home after SE tax and retirement contributions
+                       (before income tax); flows into breathing room
         se_tax       — self-employment tax owed (shown separately in cash flow)
         business_equity — current business asset value (net_profit × multiple)
         solo_401k_contribution — amount deposited to retirement this year
+        taxable_business_income — the ordinary income the profit adds to the 1040
+                       (net of ½-SE / health / solo-401k / QBI); negative for a loss,
+                       capped at the §461(l) limit. _compute_year income-taxes this.
 
         Revenue is stored in state.business_revenue and grown in _advance_state.
         The initial_investment is deducted from brokerage in the start year.
         """
         biz = self._plan.business
         if biz is None or year < biz.start_year:
-            return 0.0, 0.0, state.business_equity, 0.0
+            return 0.0, 0.0, state.business_equity, 0.0, 0.0
 
         # One-time initial investment in start year
         if year == biz.start_year and biz.initial_investment > 0:
@@ -1932,40 +1968,43 @@ class ProjectionEngine:
             if year == biz.sale_year:
                 proceeds = state.business_equity  # already scaled by ownership_pct
                 state.brokerage_balance += proceeds
-            return 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
         revenue    = state.business_revenue
         net_profit = revenue * (1.0 - biz.expense_ratio) * biz.ownership_pct
 
         # --- Self-employment tax ---
         # SE tax = 12.4% Social Security + 2.9% Medicare on 92.35% of net profit.
-        # The Social Security portion stops at the (inflation-indexed) wage base, and
-        # coordinates with the owner's W-2 wages, which have already consumed part of
-        # the base for the year; the Medicare portion continues on every dollar. The
-        # employer half is deductible from AGI. Charging the full 15.3% on all profit
-        # (the old behaviour) overstated SE tax for any earner above the wage base.
-        se_base     = net_profit * _SE_TAX_DEDUCTIBLE_SHARE
+        # Only POSITIVE profit is subject to SE tax — a loss owes none, so the base is
+        # floored at 0 (the old code let a loss drive se_base negative, producing a
+        # nonsensical negative SE "credit"). The Social Security portion stops at the
+        # (inflation-indexed) wage base and coordinates with the owner's W-2 wages,
+        # which have already consumed part of the base; Medicare continues on every
+        # dollar. The employer half is deductible from AGI.
+        se_profit   = max(0.0, net_profit)
+        se_base     = se_profit * _SE_TAX_DEDUCTIBLE_SHARE
         wage_base   = SS_WAGE_BASE * inf_f
         w2_ss_wages = min(max(0.0, state.income_primary), wage_base)
         ss_taxable  = max(0.0, min(se_base, wage_base - w2_ss_wages))
         se_tax      = ss_taxable * _SE_SS_RATE + se_base * _SE_MEDICARE_RATE
         employer_half_deduction = se_tax / 2.0
 
-        # --- Health insurance deduction ---
-        hi_deduction = min(biz.self_employed_health_insurance, net_profit)
+        # --- Health insurance deduction (only against positive profit) ---
+        hi_deduction = min(biz.self_employed_health_insurance, se_profit)
 
         # --- QBI deduction ---
         # 20% of qualified business income, phased out above income thresholds.
         # Simplified: apply phase-out linearly over a $50k window above the limit.
+        # A loss yields no QBI deduction (a negative-QBI carryforward isn't modelled).
         qbi_deduction = 0.0
-        if biz.use_qbi_deduction:
+        if biz.use_qbi_deduction and net_profit > 0:
             limit = by_filing_status(state.is_married, _QBI_PHASEOUT_SINGLE, _QBI_PHASEOUT_MFJ)
             phase = linear_phaseout(state.gross_income + net_profit, limit, limit + 50_000)
             qbi_deduction = net_profit * 0.20 * phase
 
         # --- Solo 401k ---
         # Capped at IRS limit and net profit (can't contribute more than earned)
-        solo_k = min(biz.solo_401k_contribution, LIMIT_SOLO_401K, max(0.0, net_profit))
+        solo_k = min(biz.solo_401k_contribution, LIMIT_SOLO_401K, se_profit)
 
         # --- SEP-IRA ---
         # Up to 25% of net self-employment income (after SE tax deduction)
@@ -1974,17 +2013,31 @@ class ProjectionEngine:
         # SEP flows into retirement alongside solo 401k
         solo_k_total = min(solo_k + sep, LIMIT_SOLO_401K)
 
-        # --- Net income to owner ---
-        # Gross profit minus all deductions; the actual tax impact on W-2 income
-        # is handled in _tax_and_credits via the normal tax engine (which will see
-        # a lower AGI because of employer_half_deduction + hi_deduction + qbi_deduction).
-        # Here we return the owner's take-home after SE tax and retirement contributions.
+        # --- Taxable business income (the amount that lands on the 1040) ---
+        # Pass-through profit is ordinary income stacked on W-2 wages, reduced by the
+        # above-the-line deductions (½ SE tax, SE health insurance, solo-401k/SEP) and
+        # the below-the-line QBI deduction. _compute_year income-taxes this figure. A
+        # loss flows through negative and offsets W-2 income in-year, capped at the
+        # inflation-indexed §461(l) excess-business-loss limit (the excess would carry
+        # forward as an NOL, which isn't modelled). The old code computed the health /
+        # QBI deductions here, then discarded them and never income-taxed the profit.
+        taxable_business_income = (net_profit - employer_half_deduction
+                                   - hi_deduction - solo_k_total - qbi_deduction)
+        excess_loss_limit = by_filing_status(
+            state.is_married, EXCESS_BUSINESS_LOSS_LIMIT_SINGLE,
+            EXCESS_BUSINESS_LOSS_LIMIT_MFJ) * inf_f
+        taxable_business_income = max(taxable_business_income, -excess_loss_limit)
+
+        # --- Net income to owner (take-home before income tax) ---
+        # Owner's cash after SE tax and retirement contributions. _compute_year then
+        # subtracts the income tax on taxable_business_income; SE tax and the solo-401k
+        # are netted here exactly once, so the caller must not subtract them again.
         net_income = net_profit - se_tax - solo_k_total
 
         # --- Business equity ---
         biz_equity = net_profit * biz.equity_multiple
 
-        return net_income, se_tax, biz_equity, solo_k_total
+        return net_income, se_tax, biz_equity, solo_k_total, taxable_business_income
 
     def _fund_purchase(self, state: EngineState, amount: float, year: int) -> None:
         """Fund a lump-sum outflow from the full asset waterfall.

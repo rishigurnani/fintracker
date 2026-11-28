@@ -54,6 +54,15 @@ SS_WAGE_BASE = 168_600
 # 2018, NOT inflation-indexed — its real value erodes over a long projection).
 SALT_DEDUCTION_CAP = 10_000
 
+# --- Excess business loss limitation (IRC §461(l)) ---
+# A pass-through business loss can offset only this much NON-business income (e.g.
+# W-2 wages) in a single year; any excess becomes an NOL carryforward (not modelled
+# here). UNLIKE the SALT/§121/NIIT caps, this one IS inflation-indexed each year
+# (2018: $250k/$500k → 2024: here), so callers scale it by the projection year's
+# cumulative inflation to keep a taxpayer in the same real cap.
+EXCESS_BUSINESS_LOSS_LIMIT_SINGLE = 305_000   # 2024
+EXCESS_BUSINESS_LOSS_LIMIT_MFJ = 610_000      # 2024
+
 # --- Net Investment Income Tax (NIIT) ---
 # 3.8% on the lesser of net investment income and the amount of MAGI above the
 # threshold. Thresholds are statutory and NOT inflation-indexed (like the

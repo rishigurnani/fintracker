@@ -126,7 +126,7 @@ class TestSelfEmploymentTaxCap:
         eng = ProjectionEngine(plan)
         state = eng._initial_state()
         state.income_primary = primary_income
-        _net, se_tax, _eq, _solo = eng._business(state, 1, 1.0)
+        _net, se_tax, _eq, _solo, _txi = eng._business(state, 1, 1.0)
         return se_tax
 
     def test_below_wage_base_matches_full_rate(self):
